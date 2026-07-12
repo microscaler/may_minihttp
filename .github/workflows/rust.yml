@@ -139,26 +139,18 @@ jobs:
             ~/.cargo/git
             target
           key: ${{ runner.os }}-goose-${{ hashFiles('**/Cargo.lock') }}
-      - name: Run Goose load tests
-        run: cargo test --test goose_header_load_test -- --test-threads=1
-      - name: Check for Goose reports
-        if: always()
-        id: check_reports
+      - name: Run Goose load tests (capture output)
+        run: cargo test --test goose_header_load_test -- --test-threads=1 --nocapture 2>&1 | tee target/goose/goose-stdout.log
+      - name: Generate goose report
         run: |
-          if [ -f "goose-report.html" ] || [ -f "goose-report.json" ] || ls goose-*.txt 2>/dev/null; then
-            echo "reports_exist=true" >> $GITHUB_OUTPUT
-          else
-            echo "reports_exist=false" >> $GITHUB_OUTPUT
-          fi
-      - name: Upload Goose reports
-        if: always() && steps.check_reports.outputs.reports_exist == 'true'
+          mkdir -p target/goose
+          bash hack/goose-report.sh --output target/goose/goose-report.json < target/goose/goose-stdout.log > target/goose/goose-report.md
+      - name: Upload goose reports
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: goose-reports
-          path: |
-            goose-*.html
-            goose-*.json
-            goose-*.txt
+          path: target/goose/
           retention-days: 7
 
   generate-reports:
