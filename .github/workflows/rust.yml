@@ -103,7 +103,7 @@ jobs:
             target
           key: ${{ runner.os }}-goose-${{ hashFiles('**/Cargo.lock') }}
       - name: Run Goose load tests
-        run: cargo test --test goose_header_load_test -- --nocapture
+        run: cargo test --test goose_header_load_test -- --test-threads=1
       - name: Check for Goose reports
         if: always()
         id: check_reports
