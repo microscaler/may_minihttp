@@ -236,9 +236,7 @@ fn send_request_with_headers(port: u16, num_headers: usize) -> io::Result<String
             Err(e) => {
                 // Retry on timeout/refused (common on Windows IOCP)
                 let kind = e.kind();
-                if kind != io::ErrorKind::TimedOut
-                    && kind != io::ErrorKind::ConnectionRefused
-                {
+                if kind != io::ErrorKind::TimedOut && kind != io::ErrorKind::ConnectionRefused {
                     return Err(e);
                 }
                 last_err = Some(e);
