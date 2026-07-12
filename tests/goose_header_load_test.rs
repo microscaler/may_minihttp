@@ -10,7 +10,9 @@
 //! - Simulates realistic traffic patterns (browsers, load balancers, APIs)
 
 use bytes::BufMut;
+use goose::config::GooseConfiguration;
 use goose::prelude::*;
+use gumdrop::Options;
 use may_minihttp::{HttpServer, HttpService, Request, Response};
 use std::io;
 use std::net::TcpListener;
@@ -533,7 +535,8 @@ async fn test_goose_smoke_test() -> Result<(), Box<dyn std::error::Error>> {
     eprintln!("[TEST] Starting Goose smoke test on {}", base_url);
 
     // Minimal Goose attack: 1 user, 1 second, simple transaction
-    let goose_attack = GooseAttack::initialize()?
+    let config = GooseConfiguration::parse_args_default::<String>(&[]).expect("config");
+    let goose_attack = GooseAttack::initialize_with_config(config)?
         .register_scenario(
             scenario!("Smoke Test").register_transaction(transaction!(request_with_5_headers)),
         )
@@ -563,7 +566,8 @@ async fn test_load_with_varying_headers() -> Result<(), Box<dyn std::error::Erro
     let base_url = fixture.base_url();
 
     // Configure Goose attack
-    let goose_attack = GooseAttack::initialize()?
+    let config = GooseConfiguration::parse_args_default::<String>(&[]).expect("config");
+    let goose_attack = GooseAttack::initialize_with_config(config)?
         .register_scenario(
             scenario!("Mixed Header Counts")
                 .register_transaction(transaction!(request_with_5_headers).set_weight(5)?)
@@ -593,7 +597,8 @@ async fn test_browser_traffic_load() -> Result<(), Box<dyn std::error::Error>> {
     let fixture = GooseTestFixture::new(19002);
     let base_url = fixture.base_url();
 
-    let goose_attack = GooseAttack::initialize()?
+    let config = GooseConfiguration::parse_args_default::<String>(&[]).expect("config");
+    let goose_attack = GooseAttack::initialize_with_config(config)?
         .register_scenario(
             scenario!("Browser Traffic").register_transaction(transaction!(browser_like_request)),
         )
@@ -616,7 +621,8 @@ async fn test_load_balancer_traffic() -> Result<(), Box<dyn std::error::Error>> 
     let fixture = GooseTestFixture::new(19003);
     let base_url = fixture.base_url();
 
-    let goose_attack = GooseAttack::initialize()?
+    let config = GooseConfiguration::parse_args_default::<String>(&[]).expect("config");
+    let goose_attack = GooseAttack::initialize_with_config(config)?
         .register_scenario(
             scenario!("Load Balancer Traffic")
                 .register_transaction(transaction!(load_balancer_request)),
@@ -642,7 +648,8 @@ async fn test_high_header_count_stress() -> Result<(), Box<dyn std::error::Error
 
     // Test with progressively more headers to validate limit enforcement
     // This test EXPECTS some failures (20+ headers will fail with default limit of 16)
-    let goose_attack = GooseAttack::initialize()?
+    let config = GooseConfiguration::parse_args_default::<String>(&[]).expect("config");
+    let goose_attack = GooseAttack::initialize_with_config(config)?
         .register_scenario(
             scenario!("Progressive Header Increase")
                 .register_transaction(transaction!(request_with_16_headers).set_weight(3)?)
@@ -670,7 +677,8 @@ async fn test_load_with_large_header_values() -> Result<(), Box<dyn std::error::
     let base_url = fixture.base_url();
 
     // Test with various large header scenarios
-    let goose_attack = GooseAttack::initialize()?
+    let config = GooseConfiguration::parse_args_default::<String>(&[]).expect("config");
+    let goose_attack = GooseAttack::initialize_with_config(config)?
         .register_scenario(
             scenario!("Large Header Values")
                 .register_transaction(transaction!(request_with_large_user_agent).set_weight(3)?)

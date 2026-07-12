@@ -39,6 +39,7 @@ nanorand = { version = "0.7", default-features = false, features = ["std", "wyra
 
 # Load testing and integration testing
 goose = "0.18.1"
+gumdrop = "0.8"
 testcontainers = "0.15"
 tokio = { version = "1", features = ["full"] }
 
