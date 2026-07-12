@@ -86,18 +86,46 @@ if [[ -n "$method" && -n "$req_count" ]]; then
 {\"method\":\"${method}\",\"path\":\"${path}\",\"requests\":${req_count},\"avg_ms\":$(extract_number "$avg_ms"),\"min_ms\":$(extract_number "$min_ms"),\"max_ms\":$(extract_number "$max_ms")}"
 fi
 
-# Build JSON
-cat > "$OUTPUT" <<EOF
-{
-  "total_users": ${total_users},
-  "total_requests": ${total_requests},
-  "successful_requests": ${successful_requests},
-  "failed_requests": ${failed_requests},
-  "success_rate": $(echo "scale=4; ${successful_requests} / (${total_requests} + 1)" | bc 2>/dev/null || echo "0"),
-  "transactions": [${transactions}
-  ]
+# Build JSON - write transaction data to temp file for reliable JSON construction
+TXN_FILE=$(mktemp)
+printf '%s\n' "$transactions" > "$TXN_FILE"
+
+python3 -c "
+import json, sys
+
+rate_args = [int(sys.argv[i]) for i in range(1, 5)]
+txn_file = sys.argv[5]
+output_file = sys.argv[6]
+
+try:
+    rate = rate_args[2] / (rate_args[1] + 1)
+except:
+    rate = 0.0
+
+txns = []
+with open(txn_file) as f:
+    for line in f:
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            txns.append(json.loads(line))
+        except:
+            pass
+
+report = {
+    'total_users': rate_args[0],
+    'total_requests': rate_args[1],
+    'successful_requests': rate_args[2],
+    'failed_requests': rate_args[3],
+    'success_rate': round(rate, 4),
+    'transactions': txns
 }
-EOF
+with open(output_file, 'w') as f:
+    json.dump(report, f, indent=2)
+" "$total_users" "$total_requests" "$successful_requests" "$failed_requests" "$TXN_FILE" "$OUTPUT"
+
+rm -f "$TXN_FILE"
 
 # Print markdown to stdout
 echo "### Load Test Report"
