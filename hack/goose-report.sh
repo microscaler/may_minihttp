@@ -1,0 +1,130 @@
+#!/usr/bin/env bash
+# Extract structured metrics from goose test output.
+#
+# Reads goose stdout (which contains the print_goose_report() output),
+# parses key metrics, and produces:
+#   - JSON report (written to --output)
+#   - Markdown table (printed to stdout)
+#
+# Usage: hack/goose-report.sh --output report.json < goose-stdout.txt
+
+set -euo pipefail
+
+OUTPUT=""
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --output) OUTPUT="$2"; shift 2 ;;
+        *) shift ;;
+    esac
+done
+
+if [[ -z "$OUTPUT" ]]; then
+    echo "Usage: $0 --output <file> < input.txt" >&2
+    exit 1
+fi
+
+# Read stdin into variable
+GOOSE_STDOUT="$(cat)"
+
+# Parse from print_goose_report() output
+# We look for lines like:
+#   Total users spawned: N
+#   Total requests:      N
+#   Successful requests: N (X.X%)
+#   Failed requests:     N (X.X%)
+#   GET /:
+#     Requests: N
+#     Average:  X.XXms
+#     Min:      X.XXms
+#     Max:      X.XXms
+
+total_users=$(echo "$GOOSE_STDOUT" | grep -oP 'Total users spawned: \K\d+' || echo "0")
+total_requests=$(echo "$GOOSE_STDOUT" | grep -oP 'Total requests: +\K\d+' || echo "0")
+successful_requests=$(echo "$GOOSE_STDOUT" | grep -oP 'Successful requests: +\K\d+' || echo "0")
+failed_requests=$(echo "$GOOSE_STDOUT" | grep -oP 'Failed requests: +\K\d+' || echo "0")
+
+# Extract per-transaction metrics
+# Pattern: "GET /path:" followed by Requests/Average/Min/Max lines
+transactions=""
+in_request=0
+method=""
+path=""
+req_count=""
+avg_ms=""
+min_ms=""
+max_ms=""
+
+while IFS= read -r line; do
+    if [[ "$line" =~ ^[[:space:]]+(GET|POST|PUT|DELETE|PATCH|HEAD|OPTIONS)[[:space:]]+(.+):[[:space:]]*$ ]]; then
+        # Flush previous transaction
+        if [[ -n "$method" && -n "$req_count" ]]; then
+            transactions="${transactions}
+{\"method\":\"${method}\",\"path\":\"${path}\",\"requests\":${req_count},\"avg_ms\":${avg_ms:-0},\"min_ms\":${min_ms:-0},\"max_ms\":${max_ms:-0}}"
+        fi
+        method="${BASH_REMATCH[1]}"
+        path="${BASH_REMATCH[2]}"
+        req_count=""
+        avg_ms=""
+        min_ms=""
+        max_ms=""
+        in_request=1
+    elif [[ $in_request -eq 1 ]]; then
+        if [[ "$line" =~ Requests:[[:space:]]+(\d+) ]]; then
+            req_count="${BASH_REMATCH[1]}"
+        elif [[ "$line" =~ Average:[[:space:]]+([0-9.]+)ms ]]; then
+            avg_ms="${BASH_REMATCH[1]}"
+        elif [[ "$line" =~ Min:[[:space:]]+([0-9.]+)ms ]]; then
+            min_ms="${BASH_REMATCH[1]}"
+        elif [[ "$line" =~ Max:[[:space:]]+([0-9.]+)ms ]]; then
+            max_ms="${BASH_REMATCH[1]}"
+        fi
+    fi
+done <<< "$GOOSE_STDOUT"
+
+# Flush last transaction
+if [[ -n "$method" && -n "$req_count" ]]; then
+    transactions="${transactions}
+{\"method\":\"${method}\",\"path\":\"${path}\",\"requests\":${req_count},\"avg_ms\":${avg_ms:-0},\"min_ms\":${min_ms:-0},\"max_ms\":${max_ms:-0}}"
+done
+
+# Build JSON
+cat > "$OUTPUT" <<EOF
+{
+  "total_users": ${total_users},
+  "total_requests": ${total_requests},
+  "successful_requests": ${successful_requests},
+  "failed_requests": ${failed_requests},
+  "success_rate": $(echo "scale=4; ${successful_requests} / (${total_requests} + 1)" | bc 2>/dev/null || echo "0"),
+  "transactions": [${transactions}
+  ]
+}
+EOF
+
+# Print markdown to stdout
+echo "### Load Test Report"
+echo ""
+echo "| Metric | Value |"
+echo "|--------|-------|"
+echo "| Total users spawned | ${total_users} |"
+echo "| Total requests | ${total_requests} |"
+echo "| Successful requests | ${successful_requests} |"
+echo "| Failed requests | ${failed_requests} |"
+echo ""
+echo "#### Per-Transaction"
+echo ""
+echo "| Method | Path | Requests | Avg (ms) | Min (ms) | Max (ms) |"
+echo "|--------|------|----------|----------|----------|----------|"
+
+while IFS= read -r tline; do
+    if [[ -z "$tline" ]]; then continue; fi
+    t_method=$(echo "$tline" | grep -oP '"method":"\K[^"]+')
+    t_path=$(echo "$tline" | grep -oP '"path":"\K[^"]+')
+    t_req=$(echo "$tline" | grep -oP '"requests":\K\d+')
+    t_avg=$(echo "$tline" | grep -oP '"avg_ms":\K[0-9.]+')
+    t_min=$(echo "$tline" | grep -oP '"min_ms":\K[0-9.]+')
+    t_max=$(echo "$tline" | grep -oP '"max_ms":\K[0-9.]+')
+    if [[ -n "$t_method" ]]; then
+        echo "| ${t_method} | ${t_path} | ${t_req} | ${t_avg} | ${t_min} | ${t_max} |"
+    fi
+done <<< "$transactions"
+echo ""

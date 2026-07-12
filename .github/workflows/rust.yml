@@ -135,10 +135,217 @@ jobs:
             goose-*.txt
           retention-days: 7
 
+  generate-reports:
+    name: Generate test reports
+    runs-on: ubuntu-latest
+    needs: [tests, goose-load-tests]
+    if: always()
+    steps:
+      - name: Checkout sources
+        uses: actions/checkout@v5
+
+      # Download all nextest artifact groups
+      - name: Download nextest reports (default, ubuntu)
+        uses: actions/download-artifact@v4
+        with:
+          name: reports-default-ubuntu-latest
+          path: reports/default-ubuntu/
+      - name: Download nextest reports (client, ubuntu)
+        uses: actions/download-artifact@v4
+        if: always()
+        with:
+          name: reports-client-ubuntu-latest
+          path: reports/client-ubuntu/
+      - name: Download nextest reports (default, windows)
+        uses: actions/download-artifact@v4
+        if: always()
+        with:
+          name: reports-default-windows-latest
+          path: reports/default-windows/
+      - name: Download nextest reports (client, windows)
+        uses: actions/download-artifact@v4
+        if: always()
+        with:
+          name: reports-client-windows-latest
+          path: reports/client-windows/
+
+      # Download goose reports
+      - name: Download goose reports
+        uses: actions/download-artifact@v4
+        if: always()
+        with:
+          name: goose-reports
+          path: reports/goose/
+
+      # Generate combined markdown report
+      - name: Build combined report
+        id: report
+        shell: bash
+        run: |
+          OUT="target/reports/combined.md"
+          mkdir -p target/reports
+
+          echo "## Test Report" > "$OUT"
+          echo "" >> "$OUT"
+
+          # --- Nextest: Unit Tests ---
+          for cfg in "default-ubuntu" "client-ubuntu" "default-windows" "client-windows"; do
+            echo "---" >> "$OUT"
+            echo "### Unit Tests ($cfg)" >> "$OUT"
+            echo "" >> "$OUT"
+            f="reports/$cfg/unit-*-report.md"
+            if ls reports/$cfg/unit-*-report.md >/dev/null 2>&1; then
+              cat reports/$cfg/unit-*-report.md >> "$OUT"
+            else
+              echo "Skipped (no unit test artifacts)" >> "$OUT"
+            fi
+            echo "" >> "$OUT"
+
+            # Integration tests (client only, ubuntu only)
+            if [[ "$cfg" == "client-ubuntu" ]]; then
+              echo "### Integration Tests ($cfg)" >> "$OUT"
+              echo "" >> "$OUT"
+              if ls reports/$cfg/integration-*-report.md >/dev/null 2>&1; then
+                cat reports/$cfg/integration-*-report.md >> "$OUT"
+              else
+                echo "Skipped (no integration test artifacts)" >> "$OUT"
+              fi
+              echo "" >> "$OUT"
+            fi
+          done
+
+          # --- Goose Load Test Report ---
+          echo "---" >> "$OUT"
+          echo "### Load Tests" >> "$OUT"
+          echo "" >> "$OUT"
+          if [[ -f "reports/goose/goose-report.md" ]]; then
+            cat reports/goose/goose-report.md >> "$OUT"
+          else
+            echo "Skipped (no goose report found)" >> "$OUT"
+          fi
+          echo "" >> "$OUT"
+
+          # Also generate JSON report
+          python3 hack/nextest-report.py \
+            --title "Combined Test Report" \
+            --output-json target/reports/combined.json \
+            reports/default-ubuntu/unit-default-ubuntu-latest.json \
+            reports/client-ubuntu/unit-client-ubuntu-latest.json \
+            reports/default-windows/unit-default-windows-latest.json \
+            reports/client-windows/unit-client-windows-latest.json \
+            2>&1 \
+            > target/reports/summary.md || true
+
+      # Upload combined reports
+      - name: Upload combined reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: combined-reports
+          path: |
+            target/reports/combined.md
+            target/reports/combined.json
+            target/reports/summary.md
+          retention-days: 7
+
+      # Post PR comment (PR events only)
+      - name: Post PR comment with reports
+        if: github.event_name == 'pull_request'
+        run: |
+          if [[ ! -f target/reports/combined.md ]]; then
+            echo "⚠️ Report generation failed" > /tmp/pr-body.md
+          else
+            # Truncate if too long (GitHub PR comment limit is ~65536 chars)
+            head -c 50000 target/reports/combined.md > /tmp/pr-body.md
+          fi
+
+          # Check for existing bot comment and update, otherwise create
+          COMMENT_ID=$(gh api repos/${{ github.repository }}/issues/${{ github.event.pull_request.number }}/comments \
+            --jq '.[] | select(.user.login == "github-actions[bot]" and (.body | contains("## Test Report"))) | .id' \
+            2>/dev/null | head -1)
+
+          if [[ -n "$COMMENT_ID" ]]; then
+            gh api repos/${{ github.repository }}/issues/comments/${COMMENT_ID} \
+              --method PATCH \
+              --field body="$(cat /tmp/pr-body.md)" \
+              2>/dev/null
+            echo "Updated existing PR comment $COMMENT_ID"
+          else
+            gh pr comment ${{ github.event.pull_request.number }} \
+              --body-file /tmp/pr-body.md \
+              2>/dev/null
+            echo "Created new PR comment"
+          fi
+
+  post-pr-comment:
+    name: Post PR comment with reports
+    runs-on: ubuntu-latest
+    needs: [lints, tests, goose-load-tests]
+    if: always() && github.event_name == 'pull_request'
+    steps:
+      - name: Checkout sources (for report script)
+        uses: actions/checkout@v5
+      - name: Download all test reports
+        uses: actions/download-artifact@v4
+        with:
+          path: reports/
+      - name: Download goose reports
+        if: always()
+        uses: actions/download-artifact@v4
+        with:
+          name: goose-reports
+          path: reports/goose/
+      - name: Build PR comment
+        id: build_comment
+        run: |
+          COMMENT_FILE="/tmp/pr-comment.md"
+          echo "## Test & Load Report" > "$COMMENT_FILE"
+          echo "" >> "$COMMENT_FILE"
+          echo "| Job | Result |" >> "$COMMENT_FILE"
+          echo "|-----|--------|" >> "$COMMENT_FILE"
+          echo "| Lints | ${{ needs.lints.result }} |" >> "$COMMENT_FILE"
+          echo "| Unit tests (default) | ${{ needs.tests.result }} |" >> "$COMMENT_FILE"
+          echo "| Integration/Perf tests (client) | ${{ needs.tests.result }} |" >> "$COMMENT_FILE"
+          echo "| Goose load tests | ${{ needs.goose-load-tests.result }} |" >> "$COMMENT_FILE"
+          echo "" >> "$COMMENT_FILE"
+          echo "---" >> "$COMMENT_FILE"
+          echo "" >> "$COMMENT_FILE"
+
+          # Combine all markdown reports from artifacts
+          for md_file in $(find reports/ -name '*-report.md' 2>/dev/null | sort); do
+            if [[ -f "$md_file" ]]; then
+              echo "### $(basename "$(dirname "$md_file")" | sed 's/reports-//')" >> "$COMMENT_FILE"
+              echo "" >> "$COMMENT_FILE"
+              cat "$md_file" >> "$COMMENT_FILE"
+              echo "" >> "$COMMENT_FILE"
+              echo "---" >> "$COMMENT_FILE"
+              echo "" >> "$COMMENT_FILE"
+            fi
+          done
+
+          # Append goose load test summary
+          if [[ -f "reports/goose/goose-report.md" ]]; then
+            echo "### Load Tests (Goose)" >> "$COMMENT_FILE"
+            echo "" >> "$COMMENT_FILE"
+            cat reports/goose/goose-report.md >> "$COMMENT_FILE"
+            echo "" >> "$COMMENT_FILE"
+          else
+            echo "_No goose reports generated._" >> "$COMMENT_FILE"
+          fi
+
+          cat "$COMMENT_FILE"
+          echo "comment_size=$(wc -c < "$COMMENT_FILE")" >> $GITHUB_OUTPUT
+      - name: Update existing PR comment or create new
+        uses: peter-evans/create-or-update-comment@v4
+        with:
+          issue-number: ${{ github.event.pull_request.number }}
+          body-file: /tmp/pr-comment.md
+          edit-mode: replace
+
   ci-summary:
     name: CI summary
     runs-on: ubuntu-latest
-    needs: [lints, tests, goose-load-tests]
+    needs: [lints, tests, goose-load-tests, post-pr-comment]
     if: always()
     steps:
       - name: Write summary
@@ -150,3 +357,5 @@ jobs:
           echo "| Lints | ${{ needs.lints.result }} |" >> $GITHUB_STEP_SUMMARY
           echo "| Tests | ${{ needs.tests.result }} |" >> $GITHUB_STEP_SUMMARY
           echo "| Goose load tests | ${{ needs.goose-load-tests.result }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Post PR comment | ${{ needs.post-pr-comment.result }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Generate reports | ${{ needs.generate-reports.result }} |" >> $GITHUB_STEP_SUMMARY
