@@ -212,10 +212,6 @@ impl Drop for HeaderTestServer {
 }
 
 fn send_request_with_headers(port: u16, num_headers: usize) -> io::Result<String> {
-    let mut stream = TcpStream::connect(format!("127.0.0.1:{}", port))?;
-    stream.set_read_timeout(Some(Duration::from_secs(5)))?;
-    stream.set_write_timeout(Some(Duration::from_secs(5)))?;
-
     // Build HTTP request with specified number of headers
     let mut request = String::from("GET /test HTTP/1.1\r\n");
     request.push_str("Host: localhost\r\n");
@@ -226,6 +222,36 @@ fn send_request_with_headers(port: u16, num_headers: usize) -> io::Result<String
     }
 
     request.push_str("\r\n"); // End of headers
+
+    // On Windows with `may`'s IOCP scheduler, the server coroutine needs
+    // time to process pending I/O events. Retry with short backoff to
+    // handle scheduling delays.
+    let mut last_err = None;
+    for attempt in 0..3u32 {
+        if attempt > 0 {
+            thread::sleep(Duration::from_millis(100 * attempt as u64));
+        }
+        match send_single_request(port, &request) {
+            Ok(response) => return Ok(response),
+            Err(e) => {
+                // Retry on timeout/refused (common on Windows IOCP)
+                let kind = e.kind();
+                if kind != io::ErrorKind::TimedOut
+                    && kind != io::ErrorKind::ConnectionRefused
+                {
+                    return Err(e);
+                }
+                last_err = Some(e);
+            }
+        }
+    }
+    Err(last_err.expect("loop always has error"))
+}
+
+fn send_single_request(port: u16, request: &str) -> io::Result<String> {
+    let mut stream = TcpStream::connect(format!("127.0.0.1:{}", port))?;
+    stream.set_read_timeout(Some(Duration::from_secs(5)))?;
+    stream.set_write_timeout(Some(Duration::from_secs(5)))?;
 
     // Send request
     stream.write_all(request.as_bytes())?;
