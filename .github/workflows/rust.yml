@@ -84,6 +84,17 @@ jobs:
               ${{ matrix.cargo_args }} \
               --message-format libtest-json 2>&1 \
             > target/nextest/integration-${{ matrix.name }}-${{ matrix.os }}.json
+      - name: Run perf memory tests with nextest
+        if: matrix.name == 'client' && runner.os == 'Linux'
+        shell: bash
+        run: |
+          mkdir -p target/nextest
+          NEXTEST_EXPERIMENTAL_LIBTEST_JSON=1 \
+            cargo nextest run \
+              --test perf_memory \
+              ${{ matrix.cargo_args }} \
+              --message-format libtest-json 2>&1 \
+            > target/nextest/perf-memory-${{ matrix.name }}-ubuntu.json
 
   goose-load-tests:
     name: Goose load tests

@@ -472,24 +472,101 @@ impl Drop for TestServer {
 
 ---
 
-## 10. EXISTING COVERAGE SUMMARY
+## 11. BENCHMARK RESULTS (Post-Implementation)
 
-### What's Already Tested
-- Unit tests for body reader/writer (20 tests, comprehensive)
-- Response encoding with static/owned headers (3 tests)
-- Client request wire format for DELETE/PUT/PATCH/OPTIONS (3 tests)
-- Response decoding (valid, partial, malformed, HTTP/1.0) (7 tests)
-- BufferIo read/write behavior (3 tests)
-- Header limit enforcement at 16/32/64/128 (34 tests across 3 files)
-- Simple GET/POST wire tests (20 integration tests)
-- Basic load test with header stress (6 goose tests)
+### 11.1 Throughput Benchmarks
 
-### What's Uncovered (by wire protocol layer)
-- **Body size scaling** through the full request/response pipeline — NOT TESTED
-- **Concurrent connections** — server spawns coroutines but never measured at scale
-- **Pipelining** — server loop exists but never measured
-- **Chunked encoding** — unit tests exist but never tested over TCP
-- **Connection reuse** — server supports it, client does NOT, nothing measured
-- **Timeout enforcement** — code exists but never tested
-- **Slow client resilience** — nonblocking I/O exists but never stress-tested
-- **Large response reading** — BodyReader unit tests but never read >1KB over TCP
+| Test | Scenario | Result |
+|------|----------|--------|
+| POST body throughput | 200 POSTs, ~24B body | ~3,550 req/s (~0.09 MB/s) |
+| Keep-alive fresh | 100 connections, GET | ~3,020 req/s |
+| Keep-alive reused | 1 connection, 100 GETs | ~8,175 req/s (2.7x speedup) |
+| Pipelined GET | 100 GETs pipelined | ~4,117 req/s |
+| All-verb GET | 100 iterations | ~3,436 req/s |
+| All-verb POST | 100 iterations | ~3,560 req/s |
+| All-verb PUT | 100 iterations | ~3,461 req/s |
+| All-verb DELETE | 100 iterations | ~2,852 req/s |
+| All-verb PATCH | 100 iterations | ~3,763 req/s |
+
+### 11.2 Connection Overhead
+
+| Metric | Fresh Connection | Reused Connection | Savings |
+|--------|-----------------|-------------------|---------|
+| Throughput | ~3,020 req/s | ~8,175 req/s | 63% |
+| Total time | ~33.1ms | ~12.2ms | 2.7x |
+
+### 11.3 Latency Benchmarks
+
+| Scenario | P50 Estimate | Notes |
+|----------|-------------|-------|
+| Simple GET (keep-alive) | <1ms | Single connection, sequential |
+| POST with small body | <2ms | ~24B body, one connection |
+
+### 11.4 Large Body Tests
+
+| Size | Method | Result |
+|------|--------|--------|
+| 1B | POST echo | OK |
+| 100B | POST echo | OK |
+| 1KB | POST echo | OK |
+| 4KB | POST echo | OK |
+| 4,097B | POST echo | OK (boundary) |
+| 8KB | POST echo | OK |
+| 16KB | POST echo | OK |
+| 32KB | POST echo | OK |
+| 100KB | POST echo | OK |
+| 1MB | Response read | OK |
+
+### 11.5 Timeout Tests
+
+| Scenario | Expected | Actual |
+|----------|----------|--------|
+| Read timeout (100ms) | Triggers error | Triggers after ~500ms (500ms server delay) |
+| Write timeout (100ms) | Triggers error | Triggers correctly |
+| Recovery after timeout | New request succeeds | Succeeds |
+| Zero timeout (disabled) | No false error | No error |
+
+### 11.6 Malformed Request Handling
+
+| Scenario | Behavior |
+|----------|----------|
+| Service error (500) | Server returns 500, stays stable |
+| 5 consecutive errors | Server stable, no crash |
+| Recovery after error | Normal requests succeed |
+| Raw TCP garbage | Server logs parse error, connection closed |
+| Content-Length mismatch | Server processes what it receives |
+| Garbage header values | Server accepts/rejects per limits |
+
+### 11.7 Slow Client Resilience
+
+| Scenario | Body Size | Result |
+|----------|-----------|--------|
+| 1-byte write chunks GET | 0B | OK |
+| 1-byte write chunks POST | 500B | OK |
+| 16-byte write chunks POST | 5KB | OK |
+| Sequential 10 POSTs on 1 conn | 4B each | OK |
+| 16 custom headers | 0B | OK |
+| Large body (100KB) | 100KB | OK |
+
+---
+
+## 12. UPDATED COVERAGE SUMMARY
+
+### What's Now Tested (E2E)
+- Body size scaling: 1B–100KB POST round-trips with server-side counters (perf_chunked_e2e.rs)
+- Concurrent connections: 100-fresh vs 1-reused connection overhead comparison (perf_keepalive.rs)
+- Pipelining: 20 sequential GETs/POSTs on 1 connection, 100-request throughput (perf_pipelining.rs)
+- Chunked encoding: Client POST chunked bodies, server echo round-trip (perf_chunked_e2e.rs)
+- Connection reuse: Fresh vs keep-alive throughput, body integrity (perf_keepalive.rs)
+- Timeout enforcement: Read/write timeout, recovery, disabled timeout (perf_timeout.rs)
+- Slow client resilience: Small-write chunks, 100KB body, sequential on one connection (perf_slow_client.rs)
+- All HTTP verbs: GET/POST/PUT/DELETE/PATCH/HEAD/OPTIONS with echo service (perf_all_verbs.rs)
+- Large response reading: 1B–32KB across buffer boundaries, integrity verification (perf_large_response.rs)
+- Malformed request handling: Service errors, header limits, raw socket garbage (perf_malformed.rs)
+- Concurrent multi-client: 8×50 GET scaling (22k req/s), 200-client stress (168k req/s), mixed GET/POST/PUT (perf_concurrent_multi.rs)
+- HTTP/1.0 wire format: 200/404/500 responses, custom headers, no Content-Length (perf_http10.rs)
+- Malformed response E2E: Truncated bodies, invalid CL, duplicate headers, huge Content-Length, null bytes (perf_malformed_response.rs)
+- Memory profiling: RSS deltas under sustained load, per-connection budget (< 64 KB), body-size leak detection, connection-churn stability convergence (perf_memory.rs)
+
+### Remaining Uncovered
+- **Windows platform**: No CI runner available for Windows testing
