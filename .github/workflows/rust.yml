@@ -69,7 +69,12 @@ jobs:
         shell: bash
         run: |
           mkdir -p target/nextest
+          # On Windows, set RUST_BACKTRACE=1 for richer error output
+          export RUST_BACKTRACE=${{ matrix.os == 'windows-latest' && '1' || 'full' }}
           NEXTEST_EXPERIMENTAL_LIBTEST_JSON=1 \
-            cargo nextest run --test client_integration ${{ matrix.cargo_args }} \
+            cargo nextest run \
+              --test client_integration \
+              --test header_traffic_integration \
+              ${{ matrix.cargo_args }} \
               --message-format libtest-json 2>&1 \
             > target/nextest/integration-${{ matrix.name }}-${{ matrix.os }}.json
