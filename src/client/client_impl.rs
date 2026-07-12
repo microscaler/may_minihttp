@@ -18,15 +18,12 @@ pub struct HttpClient {
 }
 
 /// On Windows, `may::net::TcpStream::connect` returns
-/// `io::ErrorKind::Uncategorized` for WSAECONNREFUSED (10061).
-/// Remap it so the client API is consistent across platforms.
+/// WSAECONNREFUSED (10061) for refused connections. Remap it so the
+/// client API reports `ErrorKind::ConnectionRefused` consistently.
 #[cfg(windows)]
 fn connect_remap(e: io::Error) -> io::Error {
-    if e.kind() == io::ErrorKind::Uncategorized && e.raw_os_error() == Some(10061) {
-        io::Error::new(
-            io::ErrorKind::ConnectionRefused,
-            e.into_inner().unwrap_or("connection refused"),
-        )
+    if e.raw_os_error() == Some(10061) {
+        io::Error::new(io::ErrorKind::ConnectionRefused, "connection refused")
     } else {
         e
     }
