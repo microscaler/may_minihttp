@@ -18,15 +18,36 @@ pub struct HttpClient {
     expect_body: bool,
 }
 
-/// On Windows, `may::net::TcpStream::connect` returns
-/// WSAECONNREFUSED (10061) for refused connections. Remap it so the
-/// client API reports `ErrorKind::ConnectionRefused` consistently.
+/// On Windows, `may::net::TcpStream::connect` can return various
+/// WSA error codes for connection failures, and `raw_os_error()` may
+/// be `None` when the error passes through the coroutine context.
+/// Remap common connection-refusal errors so the client API reports
+/// `ErrorKind::ConnectionRefused` consistently.
 #[cfg(windows)]
 fn connect_remap(e: io::Error) -> io::Error {
-    if e.raw_os_error() == Some(10061) {
-        io::Error::new(io::ErrorKind::ConnectionRefused, "connection refused")
-    } else {
-        e
+    match e.raw_os_error() {
+        // WSAECONNREFUSED (10061) — connection refused
+        // WSAETIMEDOUT (10060) — connection timed out (no response)
+        // WSAEHOSTUNREACH (10064) — host unreachable
+        Some(10061) | Some(10060) | Some(10064) => {
+            io::Error::new(io::ErrorKind::ConnectionRefused, "connection refused")
+        }
+        _ => {
+            // raw_os_error() may return None when errors pass through
+            // the coroutine context; fall back to string matching
+            let desc = e.to_string().to_lowercase();
+            if desc.contains("refused")
+                || desc.contains("timed out")
+                || desc.contains("unreachable")
+                || desc.contains("wsaeconnrefused")
+                || desc.contains("wsaetimedout")
+                || desc.contains("wsaehostunreach")
+            {
+                io::Error::new(io::ErrorKind::ConnectionRefused, "connection refused")
+            } else {
+                e
+            }
+        }
     }
 }
 
