@@ -228,7 +228,7 @@ fn send_request_with_headers(port: u16, num_headers: usize) -> io::Result<String
         request.push_str(&format!("X-Custom-Header-{}: value-{}\r\n", i, i));
     }
 
-    request.push_str("Connection: close\r\n\r\n");
+    request.push_str("\r\n"); // End of headers
 
     // On Windows the server uses blocking reads; retry briefly while the
     // previous connection handler releases its worker thread.
@@ -274,6 +274,10 @@ fn send_single_request(port: u16, request: &str) -> io::Result<String> {
             Err(e) => return Err(e),
         }
     }
+
+    // Half-close so Windows blocking server handlers exit their read loop
+    // without adding Connection: close to the header count under test.
+    let _ = stream.shutdown(std::net::Shutdown::Write);
 
     String::from_utf8(response).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
 }
