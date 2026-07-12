@@ -71,6 +71,13 @@ jobs:
               --message-format libtest-json \
               2>&1 \
             > target/nextest/unit-${{ matrix.name }}-${{ matrix.os }}.json
+          # Generate human-readable report + JSON summary from JSONL
+          python3 hack/nextest-report.py \
+            --title "Unit Tests — ${{ matrix.os }} / ${{ matrix.name }}" \
+            --output-json target/nextest/unit-${{ matrix.name }}-${{ matrix.os }}-summary.json \
+            target/nextest/unit-${{ matrix.name }}-${{ matrix.os }}.json \
+            2>&1 \
+            > target/nextest/unit-${{ matrix.name }}-${{ matrix.os }}-report.md
       - name: Run integration tests with nextest
         if: matrix.name == 'client'
         shell: bash
@@ -84,6 +91,12 @@ jobs:
               ${{ matrix.cargo_args }} \
               --message-format libtest-json 2>&1 \
             > target/nextest/integration-${{ matrix.name }}-${{ matrix.os }}.json
+          python3 hack/nextest-report.py \
+            --title "Integration Tests — ${{ matrix.os }} / ${{ matrix.name }}" \
+            --output-json target/nextest/integration-${{ matrix.name }}-${{ matrix.os }}-summary.json \
+            target/nextest/integration-${{ matrix.name }}-${{ matrix.os }}.json \
+            2>&1 \
+            > target/nextest/integration-${{ matrix.name }}-${{ matrix.os }}-report.md
       - name: Run perf memory tests with nextest
         if: matrix.name == 'client' && runner.os == 'Linux'
         shell: bash
@@ -95,6 +108,12 @@ jobs:
               ${{ matrix.cargo_args }} \
               --message-format libtest-json 2>&1 \
             > target/nextest/perf-memory-${{ matrix.name }}-ubuntu.json
+          python3 hack/nextest-report.py \
+            --title "Memory Profiling — ${{ matrix.os }} / ${{ matrix.name }}" \
+            --output-json target/nextest/perf-memory-${{ matrix.name }}-summary.json \
+            target/nextest/perf-memory-${{ matrix.name }}-ubuntu.json \
+            2>&1 \
+            > target/nextest/perf-memory-${{ matrix.name }}-report.md
       - name: Upload test reports
         if: always()
         uses: actions/upload-artifact@v4
