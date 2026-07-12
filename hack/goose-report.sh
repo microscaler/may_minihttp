@@ -27,26 +27,17 @@ fi
 GOOSE_STDOUT="$(cat)"
 
 # Parse from print_goose_report() output
-# We look for lines like:
-#   Total users spawned: N
-#   Total requests:      N
-#   Successful requests: N (X.X%)
-#   Failed requests:     N (X.X%)
-#   GET /:
-#     Requests: N
-#     Average:  X.XXms
-#     Min:      X.XXms
-#     Max:      X.XXms
-
 total_users=$(echo "$GOOSE_STDOUT" | grep -oP 'Total users spawned: \K\d+' || echo "0")
 total_requests=$(echo "$GOOSE_STDOUT" | grep -oP 'Total requests: +\K\d+' || echo "0")
 successful_requests=$(echo "$GOOSE_STDOUT" | grep -oP 'Successful requests: +\K\d+' || echo "0")
 failed_requests=$(echo "$GOOSE_STDOUT" | grep -oP 'Failed requests: +\K\d+' || echo "0")
 
-# Extract per-transaction metrics
-# Pattern: "GET /path:" followed by Requests/Average/Min/Max lines
+# Extract per-transaction metrics from Response Times section
+# Goose outputs two patterns:
+#   "  GET /path:" (normal: method + path)
+#   "  GET GET :"   (double-word: just the method repeated)
+# followed by indented Requests/Average/Min/Max lines
 transactions=""
-in_request=0
 method=""
 path=""
 req_count=""
@@ -54,22 +45,30 @@ avg_ms=""
 min_ms=""
 max_ms=""
 
+extract_number() {
+    local val="${1:-0}"
+    # Strip trailing 'ms' if present
+    val="${val%%ms*}"
+    echo "$val"
+}
+
 while IFS= read -r line; do
+    # Detect method line: "  GET /path:" or "  GET GET :"
     if [[ "$line" =~ ^[[:space:]]+(GET|POST|PUT|DELETE|PATCH|HEAD|OPTIONS)[[:space:]]+(.+):[[:space:]]*$ ]]; then
         # Flush previous transaction
         if [[ -n "$method" && -n "$req_count" ]]; then
             transactions="${transactions}
-{\"method\":\"${method}\",\"path\":\"${path}\",\"requests\":${req_count},\"avg_ms\":${avg_ms:-0},\"min_ms\":${min_ms:-0},\"max_ms\":${max_ms:-0}}"
+{\"method\":\"${method}\",\"path\":\"${path}\",\"requests\":${req_count},\"avg_ms\":$(extract_number "$avg_ms"),\"min_ms\":$(extract_number "$min_ms"),\"max_ms\":$(extract_number "$max_ms")}"
         fi
         method="${BASH_REMATCH[1]}"
+        # Second capture could be "GET" (double-word) or "/path" (normal)
         path="${BASH_REMATCH[2]}"
         req_count=""
         avg_ms=""
         min_ms=""
         max_ms=""
-        in_request=1
-    elif [[ $in_request -eq 1 ]]; then
-        if [[ "$line" =~ Requests:[[:space:]]+(\d+) ]]; then
+    elif [[ -n "$method" ]]; then
+        if [[ "$line" =~ Requests:[[:space:]]+([0-9]+) ]]; then
             req_count="${BASH_REMATCH[1]}"
         elif [[ "$line" =~ Average:[[:space:]]+([0-9.]+)ms ]]; then
             avg_ms="${BASH_REMATCH[1]}"
@@ -84,8 +83,8 @@ done <<< "$GOOSE_STDOUT"
 # Flush last transaction
 if [[ -n "$method" && -n "$req_count" ]]; then
     transactions="${transactions}
-{\"method\":\"${method}\",\"path\":\"${path}\",\"requests\":${req_count},\"avg_ms\":${avg_ms:-0},\"min_ms\":${min_ms:-0},\"max_ms\":${max_ms:-0}}"
-done
+{\"method\":\"${method}\",\"path\":\"${path}\",\"requests\":${req_count},\"avg_ms\":$(extract_number "$avg_ms"),\"min_ms\":$(extract_number "$min_ms"),\"max_ms\":$(extract_number "$max_ms")}"
+fi
 
 # Build JSON
 cat > "$OUTPUT" <<EOF
