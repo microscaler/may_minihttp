@@ -10,17 +10,18 @@ Reads one or more libtest-json JSONL files (produced by nextest with
 Expected JSONL line shapes (nextest libtest-json):
   - {"type":"suite_start","num_tests":N}
   - {"type":"test_suite_start","root":"crate_name"}
-  - {"type":"test","name":"test_name","status":"passed","stdout":"..."}
-  - {"type":"test","name":"test_name","status":"failed","stdout":"...","stdout_data":"..."}
-  - {"type":"test","name":"test_name","status":"ignored"}
-  - {"type":"test","name":"test_name","status":"errored","stdout":"...","stderr":"..."}
+  - {"type":"test","name":"test_name","event":"ok","exec_time":...}
+  - {"type":"test","name":"test_name","event":"failed",...}
+  - {"type":"test","name":"test_name","event":"started"}  (skip this)
   - {"type":"suite_end","status":"success"|"failure"}
 
-This script handles both shapes.
+This script handles both the "event":"ok" shape and the legacy
+"status":"passed" shape.
 """
 
 import argparse
 import json
+import re
 import sys
 from collections import defaultdict
 from datetime import datetime, timezone
@@ -33,7 +34,7 @@ def parse_jsonl_files(paths):
 
     for path in paths:
         with open(path, "r") as f:
-            for line_num, line in enumerate(f, 1):
+            for line in f:
                 line = line.strip()
                 if not line:
                     continue
@@ -42,17 +43,67 @@ def parse_jsonl_files(paths):
                 except json.JSONDecodeError:
                     continue
 
-                if event.get("type") == "suite_start":
+                etype = event.get("type", "")
+
+                if etype == "suite_start":
                     suite_start = event
-                elif event.get("type") == "test":
-                    # Normalize: add root crate if not present
+                elif etype == "test":
+                    # nextest libtest-json emits a "started" event per test
+                    # (no exec_time) plus a "ok"/"failed" leaf event (has
+                    # exec_time).  Skip the started sibling to avoid
+                    # double-counting.
+                    if event.get("event") == "started":
+                        continue
                     if "root" not in event:
                         event["root"] = "may_minihttp"
                     tests.append(event)
-                elif event.get("type") == "suite_end":
-                    pass
+                # suite_end and test_suite_start are informational only
 
     return tests, suite_start
+
+
+def normalize_status(t):
+    """Return a normalised status string from a test event."""
+    # First try the "status" key (some tools use this)
+    s = t.get("status")
+    if s:
+        return s.lower()
+
+    # nextest libtest-json uses "event":"ok"/"failed"/"skipped"/...
+    e = t.get("event")
+    if e:
+        mapping = {
+            "ok": "passed",
+            "failed": "failed",
+            "skipped": "skipped",
+            "ignored": "ignored",
+            "errored": "errored",
+        }
+        return mapping.get(e.lower(), "unknown")
+
+    return "unknown"
+
+
+def parse_duration(t):
+    """Extract duration in seconds from a test event, or None."""
+    d = t.get("exec_time")
+    if d is None:
+        d = t.get("exec_time_secs")
+    if d is not None:
+        try:
+            return float(d)
+        except (ValueError, TypeError):
+            return None
+
+    # Fallback: look for "N.NNs" or "N.Nms" in stdout
+    stdout = t.get("stdout", "")
+    if isinstance(stdout, str):
+        m = re.search(r"(\d+\.\d+)(s|ms)\b", stdout)
+        if m:
+            val = float(m.group(1))
+            return val if m.group(2) == "s" else val / 1000.0
+
+    return None
 
 
 def analyze_tests(tests):
@@ -64,48 +115,30 @@ def analyze_tests(tests):
         "errored": 0,
         "ignored": 0,
         "skipped": 0,
-        "by_crate": defaultdict(lambda: {"passed": 0, "failed": 0, "errored": 0, "ignored": 0, "skipped": 0}),
+        "by_crate": defaultdict(
+            lambda: {
+                "passed": 0, "failed": 0, "errored": 0,
+                "ignored": 0, "skipped": 0,
+            }
+        ),
         "by_status": defaultdict(list),
         "slowest": [],
     }
 
     for t in tests:
-        status = t.get("status", "unknown")
+        norm = normalize_status(t)
         name = t.get("name", "")
         root = t.get("root", "unknown")
+        duration = parse_duration(t)
 
-        # Categorize
-        if status == "passed":
-            summary["passed"] += 1
-            summary["by_crate"][root]["passed"] += 1
-        elif status == "failed":
-            summary["failed"] += 1
-            summary["by_crate"][root]["failed"] += 1
-        elif status == "errored":
-            summary["errored"] += 1
-            summary["by_crate"][root]["errored"] += 1
-        elif status == "ignored":
-            summary["ignored"] += 1
-            summary["by_crate"][root]["ignored"] += 1
+        # Increment counters
+        key = norm if norm in ("passed", "failed", "errored", "ignored", "skipped") else "skipped"
+        if norm in summary:
+            summary[norm] += 1
         else:
             summary["skipped"] += 1
-            summary["by_crate"][root]["skipped"] += 1
-
-        summary["by_status"][status].append(name)
-
-        # Duration — try from stdout if present, else skip
-        duration = None
-        if "stdout" in t and isinstance(t["stdout"], str):
-            try:
-                # Some outputs include duration info in stdout
-                import re
-                m = re.search(r'(\d+\.\d+)(s|ms)', t["stdout"])
-                if m:
-                    val = float(m.group(1))
-                    unit = m.group(2)
-                    duration = val if unit == "s" else val / 1000.0
-            except (ValueError, AttributeError):
-                pass
+        summary["by_status"][norm].append(name)
+        summary["by_crate"][root][key] += 1
 
         if duration is not None:
             summary["slowest"].append({
@@ -115,8 +148,6 @@ def analyze_tests(tests):
             })
 
     summary["slowest"].sort(key=lambda x: x["duration"], reverse=True)
-
-    # Convert defaultdicts to regular dicts for JSON serialization
     summary["by_crate"] = dict(summary["by_crate"])
     summary["by_status"] = {k: v for k, v in summary["by_status"].items()}
 
@@ -133,8 +164,8 @@ def format_markdown(summary, title="Test Report"):
     lines.append("### Overall")
     lines.append("")
     total = summary["total"]
-    lines.append(f"| Metric | Count |")
-    lines.append(f"|--------|-------|")
+    lines.append("| Metric | Count |")
+    lines.append("|--------|-------|")
     lines.append(f"| **Total** | **{total}** |")
     lines.append(f"| ✅ Passed | {summary['passed']} |")
     lines.append(f"| ❌ Failed | {summary['failed']} |")
@@ -164,7 +195,6 @@ def format_markdown(summary, title="Test Report"):
         lines.append("| Rank | Test | Duration |")
         lines.append("|------|------|----------|")
         for i, t in enumerate(top_slow, 1):
-            # Truncate long test names
             name = t["name"]
             if len(name) > 80:
                 name = name[:77] + "..."
