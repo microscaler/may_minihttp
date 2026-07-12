@@ -17,9 +17,27 @@ pub struct HttpClient {
     conn: Rc<RefCell<BufferIo<TcpStream>>>,
 }
 
+/// On Windows, `may::net::TcpStream::connect` returns
+/// `io::ErrorKind::Uncategorized` for WSAECONNREFUSED (10061).
+/// Remap it so the client API is consistent across platforms.
+#[cfg(windows)]
+fn connect_remap(e: io::Error) -> io::Error {
+    if e.kind() == io::ErrorKind::Uncategorized && e.raw_os_error() == Some(10061) {
+        io::Error::new(
+            io::ErrorKind::ConnectionRefused,
+            e.into_inner().unwrap_or("connection refused"),
+        )
+    } else {
+        e
+    }
+}
+
 impl HttpClient {
     /// Connect to the given address.
     pub fn connect<A: ToSocketAddrs>(remote: A) -> io::Result<Self> {
+        #[cfg(windows)]
+        let stream = TcpStream::connect(remote).map_err(connect_remap)?;
+        #[cfg(not(windows))]
         let stream = TcpStream::connect(remote)?;
         let stream = BufferIo::new(stream);
         Ok(HttpClient {
