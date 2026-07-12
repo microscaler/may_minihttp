@@ -167,11 +167,11 @@ def format_markdown(summary, title="Test Report"):
     lines.append("| Metric | Count |")
     lines.append("|--------|-------|")
     lines.append(f"| **Total** | **{total}** |")
-    lines.append(f"| ✅ Passed | {summary['passed']} |")
-    lines.append(f"| ❌ Failed | {summary['failed']} |")
-    lines.append(f"| ⚠️  Errored | {summary['errored']} |")
-    lines.append(f"| 🔇 Ignored | {summary['ignored']} |")
-    lines.append(f"| ⏭️  Skipped | {summary['skipped']} |")
+    lines.append(f"| Passed | {summary['passed']} |")
+    lines.append(f"| Failed | {summary['failed']} |")
+    lines.append(f"| Errored | {summary['errored']} |")
+    lines.append(f"| Ignored | {summary['ignored']} |")
+    lines.append(f"| Skipped | {summary['skipped']} |")
     lines.append("")
 
     # By crate
