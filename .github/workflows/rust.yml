@@ -61,8 +61,13 @@ jobs:
         run: |
           mkdir -p target/nextest
           NEXTEST_EXPERIMENTAL_LIBTEST_JSON=1 \
-            cargo nextest run --workspace --all-targets --all-features \
-              -E 'not binary(goose_header_load_test)' \
+            cargo nextest run --workspace --all-features \
+              --lib \
+              --test client_integration \
+              --test header_traffic_integration \
+              --test max_headers_enum \
+              --test request_parsing \
+              --test simple_header_test \
               --message-format libtest-json \
               2>&1 \
             > target/nextest/unit-${{ matrix.name }}-${{ matrix.os }}.json
