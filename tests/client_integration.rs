@@ -13,7 +13,8 @@
 
 use std::io::{self, Read, Write};
 use std::net::{TcpListener, TcpStream};
-use std::sync::Once;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Once};
 use std::thread;
 use std::time::Duration;
 
@@ -126,7 +127,8 @@ impl HttpService for TestService {
 /// waits for it to accept connections, and provides cleanup on drop.
 struct ClientTestFixture {
     port: u16,
-    handle: Option<may::coroutine::JoinHandle<()>>,
+    shutdown: Arc<AtomicBool>,
+    server_thread: Option<thread::JoinHandle<()>>,
 }
 
 impl ClientTestFixture {
@@ -136,14 +138,30 @@ impl ClientTestFixture {
         // Find an available port
         let port = find_available_port(preferred_port);
 
-        // Start the HTTP server
-        let handle = HttpServer(TestService)
-            .start(&format!("127.0.0.1:{}", port))
-            .expect("Failed to start test server");
+        // Run the MAY server on a dedicated OS thread so Windows blocking handlers
+        // do not stall the test thread's client I/O.
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let shutdown_clone = Arc::clone(&shutdown);
+        let addr = format!("127.0.0.1:{}", port);
+        let server_thread = thread::spawn(move || {
+            let handle = HttpServer(TestService)
+                .start(&addr)
+                .expect("Failed to start test server");
+
+            while !shutdown_clone.load(Ordering::Relaxed) {
+                thread::sleep(Duration::from_millis(50));
+            }
+
+            unsafe {
+                handle.coroutine().cancel();
+            }
+            let _ = handle.join();
+        });
 
         let fixture = Self {
             port,
-            handle: Some(handle),
+            shutdown,
+            server_thread: Some(server_thread),
         };
 
         // Wait for server to be ready
@@ -158,11 +176,13 @@ impl ClientTestFixture {
         for attempt in 0..max_attempts {
             match TcpStream::connect(format!("127.0.0.1:{}", self.port)) {
                 Ok(mut stream) => {
-                    // Send a minimal HTTP request and read response
-                    let request = "GET /ok HTTP/1.1\r\nHost: localhost\r\n\r\n";
+                    // Close after probe so Windows blocking server handlers release the worker.
+                    let request =
+                        "GET /ok HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n";
                     if stream.write_all(request.as_bytes()).is_ok() {
                         let mut buf = [0u8; 256];
                         if stream.read(&mut buf).is_ok() {
+                            let _ = stream.shutdown(std::net::Shutdown::Both);
                             return true;
                         }
                     }
@@ -188,10 +208,8 @@ impl ClientTestFixture {
 
 impl Drop for ClientTestFixture {
     fn drop(&mut self) {
-        if let Some(handle) = self.handle.take() {
-            unsafe {
-                handle.coroutine().cancel();
-            }
+        self.shutdown.store(true, Ordering::Relaxed);
+        if let Some(handle) = self.server_thread.take() {
             let _ = handle.join();
         }
     }
