@@ -8,7 +8,7 @@
 use bytes::BufMut;
 use may_minihttp::{HttpServer, HttpService, Request, Response};
 use std::io::{self, Read, Write};
-use std::net::TcpStream;
+use std::net::{TcpListener, TcpStream};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Once};
 use std::thread;
@@ -46,10 +46,39 @@ struct SimpleHeaderTestServer {
     server_thread: Option<thread::JoinHandle<()>>,
 }
 
+/// Check if a port is available for binding
+fn is_port_available(port: u16) -> bool {
+    TcpListener::bind(format!("127.0.0.1:{}", port)).is_ok()
+}
+
+/// Find the next available port starting from the given port
+fn find_available_port(start_port: u16) -> u16 {
+    for port in start_port..(start_port + 100) {
+        if is_port_available(port) {
+            return port;
+        }
+    }
+    panic!(
+        "Could not find available port in range {}-{}",
+        start_port,
+        start_port + 100
+    );
+}
+
+/// Ensure a port is available, finding an alternative if necessary
+fn ensure_port_available(preferred_port: u16) -> u16 {
+    if is_port_available(preferred_port) {
+        preferred_port
+    } else {
+        find_available_port(preferred_port + 1)
+    }
+}
+
 impl SimpleHeaderTestServer {
-    fn new(port: u16) -> Self {
+    fn new(preferred_port: u16) -> Self {
         init_may_runtime();
 
+        let port = ensure_port_available(preferred_port);
         let shutdown = Arc::new(AtomicBool::new(false));
         let shutdown_clone = Arc::clone(&shutdown);
         let addr = format!("127.0.0.1:{}", port);
