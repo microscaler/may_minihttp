@@ -3,12 +3,14 @@
 use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::io::{self, Read};
+use std::net::{SocketAddr, ToSocketAddrs};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use http::header::{
-    AUTHORIZATION, CONNECTION, CONTENT_LENGTH, CONTENT_TYPE, COOKIE, LOCATION, PROXY_AUTHORIZATION,
-    TRANSFER_ENCODING,
+    AUTHORIZATION, CONNECTION, CONTENT_LENGTH, CONTENT_TYPE, COOKIE, HOST, LOCATION,
+    PROXY_AUTHORIZATION, TRANSFER_ENCODING,
 };
 use http::{HeaderMap, HeaderName, HeaderValue, Method, StatusCode, Version};
 use may::sync::{Condvar, Mutex};
@@ -18,6 +20,24 @@ use url::Url;
 use super::{HttpClient, MultipartForm};
 
 const DEFAULT_MAX_RESPONSE_BODY: usize = 8 * 1024 * 1024;
+
+/// Hostname resolver used before coroutine-aware TCP connection attempts.
+///
+/// The default delegates to the operating system and may block during a cache miss. Deployments
+/// requiring a strictly non-blocking scheduler path should inject a cached or may-aware resolver.
+pub trait Resolver: Send + Sync {
+    fn resolve(&self, host: &str, port: u16) -> io::Result<Vec<SocketAddr>>;
+}
+
+/// Operating-system resolver used by default.
+#[derive(Debug, Default)]
+pub struct SystemResolver;
+
+impl Resolver for SystemResolver {
+    fn resolve(&self, host: &str, port: u16) -> io::Result<Vec<SocketAddr>> {
+        (host, port).to_socket_addrs().map(Iterator::collect)
+    }
+}
 
 /// Policy governing whether HTTP redirects are followed.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -53,13 +73,19 @@ pub struct ClientBuilder {
     connect_timeout: Duration,
     io_timeout: Duration,
     request_timeout: Duration,
+    max_response_header_bytes: usize,
     max_response_body: usize,
     redirect_policy: RedirectPolicy,
     tls_config: Option<Arc<ClientConfig>>,
+    resolver: Arc<dyn Resolver>,
+    sensitive_headers: HashSet<HeaderName>,
 }
 
 impl Default for ClientBuilder {
     fn default() -> Self {
+        let sensitive_headers = [AUTHORIZATION, COOKIE, PROXY_AUTHORIZATION]
+            .into_iter()
+            .collect();
         Self {
             max_connections: 64,
             max_connections_per_origin: 8,
@@ -68,9 +94,12 @@ impl Default for ClientBuilder {
             connect_timeout: Duration::from_secs(10),
             io_timeout: Duration::from_secs(30),
             request_timeout: Duration::from_secs(30),
+            max_response_header_bytes: super::response::DEFAULT_MAX_RESPONSE_HEADER_BYTES,
             max_response_body: DEFAULT_MAX_RESPONSE_BODY,
             redirect_policy: RedirectPolicy::None,
             tls_config: None,
+            resolver: Arc::new(SystemResolver),
+            sensitive_headers,
         }
     }
 }
@@ -121,6 +150,11 @@ impl ClientBuilder {
         self
     }
 
+    pub fn max_response_header_bytes(mut self, value: usize) -> Self {
+        self.max_response_header_bytes = value;
+        self
+    }
+
     pub fn redirect_policy(mut self, value: RedirectPolicy) -> Self {
         self.redirect_policy = value;
         self
@@ -129,6 +163,18 @@ impl ClientBuilder {
     /// Use a custom rustls configuration for HTTPS (private CAs, mTLS, or tests).
     pub fn tls_config(mut self, value: Arc<ClientConfig>) -> Self {
         self.tls_config = Some(value);
+        self
+    }
+
+    /// Inject a cached, static, or may-aware resolver.
+    pub fn resolver(mut self, value: Arc<dyn Resolver>) -> Self {
+        self.resolver = value;
+        self
+    }
+
+    /// Mark an additional header for removal before a cross-origin redirect.
+    pub fn sensitive_header(mut self, value: HeaderName) -> Self {
+        self.sensitive_headers.insert(value);
         self
     }
 
@@ -145,10 +191,10 @@ impl ClientBuilder {
                 "per-origin connection limit cannot exceed the global limit",
             ));
         }
-        if self.max_response_body == 0 {
+        if self.max_response_body == 0 || self.max_response_header_bytes < 4 {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
-                "maximum response body must be greater than zero",
+                "response body limit must be non-zero and header limit at least four bytes",
             ));
         }
 
@@ -167,13 +213,17 @@ impl ClientBuilder {
                     connect_timeout: self.connect_timeout,
                     io_timeout: self.io_timeout,
                     request_timeout: self.request_timeout,
+                    max_response_header_bytes: self.max_response_header_bytes,
                     max_response_body: self.max_response_body,
                     redirect_policy: self.redirect_policy,
+                    sensitive_headers: self.sensitive_headers,
                 },
                 tls_config,
                 tls_profile,
+                resolver: self.resolver,
                 pool: Mutex::new(PoolState::default()),
                 available: Condvar::new(),
+                stats: ClientStatsInner::default(),
             }),
         })
     }
@@ -182,6 +232,113 @@ impl ClientBuilder {
 #[derive(Clone)]
 pub struct Client {
     inner: Arc<ClientInner>,
+}
+
+/// Monotonic operational counters for a [`Client`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ClientStats {
+    pub connections_created: u64,
+    pub connections_reused: u64,
+    pub connections_discarded: u64,
+    pub pool_waits: u64,
+    pub stale_retries: u64,
+    pub redirects_followed: u64,
+}
+
+/// Stable high-level classification for client failures.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ClientErrorKind {
+    InvalidRequest,
+    Dns,
+    Connection,
+    Tls,
+    Timeout,
+    Protocol,
+    BodyTooLarge,
+    BodyNotReplayable,
+    Redirect,
+    Io,
+}
+
+/// Classified error returned by [`RequestBuilder::send_typed`].
+#[derive(Debug)]
+pub struct ClientError {
+    kind: ClientErrorKind,
+    source: io::Error,
+}
+
+impl ClientError {
+    pub fn kind(&self) -> ClientErrorKind {
+        self.kind
+    }
+
+    pub fn into_io_error(self) -> io::Error {
+        self.source
+    }
+}
+
+impl fmt::Display for ClientError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "{}", self.source)
+    }
+}
+
+impl std::error::Error for ClientError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.source)
+    }
+}
+
+impl From<io::Error> for ClientError {
+    fn from(source: io::Error) -> Self {
+        let message = source.to_string().to_ascii_lowercase();
+        let kind = match source.kind() {
+            _ if message.contains("body is not replayable") => ClientErrorKind::BodyNotReplayable,
+            io::ErrorKind::InvalidInput => ClientErrorKind::InvalidRequest,
+            io::ErrorKind::AddrNotAvailable => ClientErrorKind::Dns,
+            io::ErrorKind::TimedOut => ClientErrorKind::Timeout,
+            io::ErrorKind::PermissionDenied => ClientErrorKind::Redirect,
+            io::ErrorKind::InvalidData if message.contains("body exceeds") => {
+                ClientErrorKind::BodyTooLarge
+            }
+            io::ErrorKind::InvalidData if message.contains("redirect") => ClientErrorKind::Redirect,
+            io::ErrorKind::InvalidData | io::ErrorKind::UnexpectedEof => ClientErrorKind::Protocol,
+            io::ErrorKind::BrokenPipe
+            | io::ErrorKind::ConnectionAborted
+            | io::ErrorKind::ConnectionRefused
+            | io::ErrorKind::ConnectionReset
+            | io::ErrorKind::NotConnected
+            | io::ErrorKind::WriteZero => ClientErrorKind::Connection,
+            io::ErrorKind::Other if message.contains("tls") || message.contains("certificate") => {
+                ClientErrorKind::Tls
+            }
+            _ => ClientErrorKind::Io,
+        };
+        Self { kind, source }
+    }
+}
+
+#[derive(Default)]
+struct ClientStatsInner {
+    connections_created: AtomicU64,
+    connections_reused: AtomicU64,
+    connections_discarded: AtomicU64,
+    pool_waits: AtomicU64,
+    stale_retries: AtomicU64,
+    redirects_followed: AtomicU64,
+}
+
+impl ClientStatsInner {
+    fn snapshot(&self) -> ClientStats {
+        ClientStats {
+            connections_created: self.connections_created.load(Ordering::Relaxed),
+            connections_reused: self.connections_reused.load(Ordering::Relaxed),
+            connections_discarded: self.connections_discarded.load(Ordering::Relaxed),
+            pool_waits: self.pool_waits.load(Ordering::Relaxed),
+            stale_retries: self.stale_retries.load(Ordering::Relaxed),
+            redirects_followed: self.redirects_followed.load(Ordering::Relaxed),
+        }
+    }
 }
 
 impl fmt::Debug for Client {
@@ -214,7 +371,7 @@ impl Client {
             method,
             url,
             headers: HeaderMap::new(),
-            body: ReplayableBody::Empty,
+            body: RequestBody::Empty,
             timeout: None,
         })
     }
@@ -225,6 +382,11 @@ impl Client {
 
     pub fn post(&self, url: &str) -> io::Result<RequestBuilder> {
         self.request(Method::POST, url)
+    }
+
+    /// Snapshot connection-pool and redirect counters.
+    pub fn stats(&self) -> ClientStats {
+        self.inner.stats.snapshot()
     }
 
     fn execute(&self, request: RequestBuilder) -> io::Result<BufferedResponse> {
@@ -243,7 +405,7 @@ impl Client {
         let mut hops = 0_usize;
 
         loop {
-            let response = self.execute_once(&method, &url, &headers, &body, deadline)?;
+            let response = self.execute_once(&method, &url, &headers, &mut body, deadline)?;
             let Some(max_hops) = policy.max_hops() else {
                 return Ok(response);
             };
@@ -253,12 +415,22 @@ impl Client {
             let Some(location) = response.headers.get(LOCATION) else {
                 return Ok(response);
             };
-            if !matches!(method, Method::GET | Method::HEAD)
-                && response.status != StatusCode::SEE_OTHER
+            if matches!(
+                response.status,
+                StatusCode::MOVED_PERMANENTLY | StatusCode::FOUND
+            ) && !matches!(method, Method::GET | Method::HEAD)
             {
-                // 301/302 compatibility rewriting and 307/308 body replay require separate,
-                // explicit policy. The safe policy never resends a non-GET request.
                 return Ok(response);
+            }
+            if matches!(
+                response.status,
+                StatusCode::TEMPORARY_REDIRECT | StatusCode::PERMANENT_REDIRECT
+            ) && !body.is_replayable()
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "request body is not replayable across this redirect",
+                ));
             }
             if hops >= max_hops {
                 return Err(io::Error::new(
@@ -287,20 +459,46 @@ impl Client {
             }
 
             if !same_origin(&url, &target) {
-                headers.remove(AUTHORIZATION);
-                headers.remove(COOKIE);
-                headers.remove(PROXY_AUTHORIZATION);
+                for header in &self.inner.config.sensitive_headers {
+                    headers.remove(header);
+                }
             }
             if response.status == StatusCode::SEE_OTHER && method != Method::HEAD {
                 method = Method::GET;
-                body = ReplayableBody::Empty;
+                body = RequestBody::Empty;
                 headers.remove(CONTENT_TYPE);
                 headers.remove(CONTENT_LENGTH);
                 headers.remove(TRANSFER_ENCODING);
             }
             url = target;
             hops += 1;
+            self.inner
+                .stats
+                .redirects_followed
+                .fetch_add(1, Ordering::Relaxed);
         }
+    }
+
+    fn execute_streaming(&self, request: RequestBuilder) -> io::Result<StreamingResponse> {
+        if self.inner.config.redirect_policy != RedirectPolicy::None {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "streaming responses require redirects to be disabled",
+            ));
+        }
+        let deadline = Instant::now()
+            .checked_add(request.timeout.unwrap_or(self.inner.config.request_timeout))
+            .ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidInput, "request timeout overflow")
+            })?;
+        let mut body = request.body;
+        self.execute_streaming_once(
+            &request.method,
+            &request.url,
+            &request.headers,
+            &mut body,
+            deadline,
+        )
     }
 
     fn execute_once(
@@ -308,94 +506,228 @@ impl Client {
         method: &Method,
         url: &Url,
         headers: &HeaderMap,
-        body: &ReplayableBody,
+        body: &mut RequestBody,
         deadline: Instant,
     ) -> io::Result<BufferedResponse> {
+        validate_body_method(method, body)?;
         let key = OriginKey::from_url(url, self.inner.tls_profile)?;
-        let mut pooled = self.checkout(&key, deadline)?;
-        let result = (|| {
-            let initial_remaining = remaining(deadline)?;
-            pooled
-                .client
-                .set_timeout(Some(self.inner.config.io_timeout.min(initial_remaining)));
-            let target = origin_form(url)?;
-            let mut request = pooled.client.new_request(method.clone(), target);
-            for (name, value) in headers {
-                request.headers_mut().append(name, value.clone());
-            }
-            let mut response = match body {
-                ReplayableBody::Empty => pooled.client.send_request(request)?,
-                ReplayableBody::Bytes(bytes) => {
-                    request.send(bytes)?;
-                    pooled.client.send_request(request)?
-                }
-                ReplayableBody::Multipart(form) => {
-                    request.send_multipart(form)?;
-                    pooled.client.send_request(request)?
-                }
-            };
+        let mut stale_retry_available = method_is_idempotent(method) && body.is_replayable();
+        loop {
+            let mut lease = self.checkout(&key, deadline)?;
+            let reused_idle_connection = lease.reused_idle_connection;
+            let result = (|| {
+                let mut response =
+                    self.send_on_lease(&mut lease, method, url, headers, body, deadline)?;
 
-            let status = response.status();
-            let version = response.version();
-            let response_headers = response.headers().clone();
-            let reusable = response_is_reusable(method, status, version, &response_headers);
-            let mut bytes = Vec::new();
-            let limit = self.inner.config.max_response_body;
-            let mut chunk = [0_u8; 8 * 1024];
-            loop {
-                let remaining = remaining(deadline)?;
-                response.set_timeout(Some(self.inner.config.io_timeout.min(remaining)))?;
-                let allowed = chunk.len().min(limit.saturating_sub(bytes.len()) + 1);
-                let read = response.read(&mut chunk[..allowed])?;
-                if read == 0 {
-                    break;
+                let status = response.status();
+                let version = response.version();
+                let response_headers = response.headers().clone();
+                let reusable =
+                    response_is_reusable(method, status, version, headers, &response_headers);
+                let mut bytes = Vec::new();
+                let limit = self.inner.config.max_response_body;
+                // Keep body buffers off may's deliberately small coroutine stacks.
+                let mut chunk = vec![0_u8; 8 * 1024];
+                loop {
+                    let remaining = remaining(deadline)?;
+                    response.set_timeout(Some(self.inner.config.io_timeout.min(remaining)))?;
+                    let allowed = chunk.len().min(limit.saturating_sub(bytes.len()) + 1);
+                    let read = response.read(&mut chunk[..allowed])?;
+                    if read == 0 {
+                        break;
+                    }
+                    bytes.extend_from_slice(&chunk[..read]);
+                    if bytes.len() > limit {
+                        response.abandon_body();
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            format!("HTTP response body exceeds configured {limit}-byte limit"),
+                        ));
+                    }
                 }
-                bytes.extend_from_slice(&chunk[..read]);
-                if bytes.len() > limit {
-                    response.abandon_body();
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        format!("HTTP response body exceeds configured {limit}-byte limit"),
-                    ));
-                }
-            }
-            drop(response);
-            Ok((
-                BufferedResponse {
-                    status,
-                    version,
-                    headers: response_headers,
-                    body: bytes,
-                    final_url: url.clone(),
-                },
-                reusable,
-            ))
-        })();
+                drop(response);
+                Ok((
+                    BufferedResponse {
+                        status,
+                        version,
+                        headers: response_headers,
+                        body: bytes,
+                        final_url: url.clone(),
+                    },
+                    reusable,
+                ))
+            })();
 
-        match result {
-            Ok((response, true)) => {
-                self.checkin(key, pooled);
-                Ok(response)
-            }
-            Ok((response, false)) => {
-                self.discard(key);
-                Ok(response)
-            }
-            Err(error) => {
-                self.discard(key);
+            match result {
+                Ok((response, true)) => {
+                    lease.checkin();
+                    return Ok(response);
+                }
+                Ok((response, false)) => {
+                    drop(lease);
+                    return Ok(response);
+                }
                 Err(error)
+                    if reused_idle_connection
+                        && stale_retry_available
+                        && stale_connection_error(&error) =>
+                {
+                    stale_retry_available = false;
+                    self.inner
+                        .stats
+                        .stale_retries
+                        .fetch_add(1, Ordering::Relaxed);
+                    drop(lease);
+                    let _ = remaining(deadline)?;
+                }
+                Err(error) => {
+                    drop(lease);
+                    return Err(error);
+                }
             }
         }
     }
 
-    fn checkout(&self, key: &OriginKey, deadline: Instant) -> io::Result<PooledConnection> {
+    fn execute_streaming_once(
+        &self,
+        method: &Method,
+        url: &Url,
+        headers: &HeaderMap,
+        body: &mut RequestBody,
+        deadline: Instant,
+    ) -> io::Result<StreamingResponse> {
+        validate_body_method(method, body)?;
+        let key = OriginKey::from_url(url, self.inner.tls_profile)?;
+        let mut stale_retry_available = method_is_idempotent(method) && body.is_replayable();
+        loop {
+            let mut lease = self.checkout(&key, deadline)?;
+            let reused_idle_connection = lease.reused_idle_connection;
+            match self.send_on_lease(&mut lease, method, url, headers, body, deadline) {
+                Ok(response) => {
+                    let status = response.status();
+                    let version = response.version();
+                    let response_headers = response.headers().clone();
+                    let reusable =
+                        response_is_reusable(method, status, version, headers, &response_headers);
+                    let mut streaming = StreamingResponse {
+                        response: Some(response),
+                        lease: Some(lease),
+                        reusable,
+                        deadline,
+                        io_timeout: self.inner.config.io_timeout,
+                        status,
+                        version,
+                        headers: response_headers,
+                        final_url: url.clone(),
+                    };
+                    if streaming
+                        .response
+                        .as_ref()
+                        .is_some_and(super::Response::body_complete)
+                    {
+                        streaming.complete();
+                    }
+                    return Ok(streaming);
+                }
+                Err(error)
+                    if reused_idle_connection
+                        && stale_retry_available
+                        && stale_connection_error(&error) =>
+                {
+                    stale_retry_available = false;
+                    self.inner
+                        .stats
+                        .stale_retries
+                        .fetch_add(1, Ordering::Relaxed);
+                    drop(lease);
+                    let _ = remaining(deadline)?;
+                }
+                Err(error) => {
+                    drop(lease);
+                    return Err(error);
+                }
+            }
+        }
+    }
+
+    fn send_on_lease(
+        &self,
+        lease: &mut PoolLease,
+        method: &Method,
+        url: &Url,
+        headers: &HeaderMap,
+        body: &mut RequestBody,
+        deadline: Instant,
+    ) -> io::Result<super::Response> {
+        if headers.contains_key(HOST) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "Host is derived from the request URL and cannot be overridden",
+            ));
+        }
+        if matches!(*method, Method::GET | Method::HEAD) && !matches!(body, RequestBody::Empty) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "request bodies are not supported for GET or HEAD",
+            ));
+        }
+        let initial_remaining = remaining(deadline)?;
+        lease
+            .connection_mut()
+            .client
+            .set_timeout(Some(self.inner.config.io_timeout.min(initial_remaining)));
+        lease
+            .connection_mut()
+            .client
+            .set_max_response_header_bytes(self.inner.config.max_response_header_bytes)?;
+        let target = origin_form(url)?;
+        let mut request = lease
+            .connection_mut()
+            .client
+            .new_request(method.clone(), target);
+        for (name, value) in headers {
+            request.headers_mut().append(name, value.clone());
+        }
+        match body {
+            RequestBody::Empty => lease.connection_mut().client.send_request(request),
+            RequestBody::Bytes(bytes) => {
+                request.send(bytes)?;
+                lease.connection_mut().client.send_request(request)
+            }
+            RequestBody::Multipart(form) => {
+                request.send_multipart(form)?;
+                lease.connection_mut().client.send_request(request)
+            }
+            RequestBody::Reader {
+                reader,
+                content_length,
+            } => {
+                if matches!(*method, Method::GET | Method::HEAD) {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "streaming request bodies are not supported for GET or HEAD",
+                    ));
+                }
+                let mut reader = reader.take().ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "request body is not replayable and was already consumed",
+                    )
+                })?;
+                request.send_reader(&mut *reader, *content_length)?;
+                lease.connection_mut().client.send_request(request)
+            }
+        }
+    }
+
+    fn checkout(&self, key: &OriginKey, deadline: Instant) -> io::Result<PoolLease> {
         loop {
             let now = Instant::now();
             let mut state = self
                 .inner
                 .pool
                 .lock()
-                .map_err(|_| io::Error::other("HTTP connection pool lock poisoned"))?;
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
             state.purge_expired(
                 now,
                 self.inner.config.idle_timeout,
@@ -403,7 +735,15 @@ impl Client {
             );
             if let Some(connections) = state.idle.get_mut(key) {
                 if let Some(connection) = connections.pop() {
-                    return Ok(connection);
+                    self.inner
+                        .stats
+                        .connections_reused
+                        .fetch_add(1, Ordering::Relaxed);
+                    return Ok(PoolLease::with_connection(
+                        Arc::clone(&self.inner),
+                        key.clone(),
+                        connection,
+                    ));
                 }
             }
             let per_origin = state.per_origin.get(key).copied().unwrap_or(0);
@@ -414,31 +754,54 @@ impl Client {
                 *state.per_origin.entry(key.clone()).or_default() += 1;
                 drop(state);
 
-                let timeout = self.inner.config.connect_timeout.min(remaining(deadline)?);
+                let mut lease = PoolLease::reserved(Arc::clone(&self.inner), key.clone());
+
+                let connect_budget = self.inner.config.connect_timeout.min(remaining(deadline)?);
+                let connect_deadline =
+                    Instant::now().checked_add(connect_budget).ok_or_else(|| {
+                        io::Error::new(io::ErrorKind::InvalidInput, "connect timeout overflow")
+                    })?;
+                let addresses = self.inner.resolver.resolve(&key.host, key.port)?;
+                if addresses.is_empty() {
+                    return Err(io::Error::new(
+                        io::ErrorKind::AddrNotAvailable,
+                        "resolver returned no addresses",
+                    ));
+                }
+                let timeout = connect_deadline
+                    .checked_duration_since(Instant::now())
+                    .ok_or_else(|| {
+                        io::Error::new(
+                            io::ErrorKind::TimedOut,
+                            "DNS resolution exhausted the connect deadline",
+                        )
+                    })?;
                 let origin = key.connect_url();
-                return match HttpClient::from_url_with_options(
+                let client = HttpClient::from_url_with_resolved_options(
                     &origin,
                     Arc::clone(&self.inner.tls_config),
-                    Some(timeout),
-                ) {
-                    Ok(client) => Ok(PooledConnection {
-                        client,
-                        created: Instant::now(),
-                        idle_since: Instant::now(),
-                    }),
-                    Err(error) => {
-                        self.discard(key.clone());
-                        Err(error)
-                    }
-                };
+                    timeout,
+                    &addresses,
+                )?;
+                lease.connection = Some(PooledConnection {
+                    client,
+                    created: Instant::now(),
+                    idle_since: Instant::now(),
+                });
+                self.inner
+                    .stats
+                    .connections_created
+                    .fetch_add(1, Ordering::Relaxed);
+                return Ok(lease);
             }
 
             let wait = remaining(deadline)?;
+            self.inner.stats.pool_waits.fetch_add(1, Ordering::Relaxed);
             let (_state, timeout) = self
                 .inner
                 .available
                 .wait_timeout(state, wait)
-                .map_err(|_| io::Error::other("HTTP connection pool lock poisoned"))?;
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
             if timeout.timed_out() {
                 return Err(io::Error::new(
                     io::ErrorKind::TimedOut,
@@ -447,43 +810,15 @@ impl Client {
             }
         }
     }
-
-    fn checkin(&self, key: OriginKey, mut connection: PooledConnection) {
-        let now = Instant::now();
-        if now.duration_since(connection.created) >= self.inner.config.max_connection_lifetime {
-            self.discard(key);
-            return;
-        }
-        connection.idle_since = now;
-        if let Ok(mut state) = self.inner.pool.lock() {
-            state.idle.entry(key).or_default().push(connection);
-            drop(state);
-            self.inner.available.notify_one();
-        }
-    }
-
-    fn discard(&self, key: OriginKey) {
-        if let Ok(mut state) = self.inner.pool.lock() {
-            state.total = state.total.saturating_sub(1);
-            if let Some(count) = state.per_origin.get_mut(&key) {
-                *count = count.saturating_sub(1);
-                if *count == 0 {
-                    state.per_origin.remove(&key);
-                }
-            }
-            drop(state);
-            self.inner.available.notify_one();
-        }
-    }
 }
 
-/// Replay-aware request builder. Current body variants can all be safely resent.
+/// Request builder whose body explicitly records whether it can be replayed.
 pub struct RequestBuilder {
     client: Client,
     method: Method,
     url: Url,
     headers: HeaderMap,
-    body: ReplayableBody,
+    body: RequestBody,
     timeout: Option<Duration>,
 }
 
@@ -511,12 +846,24 @@ impl RequestBuilder {
     }
 
     pub fn body(mut self, value: impl Into<Vec<u8>>) -> Self {
-        self.body = ReplayableBody::Bytes(Arc::from(value.into()));
+        self.body = RequestBody::Bytes(Arc::from(value.into()));
         self
     }
 
     pub fn multipart(mut self, value: MultipartForm) -> Self {
-        self.body = ReplayableBody::Multipart(value);
+        self.body = RequestBody::Multipart(value);
+        self
+    }
+
+    /// Attach a single-use streaming request body.
+    ///
+    /// The reader must itself be coroutine-safe. This body is never retried and cannot be replayed
+    /// across a 307/308 redirect.
+    pub fn reader(mut self, value: impl Read + Send + 'static, content_length: usize) -> Self {
+        self.body = RequestBody::Reader {
+            reader: Some(Box::new(value)),
+            content_length,
+        };
         self
     }
 
@@ -531,7 +878,7 @@ impl RequestBuilder {
         self.headers
             .entry(CONTENT_TYPE)
             .or_insert(HeaderValue::from_static("application/json"));
-        self.body = ReplayableBody::Bytes(Arc::from(body));
+        self.body = RequestBody::Bytes(Arc::from(body));
         Ok(self)
     }
 
@@ -544,16 +891,46 @@ impl RequestBuilder {
         let client = self.client.clone();
         client.execute(self)
     }
+
+    /// Send with a stable high-level error classification while retaining the underlying I/O error.
+    pub fn send_typed(self) -> Result<BufferedResponse, ClientError> {
+        self.send().map_err(ClientError::from)
+    }
+
+    /// Send without buffering the response body.
+    ///
+    /// The connection remains checked out until the body reaches EOF. Dropping the response before
+    /// EOF discards that connection without performing blocking drain I/O. Redirect following must
+    /// be disabled because a streaming body cannot safely hide redirect consumption and replay.
+    pub fn send_streaming(self) -> io::Result<StreamingResponse> {
+        let client = self.client.clone();
+        client.execute_streaming(self)
+    }
+
+    /// Streaming variant with stable high-level error classification.
+    pub fn send_streaming_typed(self) -> Result<StreamingResponse, ClientError> {
+        self.send_streaming().map_err(ClientError::from)
+    }
 }
 
-#[derive(Clone)]
-enum ReplayableBody {
+enum RequestBody {
     Empty,
     Bytes(Arc<[u8]>),
     Multipart(MultipartForm),
+    Reader {
+        reader: Option<Box<dyn Read + Send>>,
+        content_length: usize,
+    },
+}
+
+impl RequestBody {
+    fn is_replayable(&self) -> bool {
+        !matches!(self, Self::Reader { .. })
+    }
 }
 
 /// Fully buffered response. Buffering makes pool check-in unambiguous and redirect replay safe.
+#[derive(Debug)]
 pub struct BufferedResponse {
     status: StatusCode,
     version: Version,
@@ -598,12 +975,119 @@ impl BufferedResponse {
     }
 }
 
+/// Streaming response that owns its connection-pool lease.
+///
+/// Reading to EOF returns a reusable HTTP/1.x connection to the pool. Any read error, request
+/// deadline, or early drop discards the connection without trying to drain the body in `Drop`.
+pub struct StreamingResponse {
+    response: Option<super::Response>,
+    lease: Option<PoolLease>,
+    reusable: bool,
+    deadline: Instant,
+    io_timeout: Duration,
+    status: StatusCode,
+    version: Version,
+    headers: HeaderMap,
+    final_url: Url,
+}
+
+impl fmt::Debug for StreamingResponse {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("StreamingResponse")
+            .field("status", &self.status)
+            .field("version", &self.version)
+            .field("headers", &self.headers)
+            .field("final_url", &self.final_url)
+            .field("complete", &self.response.is_none())
+            .finish()
+    }
+}
+
+impl StreamingResponse {
+    pub fn status(&self) -> StatusCode {
+        self.status
+    }
+
+    pub fn version(&self) -> Version {
+        self.version
+    }
+
+    pub fn headers(&self) -> &HeaderMap {
+        &self.headers
+    }
+
+    pub fn final_url(&self) -> &Url {
+        &self.final_url
+    }
+
+    fn complete(&mut self) {
+        drop(self.response.take());
+        if let Some(lease) = self.lease.take() {
+            if self.reusable {
+                lease.checkin();
+            }
+        }
+    }
+
+    fn discard(&mut self) {
+        if let Some(response) = self.response.as_mut() {
+            response.abandon_body();
+        }
+        drop(self.response.take());
+        drop(self.lease.take());
+    }
+}
+
+impl Read for StreamingResponse {
+    fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+        if buffer.is_empty() {
+            return Ok(0);
+        }
+        let timeout = match remaining(self.deadline) {
+            Ok(remaining) => self.io_timeout.min(remaining),
+            Err(error) => {
+                self.discard();
+                return Err(error);
+            }
+        };
+        let Some(response) = self.response.as_mut() else {
+            return Ok(0);
+        };
+        if let Err(error) = response.set_timeout(Some(timeout)) {
+            self.discard();
+            return Err(error);
+        }
+        match response.read(buffer) {
+            Ok(read) => {
+                let complete = response.body_complete();
+                if complete {
+                    self.complete();
+                }
+                Ok(read)
+            }
+            Err(error) => {
+                self.discard();
+                Err(error)
+            }
+        }
+    }
+}
+
+impl Drop for StreamingResponse {
+    fn drop(&mut self) {
+        self.discard();
+    }
+}
+
 struct ClientInner {
     config: ClientConfigValues,
     tls_config: Arc<ClientConfig>,
     tls_profile: usize,
+    resolver: Arc<dyn Resolver>,
     pool: Mutex<PoolState>,
     available: Condvar,
+    stats: ClientStatsInner,
 }
 
 struct ClientConfigValues {
@@ -614,8 +1098,10 @@ struct ClientConfigValues {
     connect_timeout: Duration,
     io_timeout: Duration,
     request_timeout: Duration,
+    max_response_header_bytes: usize,
     max_response_body: usize,
     redirect_policy: RedirectPolicy,
+    sensitive_headers: HashSet<HeaderName>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -696,6 +1182,104 @@ struct PooledConnection {
     idle_since: Instant,
 }
 
+/// Owns one accounted pool slot. Dropping it from any path, including coroutine cancellation,
+/// releases capacity unless the connection was successfully returned to the idle pool.
+struct PoolLease {
+    inner: Arc<ClientInner>,
+    key: OriginKey,
+    connection: Option<PooledConnection>,
+    accounted: bool,
+    reused_idle_connection: bool,
+}
+
+impl PoolLease {
+    fn reserved(inner: Arc<ClientInner>, key: OriginKey) -> Self {
+        Self {
+            inner,
+            key,
+            connection: None,
+            accounted: true,
+            reused_idle_connection: false,
+        }
+    }
+
+    fn with_connection(
+        inner: Arc<ClientInner>,
+        key: OriginKey,
+        connection: PooledConnection,
+    ) -> Self {
+        Self {
+            inner,
+            key,
+            connection: Some(connection),
+            accounted: true,
+            reused_idle_connection: true,
+        }
+    }
+
+    fn connection_mut(&mut self) -> &mut PooledConnection {
+        self.connection
+            .as_mut()
+            .expect("connected pool lease must contain a connection")
+    }
+
+    fn checkin(mut self) {
+        let now = Instant::now();
+        if now.duration_since(self.connection_mut().created)
+            >= self.inner.config.max_connection_lifetime
+        {
+            return;
+        }
+        self.connection_mut().idle_since = now;
+        let connection = self
+            .connection
+            .take()
+            .expect("connected pool lease must contain a connection");
+        let mut state = self
+            .inner
+            .pool
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        state
+            .idle
+            .entry(self.key.clone())
+            .or_default()
+            .push(connection);
+        self.accounted = false;
+        drop(state);
+        self.inner.available.notify_one();
+    }
+}
+
+impl Drop for PoolLease {
+    fn drop(&mut self) {
+        if !self.accounted {
+            return;
+        }
+        if self.connection.is_some() {
+            self.inner
+                .stats
+                .connections_discarded
+                .fetch_add(1, Ordering::Relaxed);
+        }
+        let mut state = self
+            .inner
+            .pool
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        state.total = state.total.saturating_sub(1);
+        if let Some(count) = state.per_origin.get_mut(&self.key) {
+            *count = count.saturating_sub(1);
+            if *count == 0 {
+                state.per_origin.remove(&self.key);
+            }
+        }
+        self.accounted = false;
+        drop(state);
+        self.inner.available.notify_one();
+    }
+}
+
 fn parse_url(value: &str) -> io::Result<Url> {
     let mut url = Url::parse(value).map_err(|error| {
         io::Error::new(io::ErrorKind::InvalidInput, format!("invalid URL: {error}"))
@@ -753,6 +1337,12 @@ fn validate_redirect(policy: RedirectPolicy, source: &Url, target: &Url) -> io::
             "redirect target scheme must be http or https",
         ));
     }
+    if !target.username().is_empty() || target.password().is_some() {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "redirect target must not contain URL credentials",
+        ));
+    }
     let same = same_origin(source, target);
     match policy {
         RedirectPolicy::None => unreachable!(),
@@ -782,13 +1372,47 @@ fn is_redirect(status: StatusCode) -> bool {
     )
 }
 
+fn method_is_idempotent(method: &Method) -> bool {
+    matches!(
+        *method,
+        Method::GET | Method::HEAD | Method::PUT | Method::DELETE | Method::OPTIONS | Method::TRACE
+    )
+}
+
+fn validate_body_method(method: &Method, body: &RequestBody) -> io::Result<()> {
+    if matches!(*method, Method::GET | Method::HEAD) && !matches!(body, RequestBody::Empty) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "request bodies are not supported for GET or HEAD",
+        ));
+    }
+    Ok(())
+}
+
+fn stale_connection_error(error: &io::Error) -> bool {
+    matches!(
+        error.kind(),
+        io::ErrorKind::BrokenPipe
+            | io::ErrorKind::ConnectionAborted
+            | io::ErrorKind::ConnectionReset
+            | io::ErrorKind::NotConnected
+            | io::ErrorKind::UnexpectedEof
+            | io::ErrorKind::WriteZero
+    )
+}
+
 fn response_is_reusable(
     method: &Method,
     status: StatusCode,
     version: Version,
+    request_headers: &HeaderMap,
     headers: &HeaderMap,
 ) -> bool {
-    let close = header_has_token(headers, CONNECTION, "close");
+    if method == Method::CONNECT || status == StatusCode::SWITCHING_PROTOCOLS {
+        return false;
+    }
+    let close = header_has_token(request_headers, CONNECTION, "close")
+        || header_has_token(headers, CONNECTION, "close");
     let persistent = match version {
         Version::HTTP_11 => !close,
         Version::HTTP_10 => header_has_token(headers, CONNECTION, "keep-alive"),
@@ -825,6 +1449,14 @@ mod tests {
     use std::io::{Read, Write};
     use std::net::{TcpListener, TcpStream};
     use std::thread;
+
+    struct StaticResolver(SocketAddr);
+
+    impl Resolver for StaticResolver {
+        fn resolve(&self, _host: &str, _port: u16) -> io::Result<Vec<SocketAddr>> {
+            Ok(vec![self.0])
+        }
+    }
 
     fn read_head(stream: &mut TcpStream) -> String {
         let mut request = Vec::new();
@@ -864,6 +1496,40 @@ mod tests {
     }
 
     #[test]
+    fn pool_expiry_uses_injected_instant_for_idle_and_lifetime_limits() {
+        fn connection(created: Instant, idle_since: Instant) -> PooledConnection {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let address = listener.local_addr().unwrap();
+            let accept = thread::spawn(move || listener.accept().unwrap());
+            let client = HttpClient::connect(address).unwrap();
+            let _ = accept.join().unwrap();
+            PooledConnection {
+                client,
+                created,
+                idle_since,
+            }
+        }
+
+        let now = Instant::now();
+        let key = OriginKey::from_url(&Url::parse("http://example.com/").unwrap(), 0).unwrap();
+        let mut state = PoolState::default();
+        state.total = 2;
+        state.per_origin.insert(key.clone(), 2);
+        state.idle.insert(
+            key.clone(),
+            vec![
+                connection(now - Duration::from_secs(5), now - Duration::from_secs(3)),
+                connection(now - Duration::from_secs(30), now - Duration::from_secs(1)),
+            ],
+        );
+
+        state.purge_expired(now, Duration::from_secs(2), Duration::from_secs(20));
+        assert_eq!(state.total, 0);
+        assert!(!state.per_origin.contains_key(&key));
+        assert!(!state.idle.contains_key(&key));
+    }
+
+    #[test]
     fn redirect_policy_rejects_cross_origin_and_downgrade() {
         let https = Url::parse("https://example.com/a").unwrap();
         let other = Url::parse("https://other.example/a").unwrap();
@@ -891,6 +1557,76 @@ mod tests {
     }
 
     #[test]
+    fn get_body_is_rejected_before_connection_attempt() {
+        let error = test_client(RedirectPolicy::None)
+            .get("http://127.0.0.1:9/")
+            .unwrap()
+            .body(b"not allowed".to_vec())
+            .send()
+            .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+        assert!(error.to_string().contains("GET or HEAD"));
+    }
+
+    #[test]
+    fn typed_errors_preserve_source_and_classification() {
+        let error = ClientError::from(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "HTTP response body exceeds configured limit",
+        ));
+        assert_eq!(error.kind(), ClientErrorKind::BodyTooLarge);
+        assert!(error.to_string().contains("body exceeds"));
+    }
+
+    #[test]
+    fn injected_resolver_controls_connection_addresses() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let request = read_head(&mut stream).to_ascii_lowercase();
+            assert!(request.contains("\r\nhost: service.invalid:"));
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok")
+                .unwrap();
+        });
+        let client = Client::builder()
+            .resolver(Arc::new(StaticResolver(address)))
+            .build()
+            .unwrap();
+        let response = client
+            .get(&format!("http://service.invalid:{}/", address.port()))
+            .unwrap()
+            .send()
+            .unwrap();
+        assert_eq!(response.body(), b"ok");
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn resolver_time_counts_against_connect_deadline() {
+        struct SlowResolver;
+        impl Resolver for SlowResolver {
+            fn resolve(&self, _host: &str, _port: u16) -> io::Result<Vec<SocketAddr>> {
+                thread::sleep(Duration::from_millis(30));
+                Ok(vec!["127.0.0.1:9".parse().unwrap()])
+            }
+        }
+
+        let client = Client::builder()
+            .resolver(Arc::new(SlowResolver))
+            .connect_timeout(Duration::from_millis(5))
+            .build()
+            .unwrap();
+        let error = client
+            .get("http://slow.invalid/")
+            .unwrap()
+            .send()
+            .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+    }
+
+    #[test]
     fn fully_consumed_responses_reuse_the_connection() {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
@@ -915,6 +1651,193 @@ mod tests {
                 .unwrap();
             assert_eq!(response.body(), b"ok");
         }
+        let stats = client.stats();
+        assert_eq!(stats.connections_created, 1);
+        assert_eq!(stats.connections_reused, 1);
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn fully_consumed_streaming_response_reuses_the_connection() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            for expected in ["/stream", "/after-stream"] {
+                let request = read_head(&mut stream);
+                assert!(request.starts_with(&format!("GET {expected} HTTP/1.1\r\n")));
+                stream
+                    .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 4\r\n\r\ndata")
+                    .unwrap();
+                stream.flush().unwrap();
+            }
+        });
+
+        let client = test_client(RedirectPolicy::None);
+        let mut response = client
+            .get(&format!("http://127.0.0.1:{port}/stream"))
+            .unwrap()
+            .send_streaming()
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let mut body = [0_u8; 4];
+        response.read_exact(&mut body).unwrap();
+        assert_eq!(&body, b"data");
+        drop(response);
+
+        assert_eq!(
+            client
+                .get(&format!("http://127.0.0.1:{port}/after-stream"))
+                .unwrap()
+                .send()
+                .unwrap()
+                .body(),
+            b"data"
+        );
+        let stats = client.stats();
+        assert_eq!(stats.connections_created, 1);
+        assert_eq!(stats.connections_reused, 1);
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn partial_streaming_response_drop_discards_connection_without_drain() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = thread::spawn(move || {
+            let (mut partial, _) = listener.accept().unwrap();
+            assert!(read_head(&mut partial).starts_with("GET /partial HTTP/1.1\r\n"));
+            partial
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 10\r\n\r\nabcdefghij")
+                .unwrap();
+            partial.flush().unwrap();
+
+            let (mut replacement, _) = listener.accept().unwrap();
+            assert!(read_head(&mut replacement).starts_with("GET /replacement HTTP/1.1\r\n"));
+            replacement
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok")
+                .unwrap();
+        });
+
+        let client = test_client(RedirectPolicy::None);
+        let mut response = client
+            .get(&format!("http://127.0.0.1:{port}/partial"))
+            .unwrap()
+            .send_streaming()
+            .unwrap();
+        let mut prefix = [0_u8; 2];
+        response.read_exact(&mut prefix).unwrap();
+        assert_eq!(&prefix, b"ab");
+        drop(response);
+
+        assert_eq!(
+            client
+                .get(&format!("http://127.0.0.1:{port}/replacement"))
+                .unwrap()
+                .send()
+                .unwrap()
+                .body(),
+            b"ok"
+        );
+        let stats = client.stats();
+        assert_eq!(stats.connections_created, 2);
+        // One discard is the partial response; the other is the replacement's explicit close.
+        assert_eq!(stats.connections_discarded, 2);
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn streaming_response_rejects_implicit_redirect_following() {
+        let client = test_client(RedirectPolicy::SameOrigin { max_hops: 1 });
+        let error = client
+            .get("http://127.0.0.1:9/")
+            .unwrap()
+            .send_streaming()
+            .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+        assert!(error.to_string().contains("redirects"));
+    }
+
+    #[test]
+    fn stale_idle_connection_is_replaced_once_for_get() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = thread::spawn(move || {
+            let (mut stale, _) = listener.accept().unwrap();
+            assert!(read_head(&mut stale).starts_with("GET /first HTTP/1.1\r\n"));
+            stale
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok")
+                .unwrap();
+            stale.flush().unwrap();
+            drop(stale);
+
+            let (mut replacement, _) = listener.accept().unwrap();
+            assert!(read_head(&mut replacement).starts_with("GET /second HTTP/1.1\r\n"));
+            replacement
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\nConnection: close\r\n\r\nfresh",
+                )
+                .unwrap();
+        });
+
+        let client = test_client(RedirectPolicy::None);
+        assert_eq!(
+            client
+                .get(&format!("http://127.0.0.1:{port}/first"))
+                .unwrap()
+                .send()
+                .unwrap()
+                .body(),
+            b"ok"
+        );
+        assert_eq!(
+            client
+                .get(&format!("http://127.0.0.1:{port}/second"))
+                .unwrap()
+                .send()
+                .unwrap()
+                .body(),
+            b"fresh"
+        );
+        assert_eq!(client.stats().stale_retries, 1);
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn stale_idle_connection_does_not_retry_post() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = thread::spawn(move || {
+            let (mut stale, _) = listener.accept().unwrap();
+            let _ = read_head(&mut stale);
+            stale
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok")
+                .unwrap();
+            stale.flush().unwrap();
+            drop(stale);
+
+            thread::sleep(Duration::from_millis(150));
+            listener.set_nonblocking(true).unwrap();
+            assert_eq!(
+                listener.accept().unwrap_err().kind(),
+                io::ErrorKind::WouldBlock,
+                "POST unexpectedly opened a retry connection"
+            );
+        });
+
+        let client = test_client(RedirectPolicy::None);
+        client
+            .get(&format!("http://127.0.0.1:{port}/prime"))
+            .unwrap()
+            .send()
+            .unwrap();
+        let error = client
+            .post(&format!("http://127.0.0.1:{port}/must-not-retry"))
+            .unwrap()
+            .body(b"side effect".to_vec())
+            .send()
+            .unwrap_err();
+        assert!(stale_connection_error(&error));
         server.join().unwrap();
     }
 
@@ -956,6 +1879,52 @@ mod tests {
         });
         assert_eq!(one.join().unwrap().unwrap().body(), b"ok");
         assert_eq!(two.join().unwrap().unwrap().body(), b"ok");
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn cancelled_request_releases_pool_capacity() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let (blocked_tx, blocked_rx) = std::sync::mpsc::channel();
+        let server = thread::spawn(move || {
+            let (mut blocked, _) = listener.accept().unwrap();
+            let _ = read_head(&mut blocked);
+            blocked_tx.send(()).unwrap();
+            thread::sleep(Duration::from_millis(100));
+            drop(blocked);
+
+            let (mut replacement, _) = listener.accept().unwrap();
+            let request = read_head(&mut replacement);
+            assert!(request.starts_with("GET /after-cancel HTTP/1.1\r\n"));
+            replacement
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok")
+                .unwrap();
+        });
+
+        let client = Client::builder()
+            .max_connections(1)
+            .max_connections_per_origin(1)
+            .request_timeout(Duration::from_secs(2))
+            .build()
+            .unwrap();
+        let blocked_client = client.clone();
+        let blocked = may::go!(move || {
+            blocked_client
+                .get(&format!("http://127.0.0.1:{port}/blocked"))
+                .unwrap()
+                .send()
+        });
+        blocked_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        unsafe { blocked.coroutine().cancel() };
+        assert!(blocked.join().is_err());
+
+        let response = client
+            .get(&format!("http://127.0.0.1:{port}/after-cancel"))
+            .unwrap()
+            .send()
+            .unwrap();
+        assert_eq!(response.body(), b"ok");
         server.join().unwrap();
     }
 
@@ -1013,6 +1982,75 @@ mod tests {
     }
 
     #[test]
+    fn temporary_redirect_replays_buffered_post_body() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            for (path, redirect) in [("/start", true), ("/final", false)] {
+                let head = read_head(&mut stream);
+                assert!(head.starts_with(&format!("POST {path} HTTP/1.1\r\n")));
+                assert!(head.to_ascii_lowercase().contains("content-length: 4\r\n"));
+                let mut body = [0_u8; 4];
+                stream.read_exact(&mut body).unwrap();
+                assert_eq!(&body, b"data");
+                if redirect {
+                    stream
+                        .write_all(
+                            b"HTTP/1.1 307 Temporary Redirect\r\nLocation: /final\r\nContent-Length: 0\r\n\r\n",
+                        )
+                        .unwrap();
+                    stream.flush().unwrap();
+                } else {
+                    stream
+                        .write_all(
+                            b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok",
+                        )
+                        .unwrap();
+                }
+            }
+        });
+
+        let response = test_client(RedirectPolicy::SameOrigin { max_hops: 2 })
+            .post(&format!("http://127.0.0.1:{port}/start"))
+            .unwrap()
+            .body(b"data".to_vec())
+            .send()
+            .unwrap();
+        assert_eq!(response.body(), b"ok");
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn streaming_reader_is_sent_once_and_rejected_for_replay_redirect() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let head = read_head(&mut stream);
+            assert!(head.starts_with("POST /start HTTP/1.1\r\n"));
+            assert!(head.to_ascii_lowercase().contains("content-length: 4\r\n"));
+            let mut body = [0_u8; 4];
+            stream.read_exact(&mut body).unwrap();
+            assert_eq!(&body, b"data");
+            stream
+                .write_all(
+                    b"HTTP/1.1 307 Temporary Redirect\r\nLocation: /again\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                )
+                .unwrap();
+        });
+
+        let error = test_client(RedirectPolicy::SameOrigin { max_hops: 2 })
+            .post(&format!("http://127.0.0.1:{port}/start"))
+            .unwrap()
+            .reader(std::io::Cursor::new(b"data".to_vec()), 4)
+            .send_typed()
+            .unwrap_err();
+        assert_eq!(error.kind(), ClientErrorKind::BodyNotReplayable);
+        server.join().unwrap();
+    }
+
+    #[test]
     fn cross_origin_redirect_strips_credentials() {
         let target = TcpListener::bind("127.0.0.1:0").unwrap();
         let target_port = target.local_addr().unwrap().port();
@@ -1032,21 +2070,31 @@ mod tests {
             let request = read_head(&mut stream).to_ascii_lowercase();
             assert!(!request.contains("\r\nauthorization:"));
             assert!(!request.contains("\r\ncookie:"));
+            assert!(!request.contains("\r\nx-secret:"));
             stream
                 .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok")
                 .unwrap();
         });
 
-        let response = test_client(RedirectPolicy::CrossOrigin {
-            max_hops: 3,
-            allow_https_downgrade: false,
-        })
-        .get(&format!("http://127.0.0.1:{source_port}/start"))
-        .unwrap()
-        .header(AUTHORIZATION, HeaderValue::from_static("Bearer secret"))
-        .header(COOKIE, HeaderValue::from_static("session=secret"))
-        .send()
-        .unwrap();
+        let response = Client::builder()
+            .redirect_policy(RedirectPolicy::CrossOrigin {
+                max_hops: 3,
+                allow_https_downgrade: false,
+            })
+            .sensitive_header(HeaderName::from_static("x-secret"))
+            .request_timeout(Duration::from_secs(2))
+            .build()
+            .unwrap()
+            .get(&format!("http://127.0.0.1:{source_port}/start"))
+            .unwrap()
+            .header(AUTHORIZATION, HeaderValue::from_static("Bearer secret"))
+            .header(COOKIE, HeaderValue::from_static("session=secret"))
+            .header(
+                HeaderName::from_static("x-secret"),
+                HeaderValue::from_static("hidden"),
+            )
+            .send()
+            .unwrap();
         assert_eq!(response.body(), b"ok");
         source_server.join().unwrap();
         target_server.join().unwrap();

@@ -1,6 +1,7 @@
 //! Multipart/form-data request encoding.
 
-use std::io::{self, Write};
+use std::io::{self, Read, Write};
+use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -76,6 +77,64 @@ impl MultipartForm {
             data: data.into(),
         });
         self
+    }
+
+    /// Eagerly read a bounded part at an explicit blocking boundary.
+    ///
+    /// Call this outside a may scheduler worker when `reader` performs blocking I/O. The retained
+    /// bytes make the eventual HTTP request coroutine-safe and replayable.
+    pub fn blocking_reader(
+        mut self,
+        name: impl Into<String>,
+        filename: Option<String>,
+        content_type: Option<String>,
+        reader: impl Read,
+        max_bytes: usize,
+    ) -> io::Result<Self> {
+        let mut data = Vec::new();
+        reader
+            .take((max_bytes as u64).saturating_add(1))
+            .read_to_end(&mut data)?;
+        if data.len() > max_bytes {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("multipart part exceeds configured {max_bytes}-byte preload limit"),
+            ));
+        }
+        self.parts.push(Part {
+            name: name.into(),
+            filename,
+            content_type,
+            data,
+        });
+        Ok(self)
+    }
+
+    /// Open and eagerly preload a bounded file part.
+    ///
+    /// This method is intentionally named `blocking_file`: `std::fs` has no may-aware API. Invoke
+    /// it before entering latency-sensitive coroutines, or perform file loading in an explicit
+    /// application-owned blocking executor and pass the resulting bytes to [`Self::bytes`].
+    pub fn blocking_file(
+        self,
+        name: impl Into<String>,
+        path: impl AsRef<Path>,
+        content_type: Option<String>,
+        max_bytes: usize,
+    ) -> io::Result<Self> {
+        let path = path.as_ref();
+        let filename = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "multipart file path has no UTF-8 filename",
+                )
+            })?
+            .to_string();
+        let file = std::fs::File::open(path)?;
+        self.blocking_reader(name, Some(filename), content_type, file, max_bytes)
     }
 
     /// Boundary token used by this form.
@@ -219,5 +278,27 @@ mod tests {
         let encoded = String::from_utf8(form.encode().unwrap()).unwrap();
         assert!(encoded.contains("name=\"a\\\"b\""));
         assert!(encoded.contains("filename=\"c\\\\d.txt\""));
+    }
+
+    #[test]
+    fn blocking_reader_is_bounded_and_becomes_replayable_bytes() {
+        let form = MultipartForm::with_boundary("safe")
+            .blocking_reader(
+                "file",
+                Some("data.bin".to_string()),
+                Some("application/octet-stream".to_string()),
+                &b"payload"[..],
+                7,
+            )
+            .unwrap();
+        let first = form.encode().unwrap();
+        let second = form.encode().unwrap();
+        assert_eq!(first, second);
+        assert!(first.windows(7).any(|window| window == b"payload"));
+
+        let error = MultipartForm::new()
+            .blocking_reader("file", None, None, &b"too large"[..], 3)
+            .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
     }
 }

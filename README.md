@@ -64,8 +64,9 @@ let response = client.get("/health".parse()?)?;
 Use `HttpClient::from_url_with_tls_config` when a private CA or mTLS client configuration is
 required. `HttpClient` is the low-level, single-connection streaming API.
 
-For requests across multiple origins, use the cloneable pooled `Client`. It buffers responses up to
-a configured limit so connections can be returned to the pool safely. Pool limits and deadlines are
+For requests across multiple origins, use the cloneable pooled `Client`. Its default `send` API
+buffers responses up to a configured limit; `send_streaming` holds the exclusive pool lease until
+EOF and discards the connection on an early drop. Pool limits, header/body limits, and deadlines are
 finite; redirects are disabled unless explicitly enabled.
 
 ```rust,no_run
@@ -78,6 +79,12 @@ let response = client.get("https://identity.example.com/health")?.send()?;
 assert!(response.status().is_success());
 # Ok::<(), Box<dyn std::error::Error>>(())
 ```
+
+The rich client also provides optional JSON helpers, bounded multipart preloading, single-use
+request readers, typed error classification, operational pool counters, and injectable DNS
+resolution. Multipart filesystem helpers are deliberately named `blocking_*` and must be called
+outside latency-sensitive may coroutines. Automatic stale-socket retry is limited to one attempt for
+idempotent requests with replayable bodies.
 
 The normal client graph uses `may`, rustls, and the ring provider selected through rustls. It does
 not include reqwest, Tokio, Hyper, or AWS-LC. Proxy discovery and HTTP/2 are not implicit.

@@ -5,7 +5,7 @@
 Native HTTP/1.1 client for `may_minihttp`: connection management, request/response types, and
 `may_http::client`-compatible API. No dependency on the abandoned `may_http` crate.
 
-**Status:** PHASE 1 DONE (compat layer 2026-07-09; native HTTPS 2026-07-14)
+**Status:** CORE AND RICH CLIENT DONE (compat layer 2026-07-09; hardened rich client 2026-07-14)
 
 **Target Milestone:** Release 0.2.0 (Microscaler fork)
 
@@ -18,11 +18,11 @@ Native HTTP/1.1 client for `may_minihttp`: connection management, request/respon
 | Story | Title | Status |
 |-------|-------|--------|
 | [01.1](stories/01.1-project-setup.md) | Project Setup & Cargo.toml | DONE |
-| [01.2](stories/01.2-error-types.md) | Error Types | DEFERRED (Phase 2 — uses `io::Result` in Phase 1) |
+| [01.2](stories/01.2-error-types.md) | Error Types | DONE (classified wrapper preserves `io::Error`) |
 | [01.3](stories/01.3-http-client.md) | HttpClient: Connection & Configuration | DONE |
-| [01.4](stories/01.4-request-builder.md) | RequestBuilder: GET/POST with Headers | DEFERRED (Phase 2) |
-| [01.5](stories/01.5-response.md) | Response: Status, Headers, Body, JSON | DONE (compat `Response`) |
-| [01.6](stories/01.6-integration-tests.md) | Integration Tests with Mock Server | DONE (20 scenarios) |
+| [01.4](stories/01.4-request-builder.md) | RequestBuilder: GET/POST with Headers | DONE (rich client) |
+| [01.5](stories/01.5-response.md) | Response: Status, Headers, Body, JSON | DONE (buffered and streaming) |
+| [01.6](stories/01.6-integration-tests.md) | Integration Tests with Mock Server | DONE |
 
 ---
 
@@ -46,10 +46,10 @@ Native HTTP/1.1 client for `may_minihttp`: connection management, request/respon
 | `http 0.2` vs `1.0` conflict | `http 0.2` only in `client/` module |
 | Upstream may_minihttp drift | Microscaler fork branch `integration/microscaler-fork` |
 
-## Follow-on capability gaps
+## Capability closure
 
 The detailed register and closure criteria live in
-[`docs/design-http-client.md`](../../design-http-client.md#capability-gap-register). JSON helpers are
-already represented by Story 01.4. Multipart encoding, redirect policy, bounded host-keyed pooling,
-and independent connect/request deadlines remain future work. A Tokio-native API is deliberately
-not a core-client goal: the synchronous call surface is backed by coroutine-aware `may::net` I/O.
+[`docs/design-http-client.md`](../../design-http-client.md#capability-gap-register). JSON, multipart,
+redirect policy, bounded host-keyed pooling, shared connect deadlines, streaming, typed error
+classification, and operational counters are delivered. A Tokio-native API remains a deliberate
+non-goal: the synchronous call surface is backed by coroutine-aware `may::net` I/O.

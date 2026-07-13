@@ -2,8 +2,9 @@
 
 ## Status
 
-Implemented direction, 2026-07-14. HTTPS, replay-aware requests, bounded buffered responses,
-redirects, and pooling follow this design without an async runtime or hidden blocking worker pool.
+Implemented direction, 2026-07-14. HTTPS, replay-aware requests, buffered and streaming responses,
+redirects, bounded pooling, and cancellation-safe leases follow this design without an async
+runtime or hidden blocking worker pool.
 
 ## Runtime invariants
 
@@ -14,8 +15,10 @@ redirects, and pooling follow this design without an async runtime or hidden blo
    client feature graph.
 5. A pool lock is held only while inspecting or mutating pool metadata. DNS, connect, TLS, request
    writes, and response reads occur after releasing it.
-6. The low-level response remains streaming. A connection is reusable only after its response body
-   is fully consumed or safely drained.
+6. Responses can stream. A connection is reusable only after its framing boundary is fully consumed;
+   partial bodies are discarded without performing I/O from `Drop`.
+7. System DNS is an explicit possible blocking boundary. Strict deployments inject a cached or
+   may-aware `Resolver`; its elapsed time still consumes the connect deadline.
 
 The `client` feature explicitly enables `may/io_timeout`; it must compile with the crate's default
 features disabled.
@@ -40,7 +43,7 @@ multiplexable.
 - immutable bytes;
 - optional JSON serialized to immutable bytes;
 - multipart text/byte parts with a known encoded length;
-- a future streaming source explicitly marked non-replayable.
+- a single-use streaming reader explicitly marked non-replayable.
 
 Redirect and stale-connection retry logic may replay only bodies marked replayable. A streaming body
 must fail with a typed `BodyNotReplayable` result before a second network attempt.
@@ -73,8 +76,8 @@ an automatic retry of a non-idempotent request after bytes may have reached the 
 ## Redirect policy
 
 Redirect following is disabled by default. The opt-in policy contains a maximum hop count and an
-origin rule. The safe default policy follows only GET and HEAD, resolves relative `Location` values,
-detects loops, and permits only same-origin targets.
+origin rule. It resolves relative `Location` values, detects loops, and can be restricted to
+same-origin targets. Status-specific method and body rules remain mandatory.
 
 If cross-origin redirects are enabled, `Authorization`, `Cookie`, `Proxy-Authorization`, and caller-
 configured sensitive headers are stripped before the redirected request is sent. HTTPS-to-HTTP
@@ -86,15 +89,16 @@ downgrades are rejected unless a separate explicit policy permits them. Status h
 
 ## Body helpers
 
-JSON is optional through the `json` feature. Serialization errors become `InvalidData` I/O errors
-until the domain error type lands. Multipart text and byte parts compute exact `Content-Length` and
-write directly into the request body without creating a second encoded body. Multipart metadata is
-validated before output to prevent CR/LF header injection.
+JSON is optional through the `json` feature. The compatibility API retains `io::Error`; callers that
+need stable categories use `ClientError`/`ClientErrorKind` without losing the source error.
+Multipart text and byte parts compute exact `Content-Length` and write directly into the request
+body without creating a second encoded body. Multipart metadata is validated before output to
+prevent CR/LF header injection.
 
-File multipart support must not simply call blocking filesystem reads from a scheduler thread.
-Callers currently preload files outside coroutine execution and pass their bytes to
-`MultipartForm::bytes`. A future reader source must either be may-aware or explicitly non-replayable;
-the client deliberately provides no misleading `file(path)` helper backed by blocking `std::fs`.
+File multipart support does not hide blocking filesystem reads in the request coroutine.
+`MultipartForm::blocking_file` and `blocking_reader` are explicit, bounded preload boundaries that
+produce replayable bytes; callers invoke them before latency-sensitive coroutine work. Direct
+request readers are single-use and never retried.
 
 ## Acceptance criteria
 
@@ -120,6 +124,8 @@ the client deliberately provides no misleading `file(path)` helper backed by blo
 - Locks are demonstrably not held during network I/O.
 - Fully consumed persistent responses reuse a connection; close/error/incomplete responses do not.
 - Idle and lifetime expiry are deterministic under an injectable clock in unit tests.
+- Coroutine cancellation and partial streaming-response drop release capacity without drain I/O.
+- A stale idle socket is retried once only for idempotent requests with replayable bodies.
 
 ### Dependency boundary
 

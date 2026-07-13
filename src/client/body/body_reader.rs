@@ -5,6 +5,9 @@ use crate::client::shared::SharedStream;
 
 use super::BodyReader::*;
 
+const MAX_CHUNK_LINE_BYTES: usize = 8 * 1024;
+const MAX_TRAILER_BYTES: usize = 16 * 1024;
+
 #[allow(clippy::enum_variant_names)]
 pub enum BodyReader {
     SizedReader(SharedStream, usize),
@@ -33,11 +36,21 @@ impl Read for BodyReader {
             SizedReader(ref r, ref mut remain) => {
                 let len = cmp::min(*remain, buf.len());
                 if len == 0 {
+                    r.mark_response_complete();
                     return Ok(0);
                 }
                 let mut r = r.clone();
                 let n = r.read(&mut buf[0..len])?;
+                if n == 0 {
+                    return Err(io::Error::new(
+                        io::ErrorKind::UnexpectedEof,
+                        "connection closed before Content-Length bytes were received",
+                    ));
+                }
                 *remain -= n;
+                if *remain == 0 {
+                    r.mark_response_complete();
+                }
                 Ok(n)
             }
             ChunkReader(ref r, ref mut opt_remaining) => {
@@ -51,10 +64,11 @@ impl Read for BodyReader {
 
                 if rem == 0 {
                     if opt_remaining.is_none() {
-                        eat(&mut r, b"\r\n")?;
+                        consume_trailers(&mut r)?;
                     }
 
                     *opt_remaining = Some(0);
+                    r.mark_response_complete();
 
                     trace!("end of chunked");
 
@@ -80,7 +94,11 @@ impl Read for BodyReader {
             }
             EofReader(Some(ref r)) => {
                 let mut r = r.clone();
-                r.read(buf)
+                let read = r.read(buf)?;
+                if read == 0 {
+                    r.mark_response_complete();
+                }
+                Ok(read)
             }
             EofReader(None) => Ok(0),
             EmptyReader => Ok(0),
@@ -89,6 +107,15 @@ impl Read for BodyReader {
 }
 
 impl BodyReader {
+    pub(crate) fn is_complete(&self) -> bool {
+        match self {
+            Self::SizedReader(_, remaining) => *remaining == 0,
+            Self::ChunkReader(_, remaining) => *remaining == Some(0),
+            Self::EofReader(reader) => reader.is_none(),
+            Self::EmptyReader => true,
+        }
+    }
+
     pub(crate) fn set_timeout(&self, timeout: Option<std::time::Duration>) -> io::Result<()> {
         match self {
             Self::SizedReader(stream, _)
@@ -106,26 +133,6 @@ impl BodyReader {
                 let _ = reader.take();
             }
             Self::EmptyReader => {}
-        }
-    }
-}
-
-impl Drop for BodyReader {
-    fn drop(&mut self) {
-        // consume all remaining chunks — stack buffer, no heap alloc (JSF 206)
-        let mut buf = [0u8; 4096];
-        loop {
-            match self.read(&mut buf) {
-                Err(e) => {
-                    error!("drop Reader err={}", e);
-                    break;
-                }
-                Ok(n) => {
-                    if n == 0 {
-                        break;
-                    }
-                }
-            }
         }
     }
 }
@@ -163,21 +170,30 @@ fn read_chunk_size(rdr: &mut dyn Read) -> io::Result<usize> {
     let mut size = 0;
     let mut in_ext = false;
     let mut in_chunk_size = true;
+    let mut line_bytes = 0_usize;
+    let mut saw_digit = false;
     loop {
+        line_bytes += 1;
+        if line_bytes > MAX_CHUNK_LINE_BYTES {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "chunk-size line exceeds configured limit",
+            ));
+        }
         match byte!(rdr) {
             b @ b'0'..=b'9' if in_chunk_size => {
-                size <<= 4;
-                size += (b - b'0') as usize;
+                saw_digit = true;
+                size = checked_hex_digit(size, b - b'0')?;
             }
             b @ b'a'..=b'f' if in_chunk_size => {
-                size <<= 4;
-                size += (b + 10 - b'a') as usize;
+                saw_digit = true;
+                size = checked_hex_digit(size, b + 10 - b'a')?;
             }
             b @ b'A'..=b'F' if in_chunk_size => {
-                size <<= 4;
-                size += (b + 10 - b'A') as usize;
+                saw_digit = true;
+                size = checked_hex_digit(size, b + 10 - b'A')?;
             }
-            b'\r' => match byte!(rdr) {
+            b'\r' if saw_digit => match byte!(rdr) {
                 b'\n' => break,
                 _ => {
                     return Err(io::Error::new(
@@ -190,7 +206,7 @@ fn read_chunk_size(rdr: &mut dyn Read) -> io::Result<usize> {
                 in_ext = true;
                 in_chunk_size = false;
             }
-            b'\t' | b' ' if !in_ext & !in_chunk_size => {}
+            b'\t' | b' ' if !in_ext && !in_chunk_size => {}
             b'\t' | b' ' if in_chunk_size => in_chunk_size = false,
             ext if in_ext => {
                 error!("chunk extension byte={}", ext);
@@ -205,6 +221,46 @@ fn read_chunk_size(rdr: &mut dyn Read) -> io::Result<usize> {
     }
     trace!("chunk size={:?}", size);
     Ok(size)
+}
+
+fn checked_hex_digit(size: usize, digit: u8) -> io::Result<usize> {
+    size.checked_mul(16)
+        .and_then(|value| value.checked_add(digit as usize))
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "chunk size overflows usize"))
+}
+
+fn consume_trailers(reader: &mut dyn Read) -> io::Result<()> {
+    let mut total = 0_usize;
+    let mut line = Vec::new();
+    loop {
+        let mut byte = [0_u8; 1];
+        if reader.read(&mut byte)? != 1 {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "connection closed inside chunk trailers",
+            ));
+        }
+        total += 1;
+        if total > MAX_TRAILER_BYTES {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "chunk trailers exceed configured limit",
+            ));
+        }
+        line.push(byte[0]);
+        if line.ends_with(b"\r\n") {
+            if line.len() == 2 {
+                return Ok(());
+            }
+            if !line[..line.len() - 2].contains(&b':') {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "malformed chunk trailer field",
+                ));
+            }
+            line.clear();
+        }
+    }
 }
 
 #[cfg(test)]
@@ -315,6 +371,18 @@ mod tests {
         assert!(read_chunk_size(reader).is_err());
     }
 
+    #[test]
+    fn test_read_chunk_size_overflow_is_rejected() {
+        let reader = &mut TestReader {
+            data: format!("{}\r\n", "F".repeat(usize::BITS as usize / 4 + 1)).into_bytes(),
+            pos: 0,
+        };
+        assert_eq!(
+            read_chunk_size(reader).unwrap_err().kind(),
+            io::ErrorKind::InvalidData
+        );
+    }
+
     // --- BodyReader tests ---
 
     #[test]
@@ -366,6 +434,17 @@ mod tests {
     }
 
     #[test]
+    fn test_chunk_reader_consumes_trailers() {
+        let data = b"5\r\nhello\r\n0\r\nX-Checksum: yes\r\nX-Other: ok\r\n\r\n";
+        let reader = stream(data);
+        let mut br = BodyReader::ChunkReader(reader, None);
+        let mut buf = [0u8; 5];
+        assert_eq!(br.read(&mut buf).unwrap(), 5);
+        assert_eq!(&buf, b"hello");
+        assert_eq!(br.read(&mut buf).unwrap(), 0);
+    }
+
+    #[test]
     fn test_chunk_reader_early_eof() {
         let data = b"10\r\nhel";
         let reader = stream(data);
@@ -383,16 +462,17 @@ mod tests {
     }
 
     #[test]
-    fn test_drop_consumes_remaining_chunks() {
-        // 5\r\nhello\r\n3\r\nabc\r\n
-        let data = b"5\r\nhello\r\n3\r\nabc\r\n";
-        let reader = stream(data);
-        let mut br = BodyReader::ChunkReader(reader, None);
+    fn dropping_partial_body_does_not_drain_or_release_connection() {
+        let reader = stream(b"5\r\nhello\r\n0\r\n\r\n");
+        reader.mark_response_pending();
+        let mut br = BodyReader::ChunkReader(reader.clone(), None);
         let mut buf = [0u8; 10];
         assert_eq!(br.read(&mut buf).unwrap(), 5);
         assert_eq!(&buf[..5], b"hello");
-        assert_eq!(br.read(&mut buf).unwrap(), 3);
-        assert_eq!(&buf[..3], b"abc");
-        drop(br); // should not panic
+        drop(br);
+        assert_eq!(
+            reader.ensure_request_ready().unwrap_err().kind(),
+            io::ErrorKind::ConnectionAborted
+        );
     }
 }

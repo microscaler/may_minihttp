@@ -4,18 +4,47 @@ use std::ops::{Deref, DerefMut};
 
 use bytes::BytesMut;
 use http::header::*;
-use http::{self, Version};
+use http::{self, HeaderMap, Version};
 use httparse;
 
 use crate::client::body::BodyReader;
 use crate::client::shared::SharedStream;
 
+pub(crate) const DEFAULT_MAX_RESPONSE_HEADER_BYTES: usize = 64 * 1024;
+const MAX_RESPONSE_HEADERS: usize = 128;
+
+#[cfg(test)]
 pub(crate) fn decode(buf: &mut BytesMut) -> io::Result<Option<Response>> {
+    decode_with_limit(buf, DEFAULT_MAX_RESPONSE_HEADER_BYTES)
+}
+
+pub(crate) fn decode_with_limit(
+    buf: &mut BytesMut,
+    max_header_bytes: usize,
+) -> io::Result<Option<Response>> {
+    let header_end = buf.windows(4).position(|window| window == b"\r\n\r\n");
+    match header_end {
+        Some(offset) if offset + 4 > max_header_bytes => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("HTTP response headers exceed configured {max_header_bytes}-byte limit"),
+            ));
+        }
+        None if buf.len() >= max_header_bytes => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("HTTP response headers exceed configured {max_header_bytes}-byte limit"),
+            ));
+        }
+        _ => {}
+    }
+
     // Parse into owned response metadata before mutating `buf`. `httparse`
     // stores header slices that borrow the input buffer, so splitting the
     // buffer while the parser is alive would violate Rust's aliasing rules.
     let (head_len, version, status_code, response_headers) = {
-        let mut headers = [httparse::EMPTY_HEADER; 64];
+        // Keep the header table off the small may coroutine stack.
+        let mut headers = vec![httparse::EMPTY_HEADER; MAX_RESPONSE_HEADERS];
         let mut parsed = httparse::Response::new(&mut headers);
         let status = parsed.parse(buf).map_err(|e| {
             io::Error::new(
@@ -30,7 +59,19 @@ pub(crate) fn decode(buf: &mut BytesMut) -> io::Result<Option<Response>> {
         };
         let version = match parsed.version {
             Some(0) => Version::HTTP_10,
-            Some(_) | None => Version::HTTP_11,
+            Some(1) => Version::HTTP_11,
+            Some(version) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("unsupported HTTP response version: 1.{version}"),
+                ));
+            }
+            None => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "HTTP response missing version",
+                ));
+            }
         };
         let status_code = parsed.code.ok_or_else(|| {
             io::Error::new(
@@ -85,42 +126,40 @@ pub struct Response(http::Response<BodyReader>);
 
 impl Response {
     pub(crate) fn set_reader(&mut self, reader: SharedStream, expect_body: bool) -> io::Result<()> {
+        let content_length = parse_content_length(self.headers())?;
+        let transfer_encoding = parse_transfer_encoding(self.headers())?;
+        if content_length.is_some() && transfer_encoding.is_some() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "HTTP response contains both Transfer-Encoding and Content-Length",
+            ));
+        }
+
         let status_forbids_body = self.status().is_informational()
             || self.status() == http::StatusCode::NO_CONTENT
             || self.status() == http::StatusCode::NOT_MODIFIED;
+        if self.status() == http::StatusCode::NO_CONTENT && content_length.is_some_and(|n| n != 0) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "204 response contains a non-zero Content-Length",
+            ));
+        }
         if !expect_body || status_forbids_body {
+            reader.mark_response_complete();
             *self.body_mut() = BodyReader::EmptyReader;
             return Ok(());
         }
 
-        use std::str;
+        if content_length == Some(0) {
+            reader.mark_response_complete();
+        } else {
+            reader.mark_response_pending();
+        }
 
-        let size = self
-            .headers()
-            .get(CONTENT_LENGTH)
-            .map(|v| {
-                let s = unsafe { str::from_utf8_unchecked(v.as_bytes()) };
-                s.parse().map_err(|e| {
-                    io::Error::new(
-                        io::ErrorKind::InvalidInput,
-                        format!("malformed Content-Length: {e}"),
-                    )
-                })
-            })
-            .transpose()?;
-
-        let chunked = self
-            .headers()
-            .get_all(TRANSFER_ENCODING)
-            .iter()
-            .filter_map(|value| value.to_str().ok())
-            .flat_map(|value| value.split(','))
-            .any(|coding| coding.trim().eq_ignore_ascii_case("chunked"));
-
-        let body_reader = match (size, chunked) {
+        let body_reader = match (content_length, transfer_encoding) {
             (Some(n), _) => BodyReader::SizedReader(reader, n),
-            (None, true) => BodyReader::ChunkReader(reader, None),
-            (None, false) => BodyReader::EofReader(Some(reader)),
+            (None, Some(())) => BodyReader::ChunkReader(reader, None),
+            (None, None) => BodyReader::EofReader(Some(reader)),
         };
 
         *self.body_mut() = body_reader;
@@ -129,6 +168,10 @@ impl Response {
 
     pub(crate) fn abandon_body(&mut self) {
         self.body_mut().abandon();
+    }
+
+    pub(crate) fn body_complete(&self) -> bool {
+        self.body().is_complete()
     }
 
     pub(crate) fn set_timeout(&self, timeout: Option<std::time::Duration>) -> io::Result<()> {
@@ -148,6 +191,69 @@ impl Response {
             )
         })
     }
+}
+
+fn parse_content_length(headers: &HeaderMap) -> io::Result<Option<usize>> {
+    let mut parsed = None;
+    for value in headers.get_all(CONTENT_LENGTH) {
+        let value = value.to_str().map_err(|error| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("malformed Content-Length: {error}"),
+            )
+        })?;
+        for item in value.split(',') {
+            let item = item.trim();
+            if item.is_empty() || !item.bytes().all(|byte| byte.is_ascii_digit()) {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "malformed Content-Length",
+                ));
+            }
+            let length = item.parse::<usize>().map_err(|error| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("malformed Content-Length: {error}"),
+                )
+            })?;
+            if parsed.is_some_and(|previous| previous != length) {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "conflicting Content-Length values",
+                ));
+            }
+            parsed = Some(length);
+        }
+    }
+    Ok(parsed)
+}
+
+fn parse_transfer_encoding(headers: &HeaderMap) -> io::Result<Option<()>> {
+    let mut codings = Vec::new();
+    for value in headers.get_all(TRANSFER_ENCODING) {
+        let value = value.to_str().map_err(|error| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("malformed Transfer-Encoding: {error}"),
+            )
+        })?;
+        codings.extend(
+            value
+                .split(',')
+                .map(str::trim)
+                .filter(|coding| !coding.is_empty()),
+        );
+    }
+    if codings.is_empty() {
+        return Ok(None);
+    }
+    if codings.len() != 1 || !codings[0].eq_ignore_ascii_case("chunked") {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "unsupported or invalid HTTP Transfer-Encoding; only chunked is supported",
+        ));
+    }
+    Ok(Some(()))
 }
 
 impl Deref for Response {
@@ -235,6 +341,22 @@ mod tests {
     }
 
     #[test]
+    fn response_header_limit_is_enforced_before_body_bytes() {
+        let mut oversized = BytesMut::from(
+            format!("HTTP/1.1 200 OK\r\nX-Large: {}\r\n\r\n", "a".repeat(64)).as_bytes(),
+        );
+        let error = super::decode_with_limit(&mut oversized, 32).unwrap_err();
+        assert!(error.to_string().contains("headers exceed"));
+
+        let mut body_is_not_counted =
+            BytesMut::from(b"HTTP/1.1 200 OK\r\nContent-Length: 64\r\n\r\n".as_slice());
+        body_is_not_counted.extend_from_slice(&[b'x'; 64]);
+        assert!(super::decode_with_limit(&mut body_is_not_counted, 48)
+            .unwrap()
+            .is_some());
+    }
+
+    #[test]
     fn test_decode_content_length() {
         let text = build_response(200, &[("Content-Length", "5")], "hello");
         let mut buf = BytesMut::from(text.as_bytes());
@@ -292,6 +414,37 @@ mod tests {
         let reader = super::SharedStream::test(FakeReader);
         let err = rsp.set_reader(reader, true).unwrap_err();
         assert!(err.to_string().contains("malformed Content-Length"));
+    }
+
+    #[test]
+    fn response_rejects_ambiguous_framing() {
+        for headers in [
+            vec![("Content-Length", "3"), ("Content-Length", "4")],
+            vec![("Content-Length", "3"), ("Transfer-Encoding", "chunked")],
+            vec![("Transfer-Encoding", "gzip, chunked")],
+        ] {
+            let text = build_response(200, &headers, "");
+            let mut buf = BytesMut::from(text.as_bytes());
+            let mut response = decode(&mut buf).unwrap().unwrap();
+            let error = response
+                .set_reader(super::SharedStream::test(FakeReader), true)
+                .unwrap_err();
+            assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+        }
+    }
+
+    #[test]
+    fn identical_repeated_content_lengths_are_accepted() {
+        let text = build_response(200, &[("Content-Length", "5"), ("Content-Length", "5")], "");
+        let mut buf = BytesMut::from(text.as_bytes());
+        let mut response = decode(&mut buf).unwrap().unwrap();
+        response
+            .set_reader(super::SharedStream::test(FakeReader), true)
+            .unwrap();
+        assert!(matches!(
+            response.body(),
+            super::BodyReader::SizedReader(_, 5)
+        ));
     }
 
     #[cfg(feature = "json")]

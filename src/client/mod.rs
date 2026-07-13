@@ -16,4 +16,7 @@ pub use client_impl::HttpClient;
 pub use multipart::MultipartForm;
 pub use request::Request;
 pub use response::Response;
-pub use rich::{BufferedResponse, Client, ClientBuilder, RedirectPolicy, RequestBuilder};
+pub use rich::{
+    BufferedResponse, Client, ClientBuilder, ClientError, ClientErrorKind, ClientStats,
+    RedirectPolicy, RequestBuilder, Resolver, StreamingResponse, SystemResolver,
+};

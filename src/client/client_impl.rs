@@ -1,8 +1,8 @@
 use std::fmt;
 use std::io;
-use std::net::ToSocketAddrs;
+use std::net::{SocketAddr, ToSocketAddrs};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use bytes::Buf;
 use http::{header::HOST, HeaderValue, Method, Uri};
@@ -19,6 +19,7 @@ pub struct HttpClient {
     conn: SharedStream,
     expect_body: bool,
     host_header: Option<HeaderValue>,
+    max_response_header_bytes: usize,
 }
 
 impl fmt::Debug for HttpClient {
@@ -76,6 +77,7 @@ impl HttpClient {
             conn: SharedStream::new(Transport::Plain(stream)),
             expect_body: true,
             host_header: None,
+            max_response_header_bytes: super::response::DEFAULT_MAX_RESPONSE_HEADER_BYTES,
         })
     }
 
@@ -87,9 +89,11 @@ impl HttpClient {
     pub fn from_url(url: &str) -> io::Result<Self> {
         let uri = Self::parse_absolute_url(url)?;
         match uri.scheme_str() {
-            Some(scheme) if scheme.eq_ignore_ascii_case("http") => Self::from_uri(uri, None, None),
+            Some(scheme) if scheme.eq_ignore_ascii_case("http") => {
+                Self::from_uri(uri, None, None, None)
+            }
             Some(scheme) if scheme.eq_ignore_ascii_case("https") => {
-                Self::from_uri(uri, Some(Self::platform_tls_config()?), None)
+                Self::from_uri(uri, Some(Self::platform_tls_config()?), None, None)
             }
             Some(scheme) => Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -105,20 +109,21 @@ impl HttpClient {
     /// preserving the same URL parsing and `Host` header behavior as [`Self::from_url`].
     pub fn from_url_with_tls_config(url: &str, tls_config: Arc<ClientConfig>) -> io::Result<Self> {
         let uri = Self::parse_absolute_url(url)?;
-        Self::from_uri(uri, Some(tls_config), None)
+        Self::from_uri(uri, Some(tls_config), None, None)
     }
 
-    pub(crate) fn from_url_with_options(
+    pub(crate) fn from_url_with_resolved_options(
         url: &str,
         tls_config: Arc<ClientConfig>,
-        connect_timeout: Option<Duration>,
+        connect_timeout: Duration,
+        addresses: &[SocketAddr],
     ) -> io::Result<Self> {
         let uri = Self::parse_absolute_url(url)?;
         let tls = uri
             .scheme_str()
             .is_some_and(|scheme| scheme.eq_ignore_ascii_case("https"))
             .then_some(tls_config);
-        Self::from_uri(uri, tls, connect_timeout)
+        Self::from_uri(uri, tls, Some(connect_timeout), Some(addresses))
     }
 
     fn parse_absolute_url(url: &str) -> io::Result<Uri> {
@@ -147,6 +152,7 @@ impl HttpClient {
         uri: Uri,
         tls_config: Option<Arc<ClientConfig>>,
         connect_timeout: Option<Duration>,
+        resolved_addresses: Option<&[SocketAddr]>,
     ) -> io::Result<Self> {
         let scheme = uri.scheme_str().expect("from_uri receives an absolute URL");
         let host = uri.host().expect("from_uri receives a URL with a host");
@@ -165,10 +171,18 @@ impl HttpClient {
         }
 
         let stream = if let Some(timeout) = connect_timeout {
+            let started = Instant::now();
             let mut last_error = None;
             let mut connected = None;
-            for address in (host, port).to_socket_addrs()? {
-                match TcpStream::connect_timeout(&address, timeout) {
+            let addresses = match resolved_addresses {
+                Some(addresses) => addresses.to_vec(),
+                None => (host, port).to_socket_addrs()?.collect(),
+            };
+            for address in addresses {
+                let remaining = timeout.checked_sub(started.elapsed()).ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::TimedOut, "TCP connect deadline exceeded")
+                })?;
+                match TcpStream::connect_timeout(&address, remaining) {
                     Ok(stream) => {
                         connected = Some(stream);
                         break;
@@ -221,6 +235,7 @@ impl HttpClient {
             conn: SharedStream::new(transport),
             expect_body: true,
             host_header: Some(host_header),
+            max_response_header_bytes: super::response::DEFAULT_MAX_RESPONSE_HEADER_BYTES,
         })
     }
 
@@ -242,12 +257,23 @@ impl HttpClient {
         self
     }
 
+    /// Bound the response status-line and header section retained while parsing.
+    pub fn set_max_response_header_bytes(&mut self, limit: usize) -> io::Result<&mut Self> {
+        if limit < 4 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "response header limit must be at least four bytes",
+            ));
+        }
+        self.max_response_header_bytes = limit;
+        Ok(self)
+    }
+
     /// GET shortcut — sends request on drop and reads the response.
     pub fn get(&mut self, uri: Uri) -> io::Result<Response> {
         self.expect_body = true; // GET can have a body
         let req = self.new_request(Method::GET, uri);
-        drop(req);
-        self.get_rsp()
+        self.send_request(req)
     }
 
     /// POST shortcut with body bytes.
@@ -256,8 +282,7 @@ impl HttpClient {
         let mut req = self.new_request(Method::POST, uri);
         let body = data.copy_to_bytes(data.remaining());
         req.send(&body)?;
-        drop(req);
-        self.get_rsp()
+        self.send_request(req)
     }
 
     /// POST a multipart/form-data body without buffering an additional encoded copy.
@@ -299,12 +324,13 @@ impl HttpClient {
 
     /// Send a request built from this client and read the response.
     #[inline]
-    pub fn send_request(&mut self, req: Request) -> io::Result<Response> {
+    pub fn send_request(&mut self, mut req: Request) -> io::Result<Response> {
         debug_assert!(
             self.conn.ptr_eq(req.conn()),
             "client and request must share the same connection"
         );
         self.expect_body = req.expect_body_request();
+        req.finish()?;
         drop(req);
         self.get_rsp()
     }
@@ -314,7 +340,10 @@ impl HttpClient {
         let reader = self.conn.clone();
         let expect_body = self.expect_body;
         self.conn.with_buffer(|stream| loop {
-            match super::response::decode(stream.get_reader_buf())? {
+            match super::response::decode_with_limit(
+                stream.get_reader_buf(),
+                self.max_response_header_bytes,
+            )? {
                 None => {
                     if stream.bump_read()? == 0 {
                         return Err(io::Error::new(
@@ -324,6 +353,11 @@ impl HttpClient {
                     }
                 }
                 Some(mut response) => {
+                    if response.status().is_informational()
+                        && response.status() != http::StatusCode::SWITCHING_PROTOCOLS
+                    {
+                        continue;
+                    }
                     response.set_reader(reader.clone(), expect_body)?;
                     return Ok(response);
                 }
@@ -444,5 +478,61 @@ mod tests {
                 .kind(),
             io::ErrorKind::InvalidInput
         );
+    }
+
+    #[test]
+    fn client_skips_interim_responses() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind HTTP server");
+        let port = listener.local_addr().expect("server address").port();
+        let server = thread::spawn(move || {
+            let (mut socket, _) = listener.accept().expect("accept connection");
+            let mut request = Vec::new();
+            let mut byte = [0_u8; 1];
+            while !request.ends_with(b"\r\n\r\n") {
+                socket.read_exact(&mut byte).expect("read request");
+                request.push(byte[0]);
+            }
+            socket
+                .write_all(
+                    b"HTTP/1.1 103 Early Hints\r\nLink: </style.css>; rel=preload\r\n\r\nHTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok",
+                )
+                .expect("write responses");
+        });
+
+        let mut client = HttpClient::from_url(&format!("http://127.0.0.1:{port}/")).unwrap();
+        let mut response = client.get("/".parse().unwrap()).unwrap();
+        assert_eq!(response.status(), http::StatusCode::OK);
+        let mut body = String::new();
+        response.read_to_string(&mut body).unwrap();
+        assert_eq!(body, "ok");
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn partial_response_drop_prevents_connection_reuse_without_blocking() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind HTTP server");
+        let port = listener.local_addr().unwrap().port();
+        let server = thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+            let mut request = Vec::new();
+            let mut byte = [0_u8; 1];
+            while !request.ends_with(b"\r\n\r\n") {
+                socket.read_exact(&mut byte).unwrap();
+                request.push(byte[0]);
+            }
+            socket
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello")
+                .unwrap();
+            thread::sleep(Duration::from_millis(50));
+        });
+
+        let mut client = HttpClient::from_url(&format!("http://127.0.0.1:{port}/")).unwrap();
+        let mut response = client.get("/one".parse().unwrap()).unwrap();
+        let mut one = [0_u8; 1];
+        response.read_exact(&mut one).unwrap();
+        drop(response);
+        let error = client.get("/two".parse().unwrap()).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::ConnectionAborted);
+        server.join().unwrap();
     }
 }

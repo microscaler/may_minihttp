@@ -1,23 +1,26 @@
 //! Outgoing HTTP/1.1 requests (client side).
 use std::fmt;
-use std::io::{self, Write};
+use std::io::{self, Read, Write};
 use std::ops::{Deref, DerefMut};
 
 use crate::client::body::BodyWriter;
 use crate::client::shared::SharedStream;
 use crate::client::MultipartForm;
-use http::header::CONTENT_TYPE;
+use http::header::{CONTENT_LENGTH, CONTENT_TYPE, TRANSFER_ENCODING};
 use http::{self, HeaderValue, Method};
 
 /// Outgoing request for [`super::HttpClient`].
 ///
-/// Derefs to `http::Request<BodyWriter>`. On drop, writes the request head and
-/// flushes the body unless the handler already did so.
+/// Derefs to `http::Request<BodyWriter>`. For compatibility, dropping a request that has never
+/// attempted completion writes its empty request head. Normal callers should use [`Self::finish`]
+/// or [`super::HttpClient::send_request`] so errors are observable.
 pub struct Request {
     raw_req: http::Request<BodyWriter>,
     writer: SharedStream,
     body_size: Option<usize>,
     expect_body: bool,
+    completion_attempted: bool,
+    completed: bool,
 }
 
 impl fmt::Debug for Request {
@@ -35,10 +38,21 @@ impl Request {
             writer: stream,
             body_size: None,
             expect_body: true,
+            completion_attempted: false,
+            completed: false,
         }
     }
 
     fn write_head_impl(&mut self) -> io::Result<()> {
+        self.writer.ensure_request_ready()?;
+        if self.headers().contains_key(TRANSFER_ENCODING)
+            && (self.body_size.is_some() || self.headers().contains_key(CONTENT_LENGTH))
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "request must not contain both Transfer-Encoding and Content-Length",
+            ));
+        }
         let mut writer = self.writer.clone();
 
         write!(
@@ -56,16 +70,22 @@ impl Request {
         }
 
         for (key, value) in self.headers().iter() {
-            write!(
-                writer,
-                "{}: {}\r\n",
-                key.as_str(),
-                value.to_str().unwrap_or("")
-            )?;
+            if self.body_size.is_some() && key == CONTENT_LENGTH {
+                continue;
+            }
+            writer.write_all(key.as_str().as_bytes())?;
+            writer.write_all(b": ")?;
+            writer.write_all(value.as_bytes())?;
+            writer.write_all(b"\r\n")?;
         }
 
         if let Some(len) = self.body_size {
             write!(writer, "Content-Length: {}\r\n", len)?
+        } else if self.method() == Method::POST
+            && !self.headers().contains_key(CONTENT_LENGTH)
+            && !self.headers().contains_key(TRANSFER_ENCODING)
+        {
+            writer.write_all(b"Transfer-Encoding: chunked\r\n")?;
         }
 
         write!(writer, "\r\n")?;
@@ -73,14 +93,27 @@ impl Request {
     }
 
     fn write_head(&mut self) -> io::Result<BodyWriter> {
+        let chunked = parse_transfer_encoding(self.headers())?;
+        if self.body_size.is_none() {
+            self.body_size = parse_content_length(self.headers())?;
+        }
+        if matches!(*self.method(), Method::GET | Method::HEAD)
+            && (self.body_size.is_some() || chunked)
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "request bodies are not supported for GET or HEAD",
+            ));
+        }
         let body = match *self.method() {
             Method::GET | Method::HEAD => BodyWriter::EmptyWriter(self.writer.clone()),
             Method::POST => match self.body_size {
                 Some(size) => BodyWriter::SizedWriter(self.writer.clone(), size),
-                None => BodyWriter::ChunkWriter(self.writer.clone()),
+                None => BodyWriter::ChunkWriter(self.writer.clone(), false),
             },
             // DELETE / PUT / PATCH / OPTIONS etc. — sized body when Content-Length
             // is set; otherwise assume no body (no Transfer-Encoding for these methods).
+            _ if chunked => BodyWriter::ChunkWriter(self.writer.clone(), false),
             _ => match self.body_size {
                 Some(size) => BodyWriter::SizedWriter(self.writer.clone(), size),
                 None => BodyWriter::EmptyWriter(self.writer.clone()),
@@ -99,7 +132,46 @@ impl Request {
     #[inline]
     pub fn send(&mut self, body: &[u8]) -> io::Result<()> {
         self.body_size = Some(body.len());
-        self.write_all(body)
+        let result = self.write_all(body);
+        if result.is_err() {
+            self.abort();
+        }
+        result
+    }
+
+    /// Stream exactly `content_length` bytes from a caller-supplied reader.
+    pub fn send_reader(
+        &mut self,
+        reader: &mut (impl Read + ?Sized),
+        content_length: usize,
+    ) -> io::Result<()> {
+        self.body_size = Some(content_length);
+        let mut remaining = content_length;
+        // Keep streaming buffers off may's deliberately small coroutine stacks.
+        let mut buffer = vec![0_u8; 8 * 1024];
+        while remaining > 0 {
+            let allowed = buffer.len().min(remaining);
+            let read = match reader.read(&mut buffer[..allowed]) {
+                Ok(0) => {
+                    self.abort();
+                    return Err(io::Error::new(
+                        io::ErrorKind::UnexpectedEof,
+                        format!("request reader ended {remaining} bytes before Content-Length"),
+                    ));
+                }
+                Ok(read) => read,
+                Err(error) => {
+                    self.abort();
+                    return Err(error);
+                }
+            };
+            if let Err(error) = self.write_all(&buffer[..read]) {
+                self.abort();
+                return Err(error);
+            }
+            remaining -= read;
+        }
+        Ok(())
     }
 
     /// Stream an encoded multipart/form-data body into this request.
@@ -115,7 +187,11 @@ impl Request {
         })?;
         self.headers_mut().insert(CONTENT_TYPE, content_type);
         self.set_content_length(form.content_length()?);
-        form.write_to(self)
+        let result = form.write_to(self);
+        if result.is_err() {
+            self.abort();
+        }
+        result
     }
 
     /// Serialize a value as JSON and write it as the request body.
@@ -137,6 +213,28 @@ impl Request {
     #[inline]
     pub fn set_content_length(&mut self, len: usize) {
         self.body_size = Some(len);
+    }
+
+    /// Explicitly finish and flush the request, returning any write error.
+    ///
+    /// [`super::HttpClient::send_request`] calls this automatically. It is exposed for low-level
+    /// users that need to separate request completion from reading the response.
+    pub fn finish(&mut self) -> io::Result<()> {
+        if self.completed {
+            return Ok(());
+        }
+        self.completion_attempted = true;
+        if let BodyWriter::InvalidWriter = *self.body() {
+            *self.body_mut() = self.write_head()?;
+        }
+        self.body_mut().finish()?;
+        self.completed = true;
+        Ok(())
+    }
+
+    pub(crate) fn abort(&mut self) {
+        self.completion_attempted = true;
+        self.body_mut().abort();
     }
 
     pub(super) fn conn(&self) -> &SharedStream {
@@ -177,6 +275,12 @@ impl DerefMut for Request {
 impl Write for Request {
     #[inline]
     fn write(&mut self, msg: &[u8]) -> io::Result<usize> {
+        if self.completed {
+            return Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "request is already finished",
+            ));
+        }
         if let BodyWriter::InvalidWriter = *self.body() {
             *self.body_mut() = self.write_head()?;
         }
@@ -185,7 +289,10 @@ impl Write for Request {
 
     #[inline]
     fn flush(&mut self) -> io::Result<()> {
-        if let BodyWriter::InvalidWriter = *self.body() {
+        if self.completed {
+            return Ok(());
+        }
+        if !self.completion_attempted && matches!(*self.body(), BodyWriter::InvalidWriter) {
             return Ok(());
         }
         self.body_mut().flush()
@@ -196,7 +303,7 @@ impl Drop for Request {
     fn drop(&mut self) {
         use std::thread;
 
-        if thread::panicking() {
+        if thread::panicking() || self.completion_attempted || self.completed {
             return;
         }
 
@@ -205,6 +312,67 @@ impl Drop for Request {
                 .write_head()
                 .unwrap_or_else(|_| BodyWriter::EmptyWriter(self.writer.clone()));
         }
+    }
+}
+
+fn parse_content_length(headers: &http::HeaderMap) -> io::Result<Option<usize>> {
+    let mut parsed = None;
+    for value in headers.get_all(CONTENT_LENGTH) {
+        let value = value.to_str().map_err(|error| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("malformed request Content-Length: {error}"),
+            )
+        })?;
+        for item in value.split(',') {
+            let item = item.trim();
+            if item.is_empty() || !item.bytes().all(|byte| byte.is_ascii_digit()) {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "malformed request Content-Length",
+                ));
+            }
+            let length = item.parse::<usize>().map_err(|error| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("malformed request Content-Length: {error}"),
+                )
+            })?;
+            if parsed.is_some_and(|previous| previous != length) {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "conflicting request Content-Length values",
+                ));
+            }
+            parsed = Some(length);
+        }
+    }
+    Ok(parsed)
+}
+
+fn parse_transfer_encoding(headers: &http::HeaderMap) -> io::Result<bool> {
+    let mut codings = Vec::new();
+    for value in headers.get_all(TRANSFER_ENCODING) {
+        let value = value.to_str().map_err(|error| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("malformed request Transfer-Encoding: {error}"),
+            )
+        })?;
+        codings.extend(
+            value
+                .split(',')
+                .map(str::trim)
+                .filter(|coding| !coding.is_empty()),
+        );
+    }
+    match codings.as_slice() {
+        [] => Ok(false),
+        [coding] if coding.eq_ignore_ascii_case("chunked") => Ok(true),
+        _ => Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "only a single request Transfer-Encoding: chunked is supported",
+        )),
     }
 }
 
@@ -314,6 +482,112 @@ mod tests {
             "head was: {head}"
         );
         assert!(head_lower.contains("host: override.example\r\n"));
+    }
+
+    #[test]
+    fn raw_header_value_bytes_are_preserved() {
+        let (stream, bytes) = capture();
+        let mut req = Request::new(stream);
+        *req.uri_mut() = "/".parse().unwrap();
+        req.headers_mut().insert(
+            http::header::HeaderName::from_static("x-opaque"),
+            http::HeaderValue::from_bytes(&[0x80, 0x81]).unwrap(),
+        );
+        drop(req);
+        assert!(bytes
+            .lock()
+            .unwrap()
+            .windows(12)
+            .any(|window| window == b"x-opaque: \x80\x81"));
+    }
+
+    #[test]
+    fn request_rejects_transfer_encoding_with_content_length() {
+        let (stream, _bytes) = capture();
+        let mut req = request_with_method(Method::POST, stream);
+        req.headers_mut()
+            .insert(TRANSFER_ENCODING, http::HeaderValue::from_static("chunked"));
+        let error = req.send(b"body").unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+    }
+
+    #[test]
+    fn caller_content_length_selects_sized_writer_and_is_canonicalized() {
+        let (stream, bytes) = capture();
+        let mut req = request_with_method(Method::POST, stream);
+        req.headers_mut()
+            .append(CONTENT_LENGTH, HeaderValue::from_static("3"));
+        req.headers_mut()
+            .append(CONTENT_LENGTH, HeaderValue::from_static("3"));
+        req.write_all(b"abc").unwrap();
+        req.finish().unwrap();
+        drop(req);
+
+        let written = written(&bytes);
+        assert_eq!(written.matches("Content-Length: 3\r\n").count(), 1);
+        assert!(!written.contains("Transfer-Encoding"));
+        assert!(written.ends_with("\r\n\r\nabc"));
+    }
+
+    #[test]
+    fn unsupported_request_transfer_coding_is_rejected_before_write() {
+        let (stream, bytes) = capture();
+        let mut req = request_with_method(Method::POST, stream);
+        req.headers_mut()
+            .insert(TRANSFER_ENCODING, HeaderValue::from_static("gzip, chunked"));
+        assert_eq!(
+            req.finish().unwrap_err().kind(),
+            io::ErrorKind::InvalidInput
+        );
+        drop(req);
+        assert!(bytes.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn reader_failure_before_head_does_not_send_from_drop() {
+        let (stream, bytes) = capture();
+        let mut req = request_with_method(Method::POST, stream);
+        let mut empty = io::empty();
+        assert_eq!(
+            req.send_reader(&mut empty, 3).unwrap_err().kind(),
+            io::ErrorKind::UnexpectedEof
+        );
+        drop(req);
+        assert!(bytes.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn explicit_finish_rejects_short_body_without_zero_padding() {
+        let (stream, bytes) = capture();
+        let mut req = request_with_method(Method::PUT, stream);
+        req.set_content_length(5);
+        req.write_all(b"hi").unwrap();
+        assert_eq!(
+            req.finish().unwrap_err().kind(),
+            io::ErrorKind::UnexpectedEof
+        );
+        drop(req);
+        let written = bytes.lock().unwrap().clone();
+        assert!(written.ends_with(b"hi"));
+        assert!(!written.ends_with(b"hi\0\0\0"));
+    }
+
+    #[test]
+    fn explicit_finish_writes_one_chunk_terminator() {
+        let (stream, bytes) = capture();
+        let mut req = request_with_method(Method::POST, stream);
+        req.write_all(b"hi").unwrap();
+        req.finish().unwrap();
+        req.finish().unwrap();
+        drop(req);
+        let written = bytes.lock().unwrap().clone();
+        assert_eq!(
+            written
+                .windows(5)
+                .filter(|part| *part == b"0\r\n\r\n")
+                .count(),
+            1
+        );
     }
 
     #[cfg(feature = "json")]

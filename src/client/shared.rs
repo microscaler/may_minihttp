@@ -1,6 +1,7 @@
 //! Coroutine-aware shared client transport.
 
 use std::io::{self, Read, Write};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -83,12 +84,14 @@ impl Write for Transport {
 #[derive(Clone)]
 pub struct SharedStream {
     inner: Arc<Mutex<BufferIo<Transport>>>,
+    request_ready: Arc<AtomicBool>,
 }
 
 impl SharedStream {
     pub fn new(transport: Transport) -> Self {
         Self {
             inner: Arc::new(Mutex::new(BufferIo::new(transport))),
+            request_ready: Arc::new(AtomicBool::new(true)),
         }
     }
 
@@ -99,6 +102,25 @@ impl SharedStream {
 
     pub fn ptr_eq(&self, other: &Self) -> bool {
         Arc::ptr_eq(&self.inner, &other.inner)
+    }
+
+    pub fn ensure_request_ready(&self) -> io::Result<()> {
+        if self.request_ready.load(Ordering::Acquire) {
+            Ok(())
+        } else {
+            Err(io::Error::new(
+                io::ErrorKind::ConnectionAborted,
+                "previous HTTP response body was not fully consumed",
+            ))
+        }
+    }
+
+    pub fn mark_response_pending(&self) {
+        self.request_ready.store(false, Ordering::Release);
+    }
+
+    pub fn mark_response_complete(&self) {
+        self.request_ready.store(true, Ordering::Release);
     }
 
     pub fn is_tls(&self) -> io::Result<bool> {

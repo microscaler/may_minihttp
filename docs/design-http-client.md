@@ -8,9 +8,10 @@ migrates here; the abandoned `may_http` crate is retired.
 
 The client supports absolute `http://` and `https://` URLs. HTTPS is implemented with rustls, the
 platform certificate verifier, and an explicit ring crypto provider. A cloneable high-level
-`Client` now adds a replay-aware `RequestBuilder`, bounded host/TLS-keyed pooling, bounded buffered
-responses, and an opt-in redirect policy. The low-level `HttpClient` remains available for streaming
-and `may_http` compatibility.
+`Client` now adds a replay-aware `RequestBuilder`, bounded host/TLS-keyed pooling, buffered and
+lease-owning streaming responses, an opt-in redirect policy, typed error classification, and
+operational counters. The low-level `HttpClient` remains available for direct streaming and
+`may_http` compatibility.
 
 The concurrency and policy design is specified in
 [`design-strict-may-client.md`](./design-strict-may-client.md).
@@ -58,8 +59,7 @@ let rsp = secure.get("/idam/v1/.well-known/jwks.json".parse()?)?;
 // Full control (DELETE, PUT, PATCH, custom headers)
 let mut req = client.new_request(Method::DELETE, "/fleet/42".parse()?);
 // req.headers_mut().insert(...);
-drop(req); // writes head on Drop
-let rsp = client.send_request(req)?; // or get_rsp after drop(req)
+let rsp = client.send_request(req)?; // explicitly finishes the request and propagates write errors
 ```
 
 API mirrors `may_http::client` so BRRTRouter `proxy.rs` / `fetch.rs` need only import path changes.
@@ -77,10 +77,11 @@ let client = Client::builder()
 let rsp = client.get("https://identity.example.com/health")?.send()?;
 ```
 
-`Client` is `Clone + Send + Sync`. It checks out one exclusive HTTP/1.1 connection per request,
-buffers the response up to `max_response_body`, and only checks a transport back in when framing and
-persistence rules make reuse safe. Pool capacity waits use `may::sync::Condvar`; the pool mutex is
-not held during DNS, connect, TLS, writes, or reads.
+`Client` is `Clone + Send + Sync`. It checks out one exclusive HTTP/1.1 connection per request. The
+default path buffers up to `max_response_body`; `send_streaming` keeps the lease until EOF. A
+transport is checked back in only when framing and persistence rules make reuse safe. Early drops,
+cancellation, and read errors discard it without blocking drain I/O. Pool capacity waits use
+`may::sync::Condvar`; the pool mutex is not held during DNS, connect, TLS, writes, or reads.
 
 ## Architecture
 
@@ -99,7 +100,7 @@ may_minihttp/src/
     ├── response.rs         # incoming streaming Response (httparse decode)
     ├── shared.rs           # Send-capable, may-Mutex transport plumbing
     ├── multipart.rs        # replayable text/byte multipart encoding
-    └── rich.rs             # Client, pool, RequestBuilder, redirects, buffered response
+    └── rich.rs             # Client, pool, redirects, buffered/streaming responses
 ```
 
 **No `may_http` dependency.** The transport is either a plain `may::net::TcpStream` or a rustls
@@ -137,27 +138,32 @@ Server continues to use `httparse` directly — no type mixing between server an
 - Absolute HTTP/HTTPS URL connection, default ports, and automatic `Host` header
 - Platform certificate verification plus injected TLS configuration for private CA/mTLS
 
-### Phase 2: Rich API
+### Phase 2: Rich API (current delivery complete)
 
 - `RequestBuilder` and bounded `BufferedResponse` ✅
-- Domain `Error` enum remains future work; current errors use `io::Error`
+- Backwards-compatible `ClientError`/`ClientErrorKind` classification over retained `io::Error` ✅
 - JSON request/response helpers (`json` feature) ✅
 - Multipart/form-data text/byte encoder with exact length and direct request streaming ✅
-- File/reader multipart parts without blocking a may scheduler thread
-- PUT/DELETE/PATCH convenience methods on `HttpClient`
-- Middleware trait
+- Explicit bounded `blocking_reader`/`blocking_file` preload boundary ✅
+- Single-use streaming request reader and lease-owning streaming response ✅
+
+PUT/DELETE/PATCH one-line shortcuts and a middleware abstraction are optional future API
+conveniences, not requirements of the current IDAM delivery.
 
 ### Phase 3: Robustness
 
 - Host/TLS-keyed connection pooling with bounded per-origin and total connections ✅
 - Redirect handling with opt-in policy, hop limit, loop detection, and cross-origin credential stripping ✅
 - Separate connect, read/write, and total request deadlines ✅
-- Retries with idempotency rules, plus streaming bodies for large responses
+- One stale-idle retry for idempotent requests with replayable bodies ✅
+- Cancellation-safe RAII pool accounting and incomplete-body discard ✅
+- Strict response framing, bounded headers/chunks/trailers, and explicit request finalisation ✅
 
 ### Phase 4: Production
 
 - TLS in the `client` feature ✅
-- Metrics, compression, HTTP/2 if `may` supports it
+- Monotonic connection, wait, retry, and redirect counters ✅
+- Compression and HTTP/2 remain optional future capabilities if `may` supports them
 
 ## Resolved Questions
 
@@ -169,20 +175,22 @@ Server continues to use `httparse` directly — no type mixing between server an
 ## Open Questions
 
 1. Upstream contribution to Xudong-Huang/may_minihttp — proceed locally; upstream ping optional.
-2. Rich client API (Phase 2) vs minimal compat layer — compat first, richness when Sesame-IDAM needs it.
+2. Upstream API shape for a future breaking 0.2 rename (`HttpClient` connection vs pooled `Client`).
 
 ## Capability gap register
 
-The remaining direct `reqwest` use in BRRTRouter test tooling exposed the following gaps. This is a
-classification of the existing evolution plan, not part of the HTTPS delivery slice.
+Direct `reqwest` use in BRRTRouter test tooling exposed the following gaps. The production client
+now closes them without introducing Tokio, Hyper, reqwest, or AWS-LC into its normal feature graph.
 
 | Capability | Classification | Current position | Acceptance for closure |
 |---|---|---|---|
 | JSON request/response helpers | Ergonomic | Delivered behind the optional `json` feature | Correct content type; encode/decode errors; unit and in-process integration tests |
-| Multipart/form-data | Functional | Text and in-memory byte parts delivered; non-blocking file/reader source remains | Generated boundary; injection-safe metadata; exact content length; direct-to-request streaming; file-source design must preserve may scheduling |
+| Multipart/form-data | Functional | Delivered with replayable text/bytes and explicit bounded blocking preload helpers | Generated boundary; injection-safe metadata; exact content length; direct-to-request streaming; blocking filesystem boundary is unmistakable |
 | Redirects | Functional and security-sensitive | Delivered on pooled `Client` | Disabled by default; bounded hops; relative `Location`; loop detection; credential stripping; downgrade rejection |
-| Connection pooling | Functional/performance | Delivered on pooled `Client` | Keyed by scheme/host/port/TLS identity; bounded per-origin/total entries; idle/lifetime expiry |
-| Connect vs request deadline | Functional/operational | Delivered on pooled `Client` | Independent connect, I/O, pool-wait, and total deadlines |
+| Connection pooling | Functional/performance | Delivered on pooled `Client` | Keyed by scheme/host/port/TLS identity; bounded per-origin/total entries; idle/lifetime expiry; cancellation-safe lease accounting |
+| Connect vs request deadline | Functional/operational | Delivered on pooled `Client` | DNS and address attempts share the connect budget; I/O, pool wait, and total request deadlines are finite |
+| Large request/response streaming | Functional/performance | Delivered with single-use readers and pool-aware streaming responses | No replay of reader bodies; EOF permits reuse; early drop/error discards without drain-on-drop I/O |
+| Error/operations surface | Operational | Delivered without breaking `io::Result` callers | Typed classification retains source error; monotonic counters expose creates, reuse, discard, waits, retries, redirects |
 | Async/Tokio API | Deliberate non-goal | Sync call surface over coroutine-aware `may::net` I/O | Keep core runtime-neutral from Tokio; use an adapter only when an external async harness requires it |
 
 Ordinary functional tests should use `Client` or `HttpClient` so their HTTP parsing, header behavior,

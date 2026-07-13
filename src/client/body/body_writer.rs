@@ -10,7 +10,7 @@ const MAX_DROP_PADDING: usize = 64 * 1024;
 #[allow(clippy::enum_variant_names)]
 pub enum BodyWriter {
     SizedWriter(SharedStream, usize),
-    ChunkWriter(SharedStream),
+    ChunkWriter(SharedStream, bool),
     // this is used to write all the data out when get drop
     EmptyWriter(SharedStream),
     // this is used as a invalid place holder
@@ -21,7 +21,7 @@ impl fmt::Debug for BodyWriter {
     fn fmt(&self, f: &mut fmt::Formatter) -> Result<(), fmt::Error> {
         let name = match *self {
             SizedWriter(..) => "SizedWriter",
-            ChunkWriter(_) => "ChunkWriter",
+            ChunkWriter(..) => "ChunkWriter",
             EmptyWriter(_) => "EmptyWriter",
             InvalidWriter => "Invalid",
         };
@@ -41,7 +41,16 @@ impl Write for BodyWriter {
                 *remain -= n;
                 Ok(n)
             }
-            ChunkWriter(ref w) => {
+            ChunkWriter(ref w, finished) => {
+                if buf.is_empty() {
+                    return Ok(0);
+                }
+                if finished {
+                    return Err(io::Error::new(
+                        io::ErrorKind::BrokenPipe,
+                        "chunked request body is already finished",
+                    ));
+                }
                 let chunk_size = buf.len();
                 let mut w = w.clone();
                 write!(w, "{:X}\r\n", chunk_size)?;
@@ -61,7 +70,7 @@ impl Write for BodyWriter {
                 let mut w = w.clone();
                 w.flush()
             }
-            ChunkWriter(ref w) => {
+            ChunkWriter(ref w, _) => {
                 let mut w = w.clone();
                 w.flush()
             }
@@ -91,17 +100,61 @@ impl Drop for BodyWriter {
                 }
                 w.flush().ok();
             }
-            ChunkWriter(ref w) => {
+            ChunkWriter(ref w, ref mut finished) => {
                 // write the chunk end and flush
-                let mut w = w.clone();
-                w.write_all(b"0\r\n\r\n").ok();
-                w.flush().ok();
+                if !*finished {
+                    let mut w = w.clone();
+                    w.write_all(b"0\r\n\r\n").ok();
+                    w.flush().ok();
+                    *finished = true;
+                }
             }
             EmptyWriter(ref w) => {
                 let mut w = w.clone();
                 w.flush().ok();
             }
             InvalidWriter => {}
+        }
+    }
+}
+
+impl BodyWriter {
+    pub(crate) fn finish(&mut self) -> io::Result<()> {
+        match self {
+            Self::SizedWriter(writer, remaining) => {
+                if *remaining != 0 {
+                    let missing = *remaining;
+                    *remaining = 0;
+                    return Err(io::Error::new(
+                        io::ErrorKind::UnexpectedEof,
+                        format!("request body ended {missing} bytes before Content-Length"),
+                    ));
+                }
+                let mut writer = writer.clone();
+                writer.flush()
+            }
+            Self::ChunkWriter(writer, finished) => {
+                if !*finished {
+                    let mut writer = writer.clone();
+                    writer.write_all(b"0\r\n\r\n")?;
+                    writer.flush()?;
+                    *finished = true;
+                }
+                Ok(())
+            }
+            Self::EmptyWriter(writer) => {
+                let mut writer = writer.clone();
+                writer.flush()
+            }
+            Self::InvalidWriter => Ok(()),
+        }
+    }
+
+    pub(crate) fn abort(&mut self) {
+        match self {
+            Self::SizedWriter(_, remaining) => *remaining = 0,
+            Self::ChunkWriter(_, finished) => *finished = true,
+            Self::EmptyWriter(_) | Self::InvalidWriter => {}
         }
     }
 }
@@ -181,16 +234,25 @@ mod tests {
     #[test]
     fn test_chunk_writer_format() {
         let (cw, bytes) = capture();
-        let mut bw = BodyWriter::ChunkWriter(cw.clone());
+        let mut bw = BodyWriter::ChunkWriter(cw.clone(), false);
         bw.write(b"hello").unwrap();
         bw.flush().unwrap();
         assert_eq!(bytes.lock().unwrap().as_slice(), b"5\r\nhello\r\n");
     }
 
     #[test]
+    fn test_chunk_writer_empty_write_emits_nothing() {
+        let (cw, bytes) = capture();
+        let mut writer = BodyWriter::ChunkWriter(cw, false);
+        assert_eq!(writer.write(&[]).unwrap(), 0);
+        writer.finish().unwrap();
+        assert_eq!(bytes.lock().unwrap().as_slice(), b"0\r\n\r\n");
+    }
+
+    #[test]
     fn test_chunk_writer_multiple_writes() {
         let (cw, bytes) = capture();
-        let mut bw = BodyWriter::ChunkWriter(cw.clone());
+        let mut bw = BodyWriter::ChunkWriter(cw.clone(), false);
         bw.write(b"hello").unwrap();
         bw.write(b"world").unwrap();
         bw.flush().unwrap();
@@ -203,7 +265,7 @@ mod tests {
     #[test]
     fn test_chunk_writer_drop_terminator() {
         let (cw, bytes) = capture();
-        let mut bw = BodyWriter::ChunkWriter(cw.clone());
+        let mut bw = BodyWriter::ChunkWriter(cw.clone(), false);
         bw.write(b"test").unwrap();
         drop(bw);
         let captured = bytes.lock().unwrap().clone();
