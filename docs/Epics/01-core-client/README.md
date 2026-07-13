@@ -5,7 +5,7 @@
 Native HTTP/1.1 client for `may_minihttp`: connection management, request/response types, and
 `may_http::client`-compatible API. No dependency on the abandoned `may_http` crate.
 
-**Status:** IN PROGRESS (Phase 1 — compat layer landed 2026-07-09)
+**Status:** PHASE 1 DONE (compat layer 2026-07-09; native HTTPS 2026-07-14)
 
 **Target Milestone:** Release 0.2.0 (Microscaler fork)
 
@@ -22,7 +22,7 @@ Native HTTP/1.1 client for `may_minihttp`: connection management, request/respon
 | [01.3](stories/01.3-http-client.md) | HttpClient: Connection & Configuration | DONE |
 | [01.4](stories/01.4-request-builder.md) | RequestBuilder: GET/POST with Headers | DEFERRED (Phase 2) |
 | [01.5](stories/01.5-response.md) | Response: Status, Headers, Body, JSON | DONE (compat `Response`) |
-| [01.6](stories/01.6-integration-tests.md) | Integration Tests with Mock Server | TODO |
+| [01.6](stories/01.6-integration-tests.md) | Integration Tests with Mock Server | DONE (20 scenarios) |
 
 ---
 
@@ -32,9 +32,9 @@ Native HTTP/1.1 client for `may_minihttp`: connection management, request/respon
 - [x] `cargo check --features client` passes
 - [x] DELETE/PUT/PATCH do not panic in `Request::Drop`
 - [x] BRRTRouter migrated off `may_http`
-- [ ] Integration test against in-process `HttpServer`
-- [ ] `docs/design-http-client.md` reflects shipped architecture
-- [ ] Server-side code unchanged without `client` feature
+- [x] Integration test against in-process `HttpServer`
+- [x] `docs/design-http-client.md` reflects shipped architecture and known gaps
+- [x] Server-side code unchanged without `client` feature
 
 ---
 
@@ -45,3 +45,11 @@ Native HTTP/1.1 client for `may_minihttp`: connection management, request/respon
 | Breaking server API | Client in `src/client/`, feature-gated |
 | `http 0.2` vs `1.0` conflict | `http 0.2` only in `client/` module |
 | Upstream may_minihttp drift | Microscaler fork branch `integration/microscaler-fork` |
+
+## Follow-on capability gaps
+
+The detailed register and closure criteria live in
+[`docs/design-http-client.md`](../../design-http-client.md#capability-gap-register). JSON helpers are
+already represented by Story 01.4. Multipart encoding, redirect policy, bounded host-keyed pooling,
+and independent connect/request deadlines remain future work. A Tokio-native API is deliberately
+not a core-client goal: the synchronous call surface is backed by coroutine-aware `may::net` I/O.

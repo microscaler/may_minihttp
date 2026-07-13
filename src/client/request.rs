@@ -1,12 +1,13 @@
 //! Outgoing HTTP/1.1 requests (client side).
-use std::cell::RefCell;
 use std::fmt;
 use std::io::{self, Write};
 use std::ops::{Deref, DerefMut};
-use std::rc::Rc;
 
 use crate::client::body::BodyWriter;
-use http::{self, Method};
+use crate::client::shared::SharedStream;
+use crate::client::MultipartForm;
+use http::header::CONTENT_TYPE;
+use http::{self, HeaderValue, Method};
 
 /// Outgoing request for [`super::HttpClient`].
 ///
@@ -14,7 +15,7 @@ use http::{self, Method};
 /// flushes the body unless the handler already did so.
 pub struct Request {
     raw_req: http::Request<BodyWriter>,
-    writer: Rc<RefCell<dyn Write>>,
+    writer: SharedStream,
     body_size: Option<usize>,
     expect_body: bool,
 }
@@ -28,7 +29,7 @@ impl fmt::Debug for Request {
 impl Request {
     /// Creates a new Request that can be used to write to a network stream.
     #[inline]
-    pub fn new(stream: Rc<RefCell<dyn Write>>) -> Request {
+    pub(crate) fn new(stream: SharedStream) -> Request {
         Request {
             raw_req: http::Request::new(BodyWriter::InvalidWriter),
             writer: stream,
@@ -38,7 +39,7 @@ impl Request {
     }
 
     fn write_head_impl(&mut self) -> io::Result<()> {
-        let mut writer = self.writer.borrow_mut();
+        let mut writer = self.writer.clone();
 
         write!(
             writer,
@@ -89,7 +90,8 @@ impl Request {
         // Flush headers immediately so pipelined requests don't overwrite
         // the buffer before the server receives them. (BufferIo batches
         // writes to its internal Vec and only flushes on buffer fill-up.)
-        self.writer.borrow_mut().flush()?;
+        let mut writer = self.writer.clone();
+        writer.flush()?;
         Ok(body)
     }
 
@@ -100,13 +102,44 @@ impl Request {
         self.write_all(body)
     }
 
+    /// Stream an encoded multipart/form-data body into this request.
+    ///
+    /// The form computes its exact length before the request head is written, so the request uses
+    /// `Content-Length` rather than chunked transfer encoding and does not allocate a second body.
+    pub fn send_multipart(&mut self, form: &MultipartForm) -> io::Result<()> {
+        let content_type = HeaderValue::from_str(&form.content_type()).map_err(|error| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("invalid multipart content type: {error}"),
+            )
+        })?;
+        self.headers_mut().insert(CONTENT_TYPE, content_type);
+        self.set_content_length(form.content_length()?);
+        form.write_to(self)
+    }
+
+    /// Serialize a value as JSON and write it as the request body.
+    #[cfg(feature = "json")]
+    pub fn send_json<T: serde::Serialize + ?Sized>(&mut self, value: &T) -> io::Result<()> {
+        let body = serde_json::to_vec(value).map_err(|error| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("JSON serialization failed: {error}"),
+            )
+        })?;
+        self.headers_mut()
+            .entry(CONTENT_TYPE)
+            .or_insert(HeaderValue::from_static("application/json"));
+        self.send(&body)
+    }
+
     /// Set Content-Length before writing the request body (when not using [`Self::send`]).
     #[inline]
     pub fn set_content_length(&mut self, len: usize) {
         self.body_size = Some(len);
     }
 
-    pub(super) fn conn(&self) -> &Rc<RefCell<dyn Write>> {
+    pub(super) fn conn(&self) -> &SharedStream {
         &self.writer
     }
 
@@ -178,35 +211,62 @@ impl Drop for Request {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Read;
+    use std::sync::{Arc, Mutex};
 
-    fn request_with_method(method: Method, stream: Rc<RefCell<Vec<u8>>>) -> Request {
+    #[derive(Clone)]
+    struct Capture(Arc<Mutex<Vec<u8>>>);
+
+    impl Read for Capture {
+        fn read(&mut self, _buffer: &mut [u8]) -> io::Result<usize> {
+            Ok(0)
+        }
+    }
+
+    impl Write for Capture {
+        fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buffer);
+            Ok(buffer.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn capture() -> (SharedStream, Arc<Mutex<Vec<u8>>>) {
+        let bytes = Arc::new(Mutex::new(Vec::new()));
+        (SharedStream::test(Capture(bytes.clone())), bytes)
+    }
+
+    fn request_with_method(method: Method, stream: SharedStream) -> Request {
         let mut req = Request::new(stream);
         *req.method_mut() = method;
         *req.uri_mut() = "/things/42".parse().unwrap();
         req
     }
 
-    fn written(stream: &Rc<RefCell<Vec<u8>>>) -> String {
-        String::from_utf8(stream.borrow().clone()).unwrap()
+    fn written(bytes: &Arc<Mutex<Vec<u8>>>) -> String {
+        String::from_utf8(bytes.lock().unwrap().clone()).unwrap()
     }
 
     #[test]
     fn delete_without_body_writes_head_on_drop() {
-        let stream: Rc<RefCell<Vec<u8>>> = Rc::new(RefCell::new(Vec::new()));
+        let (stream, bytes) = capture();
         let req = request_with_method(Method::DELETE, stream.clone());
         drop(req);
-        let head = written(&stream);
+        let head = written(&bytes);
         assert!(head.starts_with("DELETE /things/42"), "head was: {head}");
         assert!(!head.contains("Content-Length"), "head was: {head}");
     }
 
     #[test]
     fn put_with_sized_body_writes_content_length() {
-        let stream: Rc<RefCell<Vec<u8>>> = Rc::new(RefCell::new(Vec::new()));
+        let (stream, bytes) = capture();
         let mut req = request_with_method(Method::PUT, stream.clone());
         req.send(b"{\"a\":1}").unwrap();
         drop(req);
-        let head = written(&stream);
+        let head = written(&bytes);
         assert!(head.starts_with("PUT /things/42"), "head was: {head}");
         assert!(head.contains("Content-Length: 7"), "head was: {head}");
         assert!(head.ends_with("{\"a\":1}"), "head was: {head}");
@@ -215,11 +275,11 @@ mod tests {
     #[test]
     fn patch_and_options_do_not_panic() {
         for method in [Method::PATCH, Method::OPTIONS] {
-            let stream: Rc<RefCell<Vec<u8>>> = Rc::new(RefCell::new(Vec::new()));
+            let (stream, bytes) = capture();
             let req = request_with_method(method.clone(), stream.clone());
             drop(req);
             assert!(
-                written(&stream).starts_with(method.as_str()),
+                written(&bytes).starts_with(method.as_str()),
                 "no head written for {method}"
             );
         }
@@ -227,17 +287,17 @@ mod tests {
 
     #[test]
     fn absolute_uri_adds_host_header() {
-        let stream: Rc<RefCell<Vec<u8>>> = Rc::new(RefCell::new(Vec::new()));
+        let (stream, bytes) = capture();
         let mut req = Request::new(stream.clone());
         *req.uri_mut() = "http://example.com/things".parse().unwrap();
         drop(req);
 
-        assert!(written(&stream).contains("Host: example.com\r\n"));
+        assert!(written(&bytes).contains("Host: example.com\r\n"));
     }
 
     #[test]
     fn explicit_host_header_is_not_duplicated() {
-        let stream: Rc<RefCell<Vec<u8>>> = Rc::new(RefCell::new(Vec::new()));
+        let (stream, bytes) = capture();
         let mut req = Request::new(stream.clone());
         *req.uri_mut() = "http://example.com/things".parse().unwrap();
         req.headers_mut().insert(
@@ -246,7 +306,7 @@ mod tests {
         );
         drop(req);
 
-        let head = written(&stream);
+        let head = written(&bytes);
         let head_lower = head.to_ascii_lowercase();
         assert_eq!(
             head_lower.matches("\r\nhost:").count(),
@@ -254,5 +314,19 @@ mod tests {
             "head was: {head}"
         );
         assert!(head_lower.contains("host: override.example\r\n"));
+    }
+
+    #[cfg(feature = "json")]
+    #[test]
+    fn send_json_sets_content_type_and_length() {
+        let (stream, bytes) = capture();
+        let mut req = request_with_method(Method::POST, stream.clone());
+        req.send_json(&serde_json::json!({"ok": true})).unwrap();
+        drop(req);
+
+        let head_and_body = written(&bytes);
+        assert!(head_and_body.contains("content-type: application/json\r\n"));
+        assert!(head_and_body.contains("Content-Length: 11\r\n"));
+        assert!(head_and_body.ends_with("{\"ok\":true}"));
     }
 }

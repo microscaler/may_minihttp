@@ -1,0 +1,126 @@
+# Strict may client architecture
+
+## Status
+
+Implemented direction, 2026-07-14. HTTPS, replay-aware requests, bounded buffered responses,
+redirects, and pooling follow this design without an async runtime or hidden blocking worker pool.
+
+## Runtime invariants
+
+1. Network I/O uses `may::net::TcpStream`; TLS wraps that socket with rustls.
+2. Waiting between coroutines uses `may::sync::{Mutex, Condvar, Semphore}` or may channels.
+3. Timers and deadlines use may's I/O timeout and timer facilities.
+4. No Tokio executor, async trait, `reqwest`, or hidden OS-thread-per-request adapter enters the
+   client feature graph.
+5. A pool lock is held only while inspecting or mutating pool metadata. DNS, connect, TLS, request
+   writes, and response reads occur after releasing it.
+6. The low-level response remains streaming. A connection is reusable only after its response body
+   is fully consumed or safely drained.
+
+The `client` feature explicitly enables `may/io_timeout`; it must compile with the crate's default
+features disabled.
+
+## Layering
+
+### Connection layer
+
+The existing `HttpClient` remains the single-connection HTTP/1.1 primitive during the 0.1 line. It
+owns one plain or TLS transport and preserves response streaming and connection reuse. The new
+cloneable `Client` is the policy-and-pool handle without forcing the breaking 0.2 rename early.
+
+For the breaking 0.2 API, `HttpClient` can be renamed to internal `HttpConnection` and `Client` can
+take the primary name. This avoids making a single HTTP/1.1 connection look concurrently
+multiplexable.
+
+### Request layer
+
+`RequestBuilder` owns replayable request metadata and a body enum:
+
+- empty;
+- immutable bytes;
+- optional JSON serialized to immutable bytes;
+- multipart text/byte parts with a known encoded length;
+- a future streaming source explicitly marked non-replayable.
+
+Redirect and stale-connection retry logic may replay only bodies marked replayable. A streaming body
+must fail with a typed `BodyNotReplayable` result before a second network attempt.
+
+### Pool layer
+
+The pool stores idle transports, not live response objects and not concurrently shared
+`HttpConnection` handles. Its key is:
+
+```text
+(scheme, canonical host, effective port, TLS profile identity)
+```
+
+The state is protected by `may::sync::Mutex`; capacity waiters use a may condition variable or
+semaphore with the request deadline. Limits are required globally and per origin. Idle eviction is
+lazy on checkout/check-in, so no background reaper thread is necessary.
+
+Checkout reserves capacity under the lock, releases the lock, and only then connects. Check-in is
+allowed when:
+
+- the response body reached its framing boundary;
+- neither side requested `Connection: close`;
+- the HTTP version permits persistence;
+- no read, write, parse, or TLS error marked the transport unhealthy;
+- the idle and lifetime limits have not expired.
+
+Stale idle sockets may be replaced once for idempotent, replayable requests. They must never cause
+an automatic retry of a non-idempotent request after bytes may have reached the peer.
+
+## Redirect policy
+
+Redirect following is disabled by default. The opt-in policy contains a maximum hop count and an
+origin rule. The safe default policy follows only GET and HEAD, resolves relative `Location` values,
+detects loops, and permits only same-origin targets.
+
+If cross-origin redirects are enabled, `Authorization`, `Cookie`, `Proxy-Authorization`, and caller-
+configured sensitive headers are stripped before the redirected request is sent. HTTPS-to-HTTP
+downgrades are rejected unless a separate explicit policy permits them. Status handling follows:
+
+- 303: change to GET and discard the body;
+- 307/308: preserve method and body only when replayable;
+- 301/302: preserve GET/HEAD; other methods require explicit compatibility policy.
+
+## Body helpers
+
+JSON is optional through the `json` feature. Serialization errors become `InvalidData` I/O errors
+until the domain error type lands. Multipart text and byte parts compute exact `Content-Length` and
+write directly into the request body without creating a second encoded body. Multipart metadata is
+validated before output to prevent CR/LF header injection.
+
+File multipart support must not simply call blocking filesystem reads from a scheduler thread.
+Callers currently preload files outside coroutine execution and pass their bytes to
+`MultipartForm::bytes`. A future reader source must either be may-aware or explicitly non-replayable;
+the client deliberately provides no misleading `file(path)` helper backed by blocking `std::fs`.
+
+## Acceptance criteria
+
+### JSON and multipart
+
+- `cargo check --no-default-features --features client` passes.
+- `cargo test --features json` covers JSON headers, serialization, deserialization, and an in-process
+  request round trip.
+- Multipart length equals bytes written, metadata injection is rejected before output, and an
+  in-process server receives text and byte parts.
+
+### Redirects
+
+- Disabled by default and bounded when enabled.
+- Relative, same-origin, loop, hop-limit, downgrade, and cross-origin credential tests are local and
+  deterministic.
+- Non-replayable bodies are never resent.
+
+### Pooling
+
+- Bounds are enforced under concurrent may coroutines without an OS-thread wait.
+- The pool key separates HTTP, HTTPS, ports, and TLS profiles.
+- Locks are demonstrably not held during network I/O.
+- Fully consumed persistent responses reuse a connection; close/error/incomplete responses do not.
+- Idle and lifetime expiry are deterministic under an injectable clock in unit tests.
+
+### Dependency boundary
+
+The normal `client` and `json` feature graphs contain no Tokio, reqwest, hyper, or AWS-LC packages.

@@ -1,14 +1,15 @@
-use std::cell::RefCell;
 use std::fmt;
 use std::io::{self, Read};
-use std::rc::Rc;
+
+use crate::client::shared::SharedStream;
 
 use super::BodyReader::*;
 
 #[allow(clippy::enum_variant_names)]
 pub enum BodyReader {
-    SizedReader(Rc<RefCell<dyn Read>>, usize),
-    ChunkReader(Rc<RefCell<dyn Read>>, Option<usize>),
+    SizedReader(SharedStream, usize),
+    ChunkReader(SharedStream, Option<usize>),
+    EofReader(Option<SharedStream>),
     EmptyReader,
 }
 
@@ -17,6 +18,7 @@ impl fmt::Debug for BodyReader {
         let name = match *self {
             SizedReader(..) => "SizedReader",
             ChunkReader(..) => "ChunkReader",
+            EofReader(..) => "EofReader",
             EmptyReader => "EmptyReader",
         };
         write!(f, "BodyReader {}", name)
@@ -33,23 +35,23 @@ impl Read for BodyReader {
                 if len == 0 {
                     return Ok(0);
                 }
-                let mut r = r.borrow_mut();
+                let mut r = r.clone();
                 let n = r.read(&mut buf[0..len])?;
                 *remain -= n;
                 Ok(n)
             }
             ChunkReader(ref r, ref mut opt_remaining) => {
-                let mut r = r.borrow_mut();
+                let mut r = r.clone();
                 let mut rem = match *opt_remaining {
                     Some(ref rem) => *rem,
                     // None means we don't know the size of the next chunk
-                    None => read_chunk_size(&mut *r)?,
+                    None => read_chunk_size(&mut r)?,
                 };
                 trace!("Chunked read, remaining={:?}", rem);
 
                 if rem == 0 {
                     if opt_remaining.is_none() {
-                        eat(&mut *r, b"\r\n")?;
+                        eat(&mut r, b"\r\n")?;
                     }
 
                     *opt_remaining = Some(0);
@@ -71,12 +73,39 @@ impl Read for BodyReader {
                 *opt_remaining = if rem > 0 {
                     Some(rem)
                 } else {
-                    eat(&mut *r, b"\r\n")?;
+                    eat(&mut r, b"\r\n")?;
                     None
                 };
                 Ok(count)
             }
+            EofReader(Some(ref r)) => {
+                let mut r = r.clone();
+                r.read(buf)
+            }
+            EofReader(None) => Ok(0),
             EmptyReader => Ok(0),
+        }
+    }
+}
+
+impl BodyReader {
+    pub(crate) fn set_timeout(&self, timeout: Option<std::time::Duration>) -> io::Result<()> {
+        match self {
+            Self::SizedReader(stream, _)
+            | Self::ChunkReader(stream, _)
+            | Self::EofReader(Some(stream)) => stream.set_timeout(timeout),
+            Self::EofReader(None) | Self::EmptyReader => Ok(()),
+        }
+    }
+
+    pub(crate) fn abandon(&mut self) {
+        match self {
+            Self::SizedReader(_, remaining) => *remaining = 0,
+            Self::ChunkReader(_, remaining) => *remaining = Some(0),
+            Self::EofReader(reader) => {
+                let _ = reader.take();
+            }
+            Self::EmptyReader => {}
         }
     }
 }
@@ -180,9 +209,7 @@ fn read_chunk_size(rdr: &mut dyn Read) -> io::Result<usize> {
 
 #[cfg(test)]
 mod tests {
-    use std::cell::RefCell;
-    use std::io;
-    use std::rc::Rc;
+    use std::io::{self, Write};
 
     use super::*;
 
@@ -202,6 +229,23 @@ mod tests {
             self.pos += len;
             Ok(len)
         }
+    }
+
+    impl Write for TestReader {
+        fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+            Ok(buffer.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn stream(data: &[u8]) -> SharedStream {
+        SharedStream::test(TestReader {
+            data: data.to_vec(),
+            pos: 0,
+        })
     }
 
     // --- eat tests ---
@@ -275,10 +319,7 @@ mod tests {
 
     #[test]
     fn test_sized_reader_exact_bytes() {
-        let reader = Rc::new(RefCell::new(TestReader {
-            data: b"hello world!".to_vec(),
-            pos: 0,
-        }));
+        let reader = stream(b"hello world!");
         let mut br = BodyReader::SizedReader(reader, 12);
         let mut buf = [0u8; 12];
         assert_eq!(br.read(&mut buf).unwrap(), 12);
@@ -289,10 +330,7 @@ mod tests {
 
     #[test]
     fn test_sized_reader_zero_remain() {
-        let reader = Rc::new(RefCell::new(TestReader {
-            data: b"nope".to_vec(),
-            pos: 0,
-        }));
+        let reader = stream(b"nope");
         let mut br = BodyReader::SizedReader(reader, 0);
         let mut buf = [0u8; 4];
         assert_eq!(br.read(&mut buf).unwrap(), 0);
@@ -302,10 +340,7 @@ mod tests {
     fn test_chunk_reader_multiple_chunks() {
         // 5\r\nhello\r\n5\r\nworld\r\n0\r\n\r\n
         let data = b"5\r\nhello\r\n5\r\nworld\r\n0\r\n\r\n";
-        let reader = Rc::new(RefCell::new(TestReader {
-            data: data.to_vec(),
-            pos: 0,
-        }));
+        let reader = stream(data);
         let mut br = BodyReader::ChunkReader(reader, None);
         let mut buf = [0u8; 10];
         // First read: chunk size 5, body "hello"
@@ -322,10 +357,7 @@ mod tests {
     fn test_chunk_reader_chunk_extensions() {
         // 5;ext=val\r\nhello\r\n0\r\n\r\n
         let data = b"5;ext=val\r\nhello\r\n0\r\n\r\n";
-        let reader = Rc::new(RefCell::new(TestReader {
-            data: data.to_vec(),
-            pos: 0,
-        }));
+        let reader = stream(data);
         let mut br = BodyReader::ChunkReader(reader, None);
         let mut buf = [0u8; 5];
         assert_eq!(br.read(&mut buf).unwrap(), 5);
@@ -336,10 +368,7 @@ mod tests {
     #[test]
     fn test_chunk_reader_early_eof() {
         let data = b"10\r\nhel";
-        let reader = Rc::new(RefCell::new(TestReader {
-            data: data.to_vec(),
-            pos: 0,
-        }));
+        let reader = stream(data);
         let mut br = BodyReader::ChunkReader(reader, None);
         let mut buf = [0u8; 10];
         assert_eq!(br.read(&mut buf).unwrap(), 3);
@@ -357,10 +386,7 @@ mod tests {
     fn test_drop_consumes_remaining_chunks() {
         // 5\r\nhello\r\n3\r\nabc\r\n
         let data = b"5\r\nhello\r\n3\r\nabc\r\n";
-        let reader = Rc::new(RefCell::new(TestReader {
-            data: data.to_vec(),
-            pos: 0,
-        }));
+        let reader = stream(data);
         let mut br = BodyReader::ChunkReader(reader, None);
         let mut buf = [0u8; 10];
         assert_eq!(br.read(&mut buf).unwrap(), 5);

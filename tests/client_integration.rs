@@ -21,7 +21,7 @@ use std::time::Duration;
 use bytes::BufMut;
 
 use http::Method;
-use may_minihttp::client::{HttpClient, Response};
+use may_minihttp::client::{HttpClient, MultipartForm, Response};
 use may_minihttp::{HttpServer, HttpService, Request as ServerRequest, Response as ServerResponse};
 
 // ============================================================================
@@ -319,6 +319,48 @@ fn test_post_with_body() {
     let body = read_body(&mut response);
     assert!(body.contains("method:POST"));
     assert!(body.contains("body:{\"hello\":\"world\"}"));
+}
+
+#[cfg(feature = "json")]
+#[test]
+fn test_post_json_sets_headers_and_body() {
+    let fixture = ClientTestFixture::new(18517);
+    let addr = fixture.base_url();
+    let mut client = HttpClient::connect(&*addr).expect("failed to connect");
+
+    let mut response = client
+        .post_json(
+            "/post".parse().expect("invalid uri"),
+            &serde_json::json!({"hello": "world"}),
+        )
+        .expect("JSON POST failed");
+
+    let body = read_body(&mut response);
+    assert!(body.contains("content-type:application/json"));
+    assert!(body.contains("body:{\"hello\":\"world\"}"));
+}
+
+#[test]
+fn test_post_multipart_streams_exact_body() {
+    let fixture = ClientTestFixture::new(18518);
+    let addr = fixture.base_url();
+    let mut client = HttpClient::connect(&*addr).expect("failed to connect");
+    let form = MultipartForm::new().text("note", "hello").bytes(
+        "file",
+        Some("ci.png"),
+        Some("image/png"),
+        b"PNG".to_vec(),
+    );
+
+    let mut response = client
+        .post_multipart("/post".parse().expect("invalid uri"), &form)
+        .expect("multipart POST failed");
+
+    let body = read_body(&mut response);
+    assert!(body.contains("content-type:multipart/form-data; boundary="));
+    assert!(body.contains("name=\"note\""));
+    assert!(body.contains("filename=\"ci.png\""));
+    assert!(body.contains("hello"));
 }
 
 /// Test 4: POST with empty body.

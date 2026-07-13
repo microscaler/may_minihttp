@@ -6,9 +6,14 @@
 mod body;
 mod buffer;
 mod client_impl;
+mod multipart;
 mod request;
 mod response;
+mod rich;
+mod shared;
 
 pub use client_impl::HttpClient;
+pub use multipart::MultipartForm;
 pub use request::Request;
 pub use response::Response;
+pub use rich::{BufferedResponse, Client, ClientBuilder, RedirectPolicy, RequestBuilder};

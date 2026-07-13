@@ -1,8 +1,6 @@
-use std::cell::RefCell;
 use std::fmt;
 use std::io::{self, Read};
 use std::ops::{Deref, DerefMut};
-use std::rc::Rc;
 
 use bytes::BytesMut;
 use http::header::*;
@@ -10,6 +8,7 @@ use http::{self, Version};
 use httparse;
 
 use crate::client::body::BodyReader;
+use crate::client::shared::SharedStream;
 
 pub(crate) fn decode(buf: &mut BytesMut) -> io::Result<Option<Response>> {
     // Parse into owned response metadata before mutating `buf`. `httparse`
@@ -85,12 +84,11 @@ pub(crate) fn decode(buf: &mut BytesMut) -> io::Result<Option<Response>> {
 pub struct Response(http::Response<BodyReader>);
 
 impl Response {
-    pub(crate) fn set_reader(
-        &mut self,
-        reader: Rc<RefCell<dyn Read>>,
-        expect_body: bool,
-    ) -> io::Result<()> {
-        if !expect_body {
+    pub(crate) fn set_reader(&mut self, reader: SharedStream, expect_body: bool) -> io::Result<()> {
+        let status_forbids_body = self.status().is_informational()
+            || self.status() == http::StatusCode::NO_CONTENT
+            || self.status() == http::StatusCode::NOT_MODIFIED;
+        if !expect_body || status_forbids_body {
             *self.body_mut() = BodyReader::EmptyReader;
             return Ok(());
         }
@@ -111,13 +109,44 @@ impl Response {
             })
             .transpose()?;
 
-        let body_reader = match size {
-            Some(n) => BodyReader::SizedReader(reader, n),
-            None => BodyReader::ChunkReader(reader, None),
+        let chunked = self
+            .headers()
+            .get_all(TRANSFER_ENCODING)
+            .iter()
+            .filter_map(|value| value.to_str().ok())
+            .flat_map(|value| value.split(','))
+            .any(|coding| coding.trim().eq_ignore_ascii_case("chunked"));
+
+        let body_reader = match (size, chunked) {
+            (Some(n), _) => BodyReader::SizedReader(reader, n),
+            (None, true) => BodyReader::ChunkReader(reader, None),
+            (None, false) => BodyReader::EofReader(Some(reader)),
         };
 
         *self.body_mut() = body_reader;
         Ok(())
+    }
+
+    pub(crate) fn abandon_body(&mut self) {
+        self.body_mut().abandon();
+    }
+
+    pub(crate) fn set_timeout(&self, timeout: Option<std::time::Duration>) -> io::Result<()> {
+        self.body().set_timeout(timeout)
+    }
+
+    /// Deserialize the remaining response body as JSON.
+    ///
+    /// This consumes bytes from the streaming body. Call it at most once unless the caller has
+    /// independently buffered and reconstructed the response.
+    #[cfg(feature = "json")]
+    pub fn json<T: serde::de::DeserializeOwned>(&mut self) -> io::Result<T> {
+        serde_json::from_reader(self).map_err(|error| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("JSON deserialization failed: {error}"),
+            )
+        })
     }
 }
 
@@ -153,8 +182,27 @@ impl fmt::Debug for Response {
 #[cfg(test)]
 mod tests {
     use bytes::BytesMut;
+    use std::io::{Cursor, Read, Write};
 
     use super::decode;
+
+    struct FakeReader;
+
+    impl Read for FakeReader {
+        fn read(&mut self, _buffer: &mut [u8]) -> std::io::Result<usize> {
+            Ok(0)
+        }
+    }
+
+    impl Write for FakeReader {
+        fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
+            Ok(buffer.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
 
     fn build_response(status: u16, headers: &[(&str, &str)], body: &str) -> String {
         let mut resp = format!("HTTP/1.1 {}\r\n", status);
@@ -210,22 +258,11 @@ mod tests {
 
     #[test]
     fn test_decode_set_reader_with_expect_body() {
-        use std::cell::RefCell;
-        use std::io::Read;
-        use std::rc::Rc;
-
         let text = build_response(200, &[("Content-Length", "5")], "");
         let mut buf = BytesMut::from(text.as_bytes());
         let mut rsp = decode(&mut buf).unwrap().unwrap();
 
-        struct FakeReader;
-        impl Read for FakeReader {
-            fn read(&mut self, _buf: &mut [u8]) -> std::io::Result<usize> {
-                Ok(0)
-            }
-        }
-
-        let reader = Rc::new(RefCell::new(FakeReader));
+        let reader = super::SharedStream::test(FakeReader);
         rsp.set_reader(reader, true).unwrap();
 
         match rsp.body() {
@@ -236,22 +273,11 @@ mod tests {
 
     #[test]
     fn test_decode_set_reader_no_body() {
-        use std::cell::RefCell;
-        use std::io::Read;
-        use std::rc::Rc;
-
         let text = build_response(200, &[] as &[(&str, &str)], "");
         let mut buf = BytesMut::from(text.as_bytes());
         let mut rsp = decode(&mut buf).unwrap().unwrap();
 
-        struct FakeReader;
-        impl Read for FakeReader {
-            fn read(&mut self, _buf: &mut [u8]) -> std::io::Result<usize> {
-                Ok(0)
-            }
-        }
-
-        let reader = Rc::new(RefCell::new(FakeReader));
+        let reader = super::SharedStream::test(FakeReader);
         rsp.set_reader(reader, false).unwrap();
 
         assert!(matches!(*rsp.body(), super::BodyReader::EmptyReader));
@@ -259,23 +285,25 @@ mod tests {
 
     #[test]
     fn test_decode_set_reader_bad_cl() {
-        use std::cell::RefCell;
-        use std::io::Read;
-        use std::rc::Rc;
-
         let text = build_response(200, &[("Content-Length", "abc")], "");
         let mut buf = BytesMut::from(text.as_bytes());
         let mut rsp = decode(&mut buf).unwrap().unwrap();
 
-        struct FakeReader;
-        impl Read for FakeReader {
-            fn read(&mut self, _buf: &mut [u8]) -> std::io::Result<usize> {
-                Ok(0)
-            }
-        }
-
-        let reader = Rc::new(RefCell::new(FakeReader));
+        let reader = super::SharedStream::test(FakeReader);
         let err = rsp.set_reader(reader, true).unwrap_err();
         assert!(err.to_string().contains("malformed Content-Length"));
+    }
+
+    #[cfg(feature = "json")]
+    #[test]
+    fn json_deserializes_streaming_body() {
+        let text = build_response(200, &[("Content-Length", "11")], "");
+        let mut buf = BytesMut::from(text.as_bytes());
+        let mut response = decode(&mut buf).unwrap().unwrap();
+        let reader = super::SharedStream::test(Cursor::new(br#"{"ok":true}"#.to_vec()));
+        response.set_reader(reader, true).unwrap();
+
+        let value: serde_json::Value = response.json().unwrap();
+        assert_eq!(value, serde_json::json!({"ok": true}));
     }
 }

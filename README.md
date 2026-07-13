@@ -42,6 +42,46 @@ fn main() {
 }
 ```
 
+### Native HTTP/HTTPS client
+
+Enable the `client` feature to use the coroutine-native HTTP/1.1 client. Absolute `http://` URLs
+use a plain `may::net::TcpStream`; absolute `https://` URLs use rustls with the platform certificate
+verifier and the ring crypto provider.
+
+```toml
+[dependencies]
+may_minihttp = { version = "0.1", features = ["client"] }
+```
+
+```rust,no_run
+use may_minihttp::client::HttpClient;
+
+let mut client = HttpClient::from_url("https://identity.example.com")?;
+let response = client.get("/health".parse()?)?;
+# Ok::<(), Box<dyn std::error::Error>>(())
+```
+
+Use `HttpClient::from_url_with_tls_config` when a private CA or mTLS client configuration is
+required. `HttpClient` is the low-level, single-connection streaming API.
+
+For requests across multiple origins, use the cloneable pooled `Client`. It buffers responses up to
+a configured limit so connections can be returned to the pool safely. Pool limits and deadlines are
+finite; redirects are disabled unless explicitly enabled.
+
+```rust,no_run
+use may_minihttp::client::{Client, RedirectPolicy};
+
+let client = Client::builder()
+    .redirect_policy(RedirectPolicy::SameOrigin { max_hops: 5 })
+    .build()?;
+let response = client.get("https://identity.example.com/health")?.send()?;
+assert!(response.status().is_success());
+# Ok::<(), Box<dyn std::error::Error>>(())
+```
+
+The normal client graph uses `may`, rustls, and the ring provider selected through rustls. It does
+not include reqwest, Tokio, Hyper, or AWS-LC. Proxy discovery and HTTP/2 are not implicit.
+
 ## Performance
 Tested with only one working thread on my laptop
 
@@ -90,4 +130,3 @@ This project is licensed under either of
    http://opensource.org/licenses/MIT)
 
 at your option.
-
