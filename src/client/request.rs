@@ -16,6 +16,7 @@ pub struct Request {
     raw_req: http::Request<BodyWriter>,
     writer: Rc<RefCell<dyn Write>>,
     body_size: Option<usize>,
+    expect_body: bool,
 }
 
 impl fmt::Debug for Request {
@@ -32,6 +33,7 @@ impl Request {
             raw_req: http::Request::new(BodyWriter::InvalidWriter),
             writer: stream,
             body_size: None,
+            expect_body: true,
         }
     }
 
@@ -46,6 +48,11 @@ impl Request {
             self.version()
         )?;
         write!(writer, "User-Agent: may_minihttp\r\nAccept: */*\r\n")?;
+        if !self.headers().contains_key(http::header::HOST) {
+            if let Some(host) = self.uri().host() {
+                write!(writer, "Host: {host}\r\n")?;
+            }
+        }
 
         for (key, value) in self.headers().iter() {
             write!(
@@ -79,6 +86,10 @@ impl Request {
             },
         };
         self.write_head_impl()?;
+        // Flush headers immediately so pipelined requests don't overwrite
+        // the buffer before the server receives them. (BufferIo batches
+        // writes to its internal Vec and only flushes on buffer fill-up.)
+        self.writer.borrow_mut().flush()?;
         Ok(body)
     }
 
@@ -97,6 +108,20 @@ impl Request {
 
     pub(super) fn conn(&self) -> &Rc<RefCell<dyn Write>> {
         &self.writer
+    }
+
+    /// Set whether the request is expected to have a response body.
+    ///
+    /// HEAD requests should call this with `false` so that [`super::Response`]
+    /// selects `EmptyReader` for the response body, preventing a hang.
+    #[inline]
+    pub fn expect_body(&mut self, val: bool) -> &mut Self {
+        self.expect_body = val;
+        self
+    }
+
+    pub(crate) fn expect_body_request(&self) -> bool {
+        self.expect_body
     }
 }
 
@@ -127,7 +152,10 @@ impl Write for Request {
 
     #[inline]
     fn flush(&mut self) -> io::Result<()> {
-        Ok(())
+        if let BodyWriter::InvalidWriter = *self.body() {
+            return Ok(());
+        }
+        self.body_mut().flush()
     }
 }
 
@@ -195,5 +223,36 @@ mod tests {
                 "no head written for {method}"
             );
         }
+    }
+
+    #[test]
+    fn absolute_uri_adds_host_header() {
+        let stream: Rc<RefCell<Vec<u8>>> = Rc::new(RefCell::new(Vec::new()));
+        let mut req = Request::new(stream.clone());
+        *req.uri_mut() = "http://example.com/things".parse().unwrap();
+        drop(req);
+
+        assert!(written(&stream).contains("Host: example.com\r\n"));
+    }
+
+    #[test]
+    fn explicit_host_header_is_not_duplicated() {
+        let stream: Rc<RefCell<Vec<u8>>> = Rc::new(RefCell::new(Vec::new()));
+        let mut req = Request::new(stream.clone());
+        *req.uri_mut() = "http://example.com/things".parse().unwrap();
+        req.headers_mut().insert(
+            http::header::HOST,
+            http::HeaderValue::from_static("override.example"),
+        );
+        drop(req);
+
+        let head = written(&stream);
+        let head_lower = head.to_ascii_lowercase();
+        assert_eq!(
+            head_lower.matches("\r\nhost:").count(),
+            1,
+            "head was: {head}"
+        );
+        assert!(head_lower.contains("host: override.example\r\n"));
     }
 }
