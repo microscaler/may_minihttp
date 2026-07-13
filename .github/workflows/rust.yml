@@ -140,7 +140,9 @@ jobs:
             target
           key: ${{ runner.os }}-goose-${{ hashFiles('**/Cargo.lock') }}
       - name: Run Goose load tests (capture output)
-        run: cargo test --test goose_header_load_test -- --test-threads=1 --nocapture 2>&1 | tee target/goose/goose-stdout.log
+        run: |
+          mkdir -p target/goose
+          cargo test --test goose_header_load_test -- --test-threads=1 --nocapture 2>&1 | tee target/goose/goose-stdout.log
       - name: Generate goose report
         run: |
           mkdir -p target/goose
