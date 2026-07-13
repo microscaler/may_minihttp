@@ -41,13 +41,18 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os:
-          - ubuntu-latest
-          - windows-latest
         include:
-          - name: default
+          - os: ubuntu-latest
+            name: default
             cargo_args: ""
-          - name: client
+          - os: ubuntu-latest
+            name: client
+            cargo_args: "--features client"
+          - os: windows-latest
+            name: default
+            cargo_args: ""
+          - os: windows-latest
+            name: client
             cargo_args: "--features client"
     steps:
       - name: Checkout sources
