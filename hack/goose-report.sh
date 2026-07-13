@@ -26,11 +26,17 @@ fi
 # Read stdin into variable
 GOOSE_STDOUT="$(cat)"
 
+# Extract only the last [REPORT] block (the most recent test run),
+# since all 6 test reports are concatenated in the log.
+GOOSE_STDOUT=$(echo "$GOOSE_STDOUT" | awk '/^\[REPORT\]/{buf=""} {buf=buf $0 "\n"} END{printf "%s", buf}')
+
 # Parse from print_goose_report() output
-total_users=$(echo "$GOOSE_STDOUT" | grep -oP 'Total users spawned: \K\d+' || echo "0")
-total_requests=$(echo "$GOOSE_STDOUT" | grep -oP 'Total requests: +\K\d+' || echo "0")
-successful_requests=$(echo "$GOOSE_STDOUT" | grep -oP 'Successful requests: +\K\d+' || echo "0")
-failed_requests=$(echo "$GOOSE_STDOUT" | grep -oP 'Failed requests: +\K\d+' || echo "0")
+# Use `tail -1` to extract only the last (most recent) test's metrics,
+# since the log contains all 6 test runs concatenated together.
+total_users=$(echo "$GOOSE_STDOUT" | grep -oP 'Total users spawned: \K\d+' | tail -1 || echo "0")
+total_requests=$(echo "$GOOSE_STDOUT" | grep -oP 'Total requests: +\K\d+' | tail -1 || echo "0")
+successful_requests=$(echo "$GOOSE_STDOUT" | grep -oP 'Successful requests: +\K\d+' | tail -1 || echo "0")
+failed_requests=$(echo "$GOOSE_STDOUT" | grep -oP 'Failed requests: +\K\d+' | tail -1 || echo "0")
 
 # Extract per-transaction metrics from Response Times section
 # Goose outputs two patterns:
