@@ -275,8 +275,10 @@ jobs:
 
       # Post PR comment (PR events only)
       - name: Post PR comment with reports
-        if: github.event_name == 'pull_request'
-        run: |
+        if: github.event.pull_request != null
+        run: |-
+          PR_NUMBER="${{ github.event.pull_request.number }}"
+          
           if [[ ! -f target/reports/combined.md ]]; then
             echo "⚠️ Report generation failed" > /tmp/pr-body.md
           else
@@ -285,7 +287,7 @@ jobs:
           fi
 
           # Check for existing bot comment and update, otherwise create
-          COMMENT_ID=$(gh api repos/${{ github.repository }}/issues/${{ github.event.pull_request.number }}/comments \
+          COMMENT_ID=$(gh api repos/${{ github.repository }}/issues/${PR_NUMBER}/comments \
             --jq '.[] | select(.user.login == "github-actions[bot]" and (.body | contains("## Test Report"))) | .id' \
             2>/dev/null | head -1)
 
@@ -296,10 +298,10 @@ jobs:
               2>/dev/null
             echo "Updated existing PR comment $COMMENT_ID"
           else
-            gh pr comment ${{ github.event.pull_request.number }} \
-              --body-file /tmp/pr-body.md \
+            gh api repos/${{ github.repository }}/issues/${PR_NUMBER}/comments \
+              --field body="$(cat /tmp/pr-body.md)" \
               2>/dev/null
-            echo "Created new PR comment"
+            echo "Created new PR comment for PR $PR_NUMBER"
           fi
 
   ci-summary:
