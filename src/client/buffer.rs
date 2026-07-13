@@ -52,7 +52,7 @@ impl<T: Read> BufferIo<T> {
         Ok(n)
     }
 
-    /// return the intneral buffer
+    /// return the internal buffer
     #[inline]
     pub fn get_reader_buf(&mut self) -> &mut BytesMut {
         &mut self.reader_buf
@@ -83,6 +83,11 @@ impl<T: Write> Write for BufferIo<T> {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
         use std::ptr;
         let buf_len = self.writer_buf.0.len();
+        if buf.len() >= buf_len {
+            self.flush()?;
+            return self.inner.write(buf);
+        }
+
         if buf_len == self.writer_buf.1 {
             self.flush()?;
         }
@@ -122,7 +127,23 @@ impl<T: Read> BufRead for BufferIo<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::{self, BufRead, Read};
+    use std::io::{self, BufRead, Read, Write};
+
+    #[derive(Default)]
+    struct RecordingWriter {
+        writes: Vec<Vec<u8>>,
+    }
+
+    impl Write for RecordingWriter {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            self.writes.push(buf.to_vec());
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
 
     struct SlowRead(u8);
 
@@ -169,12 +190,25 @@ mod tests {
         let data = vec![0u8; 100];
         let mut wrt = BufferIo::with_capacity(io::sink(), 40);
         let n = wrt.write(&data).unwrap();
-        assert_eq!(n, 40);
+        assert_eq!(n, 100);
         let n = wrt.write(&[0u8; 6]).unwrap();
         assert_eq!(n, 6);
         let n = wrt.write(&data).unwrap();
-        assert_eq!(n, 34);
+        assert_eq!(n, 100);
         let n = wrt.write(&data).unwrap();
-        assert_eq!(n, 40);
+        assert_eq!(n, 100);
+    }
+
+    #[test]
+    fn large_write_flushes_buffer_then_bypasses_it() {
+        let mut writer = BufferIo::with_capacity(RecordingWriter::default(), 4);
+        writer.write_all(b"ab").unwrap();
+        writer.write_all(b"01234567").unwrap();
+
+        assert_eq!(
+            writer.inner.writes,
+            vec![b"ab".to_vec(), b"01234567".to_vec()]
+        );
+        assert_eq!(writer.writer_buf.1, 0);
     }
 }

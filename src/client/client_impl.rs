@@ -15,6 +15,7 @@ use crate::client::{Request, Response};
 #[derive(Debug)]
 pub struct HttpClient {
     conn: Rc<RefCell<BufferIo<TcpStream>>>,
+    expect_body: bool,
 }
 
 /// On Windows, `may::net::TcpStream::connect` can return various
@@ -60,6 +61,7 @@ impl HttpClient {
         let stream = BufferIo::new(stream);
         Ok(HttpClient {
             conn: Rc::new(RefCell::new(stream)),
+            expect_body: true,
         })
     }
 
@@ -68,14 +70,18 @@ impl HttpClient {
         {
             let mut s = self.conn.borrow_mut();
             let s = s.inner_mut();
-            s.set_read_timeout(timeout).unwrap();
-            s.set_write_timeout(timeout).unwrap();
+            // may::net::TcpStream timeout errors are handled at the coroutine
+            // level (may::io::Timeout). The underlying socket call may return
+            // EOPNOTSUPP on non-blocking sockets — this is expected.
+            let _ = s.set_read_timeout(timeout);
+            let _ = s.set_write_timeout(timeout);
         }
         self
     }
 
     /// GET shortcut — sends request on drop and reads the response.
     pub fn get(&mut self, uri: Uri) -> io::Result<Response> {
+        self.expect_body = true; // GET can have a body
         let mut req = Request::new(self.conn.clone());
         *req.uri_mut() = uri;
         drop(req);
@@ -84,6 +90,7 @@ impl HttpClient {
 
     /// POST shortcut with body bytes.
     pub fn post<T: Buf>(&mut self, uri: Uri, mut data: T) -> io::Result<Response> {
+        self.expect_body = true; // POST can have a body
         let mut req = Request::new(self.conn.clone());
         *req.method_mut() = Method::POST;
         *req.uri_mut() = uri;
@@ -97,6 +104,10 @@ impl HttpClient {
     #[inline]
     pub fn new_request(&self, method: Method, uri: Uri) -> Request {
         let mut req = Request::new(self.conn.clone());
+        // HEAD requests expect no body
+        if method == Method::HEAD {
+            req.expect_body(false);
+        }
         *req.method_mut() = method;
         *req.uri_mut() = uri;
         req
@@ -107,7 +118,11 @@ impl HttpClient {
     pub fn send_request(&mut self, req: Request) -> io::Result<Response> {
         use std::io::Write;
         let conn: Rc<RefCell<dyn Write>> = self.conn.clone();
-        assert_eq!(Rc::ptr_eq(&conn, req.conn()), true);
+        debug_assert!(
+            Rc::ptr_eq(&conn, req.conn()),
+            "client and request must share the same connection Rc"
+        );
+        self.expect_body = req.expect_body_request();
         drop(req);
         self.get_rsp()
     }
@@ -126,7 +141,7 @@ impl HttpClient {
                     }
                 }
                 Some(mut rsp) => {
-                    rsp.set_reader(self.conn.clone());
+                    rsp.set_reader(self.conn.clone(), self.expect_body)?;
                     return Ok(rsp);
                 }
             }
