@@ -13,7 +13,7 @@ use bytes::BufMut;
 use goose::config::GooseConfiguration;
 use goose::prelude::*;
 use gumdrop::Options;
-use may_minihttp::{HttpServer, HttpService, Request, Response};
+use may_minihttp::{HttpServerWithHeaders, HttpService, Request, Response};
 use std::io;
 use std::net::TcpListener;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -168,7 +168,7 @@ impl GooseTestFixture {
         let shutdown_clone = Arc::clone(&shutdown);
         let addr = format!("127.0.0.1:{}", port);
         let server_thread = thread::spawn(move || {
-            let handle = HttpServer(TestService)
+            let handle = HttpServerWithHeaders::<TestService, 32>(TestService)
                 .start(&addr)
                 .expect("Failed to start test server");
 
