@@ -276,7 +276,8 @@ jobs:
       # Post PR comment (PR events only)
       - name: Post PR comment with reports
         if: github.event.pull_request != null
-        run: |-
+        run: |
+          set -x
           PR_NUMBER="${{ github.event.pull_request.number }}"
           
           if [[ ! -f target/reports/combined.md ]]; then
@@ -285,22 +286,22 @@ jobs:
             # Truncate if too long (GitHub PR comment limit is ~65536 chars)
             head -c 50000 target/reports/combined.md > /tmp/pr-body.md
           fi
-
+          
           # Check for existing bot comment and update, otherwise create
           COMMENT_ID=$(gh api repos/${{ github.repository }}/issues/${PR_NUMBER}/comments \
             --jq '.[] | select(.user.login == "github-actions[bot]" and (.body | contains("## Test Report"))) | .id' \
-            2>/dev/null | head -1)
-
+            2>&1 | head -1)
+          
           if [[ -n "$COMMENT_ID" ]]; then
             gh api repos/${{ github.repository }}/issues/comments/${COMMENT_ID} \
               --method PATCH \
               --field body="$(cat /tmp/pr-body.md)" \
-              2>/dev/null
+              2>&1
             echo "Updated existing PR comment $COMMENT_ID"
           else
             gh api repos/${{ github.repository }}/issues/${PR_NUMBER}/comments \
               --field body="$(cat /tmp/pr-body.md)" \
-              2>/dev/null
+              2>&1
             echo "Created new PR comment for PR $PR_NUMBER"
           fi
 
