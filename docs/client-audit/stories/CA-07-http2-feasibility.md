@@ -2,7 +2,7 @@
 
 Priority: P2 discovery
 
-Status: Proposed discovery
+Status: Proposed discovery (evidence plan documented)
 
 ## Outcome
 
@@ -20,6 +20,16 @@ justify a may-native implementation and its protocol complexity.
       per-connection memory.
 - [ ] Compare operational complexity with increasing the bounded HTTP/1.1 per-origin pool.
 - [ ] Produce a go/no-go architecture decision before implementation.
+
+The measurement fields, peer inventory, and review gate are documented in
+[`../CA-07-evidence-plan.md`](../CA-07-evidence-plan.md). No HTTP/2 production code should be
+added until those requirements are backed by measurements from the deployed service path.
+
+The pooled HTTP/1.1 baseline can be captured with
+[`../../../examples/client_pool_audit.rs`](../../../examples/client_pool_audit.rs).
+
+The first ms02 baseline is recorded in
+[`../evidence/CA-07-2026-07-14.md`](../evidence/CA-07-2026-07-14.md).
 
 ## Go Criteria
 

@@ -48,6 +48,7 @@ gumdrop = "0.8"
 testcontainers = "0.15"
 tokio = { version = "1", features = ["full"] }
 rcgen = "0.14"
+flate2 = "1.1"
 
 [target.'cfg(unix)'.dev-dependencies]
 may_postgres = { git = "https://github.com/Xudong-Huang/may_postgres.git", default-features = false }
@@ -82,6 +83,10 @@ required-features = ["client"]
 
 [[example]]
 name = "client_full"
+required-features = ["client"]
+
+[[example]]
+name = "client_pool_audit"
 required-features = ["client"]
 
 [profile.release]

@@ -2,7 +2,7 @@
 
 Priority: P2 discovery
 
-Status: Proposed discovery
+Status: Proposed discovery (measurement probe added)
 
 ## Outcome
 
@@ -18,6 +18,15 @@ and, only if justified, define a safe bounded implementation.
 - [ ] Define behavior for unsupported, repeated, or malformed `Content-Encoding` values.
 - [ ] Evaluate buffered and streaming decompression without blocking the may scheduler.
 - [ ] Produce a go/no-go decision and dependency review before implementation.
+
+The deterministic probe at [`../../../examples/compression_audit.rs`](../../../examples/compression_audit.rs)
+reports plain and gzip wire sizes plus p50/p95 encode/decode wall-clock samples. Run it with the
+default service-shaped fixtures, then repeat with captured Sesame-IDAM, BRRTRouter, and Hauliage
+payloads supplied as positional file arguments. These results are evidence only; the client does
+not negotiate or decode compression until the go/no-go gate is approved.
+
+The first Hauliage fixture run is recorded in
+[`../evidence/CA-06-2026-07-14.md`](../evidence/CA-06-2026-07-14.md).
 
 ## Implementation Acceptance Criteria if Approved
 

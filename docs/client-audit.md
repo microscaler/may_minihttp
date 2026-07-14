@@ -17,8 +17,12 @@ is discovery-gated rather than required for the current inter-service baseline.
 HTTP/2 and response decompression are discovery-gated optimisations. Proxy discovery, cookie jars,
 WebSockets, URL credentials, HSTS, and a Tokio-native pool are not core client requirements.
 
-Implementation-ready candidate stories are indexed in
+Implementation-ready and discovery candidate stories are indexed in
 [`client-audit/README.md`](./client-audit/README.md).
+
+The CA-07 HTTP/2 evidence fields and go/no-go gate are documented in
+[`client-audit/CA-07-evidence-plan.md`](./client-audit/CA-07-evidence-plan.md); this is an
+experiment plan, not a commitment to add HTTP/2.
 
 ## Client Architecture Summary
 
@@ -108,8 +112,8 @@ The earlier reqwest comparison contained several incorrect or misleading finding
 | P1 | Cooperative cancellation | Delivered | Shutdown, abandoned upstream requests, and request races need a safe abort path | [CA-03](./client-audit/stories/CA-03-cooperative-cancellation.md) |
 | P1 | Request metadata provider | Delivered | Rotating service credentials and trace context are applied consistently without transport-level JWT policy | [CA-04](./client-audit/stories/CA-04-request-metadata-provider.md) |
 | P1 | TLS identity rotation | Delivered | Certificate/trust rotation cannot reuse connections created under an obsolete TLS identity | [CA-05](./client-audit/stories/CA-05-tls-identity-rotation.md) |
-| P2 discovery | Bounded decompression | Evidence required | May reduce bandwidth for large payloads, but only if workloads justify complexity and risk | [CA-06](./client-audit/stories/CA-06-bounded-decompression.md) |
-| P2 discovery | HTTP/2 feasibility | Evidence required | Multiplexing may help high-concurrency origins, but must fit strict may architecture and measured demand | [CA-07](./client-audit/stories/CA-07-http2-feasibility.md) |
+| P2 discovery | Bounded decompression | Initial Hauliage evidence; broader evidence required | May reduce bandwidth for large payloads, but only if workloads justify complexity and risk | [CA-06](./client-audit/stories/CA-06-bounded-decompression.md) |
+| P2 discovery | HTTP/2 feasibility | Initial ms02 baseline; peer inventory required | Multiplexing may help high-concurrency origins, but must fit strict may architecture and measured demand | [CA-07](./client-audit/stories/CA-07-http2-feasibility.md) |
 
 The delivered CA-01 through CA-05 items are transport primitives, not service-discovery,
 authorization, token-acquisition, certificate-issuance, secret-store, or observability-backend

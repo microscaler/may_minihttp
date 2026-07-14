@@ -14,8 +14,17 @@ not commitments in the current delivery.
 | [CA-03](./stories/CA-03-cooperative-cancellation.md) | P1 | Cooperative request cancellation | Delivered 2026-07-14 | CA-02 for cancellable DNS semantics |
 | [CA-04](./stories/CA-04-request-metadata-provider.md) | P1 | Request metadata provider | Delivered 2026-07-14 | CA-01 event/redaction model |
 | [CA-05](./stories/CA-05-tls-identity-rotation.md) | P1 | TLS identity and trust rotation | Delivered 2026-07-14 | CA-01 observations |
-| [CA-06](./stories/CA-06-bounded-decompression.md) | P2 discovery | Bounded response decompression | Proposed discovery | CA-01 measurements |
-| [CA-07](./stories/CA-07-http2-feasibility.md) | P2 discovery | Strict-may HTTP/2 feasibility | Proposed discovery | CA-01 measurements |
+| [CA-06](./stories/CA-06-bounded-decompression.md) | P2 discovery | Bounded response decompression | Measurement probe added | CA-01 measurements |
+| [CA-07](./stories/CA-07-http2-feasibility.md) | P2 discovery | Strict-may HTTP/2 feasibility | Evidence plan documented | CA-01 measurements |
+
+CA-07's measurement fields, peer inventory, and go/no-go gate are captured in the
+[evidence plan](./CA-07-evidence-plan.md). It remains discovery-only until a deployed-path
+workload justifies implementation.
+
+CA-06 measurement results are kept under [evidence](./evidence/).
+
+The initial CA-07 pooled baseline is also recorded under [evidence](./evidence/); it is not a
+production go/no-go result.
 
 ## Delivery Rule
 
