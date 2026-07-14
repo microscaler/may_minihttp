@@ -20,6 +20,7 @@ use super::cancellation::{cancelled_error, is_cancelled_error};
 use super::{
     CancellationToken, ClientEvent, ClientObserver, ObservedOrigin, RequestMetadata,
     RequestMetadataContext, RequestMetadataProvider, Resolver, SystemResolver,
+    TlsConfigFailurePolicy, TlsConfigProvider, TlsConfigSnapshot,
 };
 use super::{HttpClient, MultipartForm};
 
@@ -72,6 +73,8 @@ pub struct ClientBuilder {
     max_response_body: usize,
     redirect_policy: RedirectPolicy,
     tls_config: Option<Arc<ClientConfig>>,
+    tls_config_provider: Option<Arc<dyn TlsConfigProvider>>,
+    tls_config_failure_policy: TlsConfigFailurePolicy,
     resolver: Arc<dyn Resolver>,
     observer: Option<Arc<dyn ClientObserver>>,
     metadata_provider: Option<Arc<dyn RequestMetadataProvider>>,
@@ -100,6 +103,8 @@ impl Default for ClientBuilder {
             max_response_body: DEFAULT_MAX_RESPONSE_BODY,
             redirect_policy: RedirectPolicy::None,
             tls_config: None,
+            tls_config_provider: None,
+            tls_config_failure_policy: TlsConfigFailurePolicy::FailRequest,
             resolver: Arc::new(SystemResolver),
             observer: None,
             metadata_provider: None,
@@ -185,6 +190,18 @@ impl ClientBuilder {
         self
     }
 
+    /// Resolve rotating rustls identity and trust snapshots for logical HTTPS requests.
+    pub fn tls_config_provider(mut self, value: Arc<dyn TlsConfigProvider>) -> Self {
+        self.tls_config_provider = Some(value);
+        self
+    }
+
+    /// Choose whether a provider load failure may use the last accepted TLS snapshot.
+    pub fn tls_config_failure_policy(mut self, value: TlsConfigFailurePolicy) -> Self {
+        self.tls_config_failure_policy = value;
+        self
+    }
+
     /// Inject a cached, static, or may-aware resolver.
     pub fn resolver(mut self, value: Arc<dyn Resolver>) -> Self {
         self.resolver = value;
@@ -259,11 +276,33 @@ impl ClientBuilder {
             "default",
         )?;
 
-        let tls_config = match self.tls_config {
-            Some(config) => config,
-            None => HttpClient::platform_tls_config()?,
+        if self.tls_config.is_some() && self.tls_config_provider.is_some() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "static TLS configuration and TLS configuration provider are mutually exclusive",
+            ));
+        }
+        let (tls_snapshot, tls_config_provider) = match self.tls_config_provider {
+            Some(provider) => {
+                let snapshot = provider.current().map_err(|error| {
+                    tls_provider_error(&format!(
+                        "failed during client construction ({:?})",
+                        error.kind()
+                    ))
+                })?;
+                validate_tls_snapshot(&snapshot)?;
+                (snapshot, Some(provider))
+            }
+            None => {
+                let config = match self.tls_config {
+                    Some(config) => config,
+                    None => HttpClient::platform_tls_config()?,
+                };
+                (TlsConfigSnapshot::new(1, config), None)
+            }
         };
-        let tls_profile = Arc::as_ptr(&tls_config) as usize;
+        let tls_generation = tls_snapshot.generation;
+        let base_tls_config = Arc::clone(&tls_snapshot.config);
         Ok(Client {
             inner: Arc::new(ClientInner {
                 config: ClientConfigValues {
@@ -282,8 +321,13 @@ impl ClientBuilder {
                     sensitive_headers: self.sensitive_headers,
                     default_headers: self.default_headers,
                 },
-                tls_config,
-                tls_profile,
+                base_tls_config,
+                tls_config_provider,
+                tls_config_failure_policy: self.tls_config_failure_policy,
+                tls_state: Mutex::new(TlsState {
+                    active: tls_snapshot,
+                }),
+                active_tls_generation: AtomicU64::new(tls_generation),
                 resolver: self.resolver,
                 observer: self.observer,
                 metadata_provider: self.metadata_provider,
@@ -444,6 +488,7 @@ struct StreamingExecution<'a> {
     cancellation: Option<CancellationToken>,
     attempt: &'a mut u32,
     sensitive_headers: &'a mut HashSet<HeaderName>,
+    tls_snapshot: &'a mut Option<TlsConfigSnapshot>,
 }
 
 struct AttemptExecution<'a> {
@@ -453,6 +498,7 @@ struct AttemptExecution<'a> {
     redirect_hop: usize,
     credentials_stripped: bool,
     sensitive_headers: &'a mut HashSet<HeaderName>,
+    tls_snapshot: &'a mut Option<TlsConfigSnapshot>,
 }
 
 fn run_cancellable<T>(
@@ -549,6 +595,7 @@ impl Client {
         let mut attempt = 0_u32;
         let mut credentials_stripped = false;
         let mut sensitive_headers = self.inner.config.sensitive_headers.clone();
+        let mut tls_snapshot = None;
 
         loop {
             let response = self.execute_once(
@@ -563,6 +610,7 @@ impl Client {
                     redirect_hop: hops,
                     credentials_stripped,
                     sensitive_headers: &mut sensitive_headers,
+                    tls_snapshot: &mut tls_snapshot,
                 },
             )?;
             let Some(max_hops) = policy.max_hops() else {
@@ -678,6 +726,7 @@ impl Client {
         let mut body = request.body;
         let mut attempt = 0_u32;
         let mut sensitive_headers = self.inner.config.sensitive_headers.clone();
+        let mut tls_snapshot = None;
         self.execute_streaming_once(
             &request.method,
             &request.url,
@@ -689,6 +738,7 @@ impl Client {
                 cancellation,
                 attempt: &mut attempt,
                 sensitive_headers: &mut sensitive_headers,
+                tls_snapshot: &mut tls_snapshot,
             },
         )
     }
@@ -708,9 +758,11 @@ impl Client {
             redirect_hop,
             credentials_stripped,
             sensitive_headers,
+            tls_snapshot,
         } = execution;
         validate_body_method(method, body)?;
-        let key = OriginKey::from_url(url, self.inner.tls_profile)?;
+        let (tls_generation, tls_config) = self.tls_for_url(url, trace, tls_snapshot)?;
+        let key = OriginKey::from_url(url, tls_generation)?;
         let mut stale_retry_available = method_is_idempotent(method) && body.is_replayable();
         let mut stale_retry = false;
         loop {
@@ -733,7 +785,7 @@ impl Client {
                 credentials_stripped,
                 sensitive_headers,
             )?;
-            let mut lease = self.checkout(&key, deadline, trace)?;
+            let mut lease = self.checkout(&key, Arc::clone(&tls_config), deadline, trace)?;
             let reused_idle_connection = lease.reused_idle_connection;
             let result = (|| {
                 let mut response =
@@ -838,9 +890,11 @@ impl Client {
             cancellation,
             attempt,
             sensitive_headers,
+            tls_snapshot,
         } = execution;
         validate_body_method(method, body)?;
-        let key = OriginKey::from_url(url, self.inner.tls_profile)?;
+        let (tls_generation, tls_config) = self.tls_for_url(url, trace, tls_snapshot)?;
+        let key = OriginKey::from_url(url, tls_generation)?;
         let mut stale_retry_available = method_is_idempotent(method) && body.is_replayable();
         let mut stale_retry = false;
         loop {
@@ -863,7 +917,7 @@ impl Client {
                 false,
                 sensitive_headers,
             )?;
-            let mut lease = self.checkout(&key, deadline, trace)?;
+            let mut lease = self.checkout(&key, Arc::clone(&tls_config), deadline, trace)?;
             let reused_idle_connection = lease.reused_idle_connection;
             match self.send_on_lease(&mut lease, method, url, &attempt_headers, body, deadline) {
                 Ok(response) => {
@@ -931,6 +985,110 @@ impl Client {
                 }
             }
         }
+    }
+
+    fn tls_for_url(
+        &self,
+        url: &Url,
+        trace: &RequestTrace,
+        captured: &mut Option<TlsConfigSnapshot>,
+    ) -> io::Result<(u64, Arc<ClientConfig>)> {
+        if url.scheme() != "https" {
+            return Ok((0, Arc::clone(&self.inner.base_tls_config)));
+        }
+        if captured.is_none() {
+            *captured = Some(self.resolve_tls_snapshot(trace)?);
+        }
+        let snapshot = captured
+            .as_ref()
+            .expect("HTTPS request must retain its TLS snapshot");
+        Ok((snapshot.generation, Arc::clone(&snapshot.config)))
+    }
+
+    fn resolve_tls_snapshot(&self, trace: &RequestTrace) -> io::Result<TlsConfigSnapshot> {
+        let Some(provider) = &self.inner.tls_config_provider else {
+            let state = self
+                .inner
+                .tls_state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            return Ok(state.active.clone());
+        };
+
+        let started = Instant::now();
+        let loaded = provider
+            .current()
+            .map_err(|error| tls_provider_error(&format!("failed ({:?})", error.kind())))
+            .and_then(|snapshot| {
+                validate_tls_snapshot(&snapshot)
+                    .map_err(|error| tls_provider_error(&error.to_string()))?;
+                Ok(snapshot)
+            });
+        match loaded {
+            Ok(snapshot) => {
+                let accepted = self.accept_tls_snapshot(trace.request_id, snapshot);
+                self.inner.observe(ClientEvent::TlsConfigCompleted {
+                    request_id: trace.request_id,
+                    duration: started.elapsed(),
+                    generation: Some(accepted.generation),
+                    fallback_used: false,
+                    error: None,
+                });
+                Ok(accepted)
+            }
+            Err(error) => {
+                let fallback = if self.inner.tls_config_failure_policy
+                    == TlsConfigFailurePolicy::UseLastKnownGood
+                {
+                    let state = self
+                        .inner
+                        .tls_state
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    Some(state.active.clone())
+                } else {
+                    None
+                };
+                self.inner.observe(ClientEvent::TlsConfigCompleted {
+                    request_id: trace.request_id,
+                    duration: started.elapsed(),
+                    generation: fallback.as_ref().map(|snapshot| snapshot.generation),
+                    fallback_used: fallback.is_some(),
+                    error: Some(ClientErrorKind::Tls),
+                });
+                fallback.ok_or(error)
+            }
+        }
+    }
+
+    fn accept_tls_snapshot(
+        &self,
+        request_id: u64,
+        snapshot: TlsConfigSnapshot,
+    ) -> TlsConfigSnapshot {
+        let mut state = self
+            .inner
+            .tls_state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let previous = state.active.generation;
+        if snapshot.generation <= previous {
+            return state.active.clone();
+        }
+        state.active = snapshot.clone();
+        self.inner
+            .active_tls_generation
+            .store(snapshot.generation, Ordering::Release);
+        drop(state);
+
+        let retired = self.inner.retire_idle_tls(snapshot.generation);
+        self.inner.observe(ClientEvent::TlsGenerationChanged {
+            request_id,
+            previous_generation: previous,
+            generation: snapshot.generation,
+            retired_idle_connections: retired,
+        });
+        snapshot
     }
 
     fn prepare_attempt_headers(
@@ -1097,6 +1255,7 @@ impl Client {
     fn checkout(
         &self,
         key: &OriginKey,
+        tls_config: Arc<ClientConfig>,
         deadline: Instant,
         trace: &RequestTrace,
     ) -> io::Result<PoolLease> {
@@ -1173,12 +1332,9 @@ impl Client {
                     })?;
                 let origin = key.connect_url();
                 let connect_started = Instant::now();
-                let client = self.inner.connect(
-                    &origin,
-                    Arc::clone(&self.inner.tls_config),
-                    timeout,
-                    &addresses,
-                );
+                let client =
+                    self.inner
+                        .connect(&origin, Arc::clone(&tls_config), timeout, &addresses);
                 self.inner.observe(ClientEvent::ConnectionCompleted {
                     request_id: trace.request_id,
                     origin: observed_key(key),
@@ -1564,8 +1720,11 @@ impl Drop for StreamingResponse {
 
 struct ClientInner {
     config: ClientConfigValues,
-    tls_config: Arc<ClientConfig>,
-    tls_profile: usize,
+    base_tls_config: Arc<ClientConfig>,
+    tls_config_provider: Option<Arc<dyn TlsConfigProvider>>,
+    tls_config_failure_policy: TlsConfigFailurePolicy,
+    tls_state: Mutex<TlsState>,
+    active_tls_generation: AtomicU64,
     resolver: Arc<dyn Resolver>,
     observer: Option<Arc<dyn ClientObserver>>,
     metadata_provider: Option<Arc<dyn RequestMetadataProvider>>,
@@ -1597,6 +1756,26 @@ impl ClientInner {
         }
         HttpClient::from_url_with_resolved_options(origin, tls_config, timeout, addresses)
     }
+
+    fn retire_idle_tls(&self, active_generation: u64) -> usize {
+        let mut state = self
+            .pool
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let retired = state.retire_tls_generations(active_generation);
+        drop(state);
+        if retired > 0 {
+            self.stats
+                .connections_discarded
+                .fetch_add(retired as u64, Ordering::Relaxed);
+            self.available.notify_all();
+        }
+        retired
+    }
+}
+
+struct TlsState {
+    active: TlsConfigSnapshot,
 }
 
 struct ClientConfigValues {
@@ -1621,11 +1800,11 @@ struct OriginKey {
     scheme: String,
     host: String,
     port: u16,
-    tls_profile: usize,
+    tls_generation: u64,
 }
 
 impl OriginKey {
-    fn from_url(url: &Url, tls_profile: usize) -> io::Result<Self> {
+    fn from_url(url: &Url, tls_generation: u64) -> io::Result<Self> {
         let host = url
             .host_str()
             .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "URL has no host"))?;
@@ -1636,8 +1815,8 @@ impl OriginKey {
             scheme: url.scheme().to_ascii_lowercase(),
             host: host.to_ascii_lowercase(),
             port,
-            tls_profile: if url.scheme() == "https" {
-                tls_profile
+            tls_generation: if url.scheme() == "https" {
+                tls_generation
             } else {
                 0
             },
@@ -1685,6 +1864,31 @@ impl PoolState {
                 }
             }
         }
+    }
+
+    fn retire_tls_generations(&mut self, active_generation: u64) -> usize {
+        let keys: Vec<_> = self
+            .idle
+            .keys()
+            .filter(|key| key.scheme == "https" && key.tls_generation != active_generation)
+            .cloned()
+            .collect();
+        let mut retired = 0;
+        for key in keys {
+            let count = self
+                .idle
+                .remove(&key)
+                .map_or(0, |connections| connections.len());
+            retired += count;
+            self.total = self.total.saturating_sub(count);
+            if let Some(origin_count) = self.per_origin.get_mut(&key) {
+                *origin_count = origin_count.saturating_sub(count);
+                if *origin_count == 0 {
+                    self.per_origin.remove(&key);
+                }
+            }
+        }
+        retired
     }
 }
 
@@ -1741,6 +1945,11 @@ impl PoolLease {
 
     fn checkin(mut self) {
         let now = Instant::now();
+        if self.key.scheme == "https"
+            && self.key.tls_generation != self.inner.active_tls_generation.load(Ordering::Acquire)
+        {
+            return;
+        }
         if now.duration_since(self.connection_mut().created)
             >= self.inner.config.max_connection_lifetime
         {
@@ -1983,6 +2192,20 @@ fn metadata_provider_error(detail: &str) -> io::Error {
     io::Error::other(format!("request metadata provider {detail}"))
 }
 
+fn validate_tls_snapshot(snapshot: &TlsConfigSnapshot) -> io::Result<()> {
+    if snapshot.generation == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "TLS configuration generation zero is reserved for non-TLS connections",
+        ));
+    }
+    Ok(())
+}
+
+fn tls_provider_error(detail: &str) -> io::Error {
+    io::Error::other(format!("TLS configuration provider {detail}"))
+}
+
 fn stale_connection_error(error: &io::Error) -> bool {
     matches!(
         error.kind(),
@@ -2084,6 +2307,23 @@ mod tests {
                 } => format!(
                     "metadata:{request_id}:{attempt}:{redirect_hop}:{stale_retry}:{error:?}"
                 ),
+                ClientEvent::TlsConfigCompleted {
+                    request_id,
+                    generation,
+                    fallback_used,
+                    error,
+                    ..
+                } => format!(
+                    "tls-config:{request_id}:{generation:?}:{fallback_used}:{error:?}"
+                ),
+                ClientEvent::TlsGenerationChanged {
+                    request_id,
+                    previous_generation,
+                    generation,
+                    retired_idle_connections,
+                } => format!(
+                    "tls-generation:{request_id}:{previous_generation}:{generation}:{retired_idle_connections}"
+                ),
                 ClientEvent::PoolWaited {
                     request_id,
                     timed_out,
@@ -2159,7 +2399,7 @@ mod tests {
     }
 
     #[test]
-    fn pool_key_separates_scheme_port_and_tls_profile() {
+    fn pool_key_separates_scheme_port_and_tls_generation() {
         let http = OriginKey::from_url(&Url::parse("http://example.com/").unwrap(), 10).unwrap();
         let https = OriginKey::from_url(&Url::parse("https://example.com/").unwrap(), 10).unwrap();
         let other_port =
@@ -2545,6 +2785,319 @@ mod tests {
             .unwrap();
         assert_eq!(response.body(), b"ok");
         server.join().unwrap();
+    }
+
+    #[test]
+    fn tls_generation_rotation_retires_idle_connections() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            for index in 0..2 {
+                let (mut stream, _) = listener.accept().unwrap();
+                let _ = read_head(&mut stream);
+                let response = if index == 0 {
+                    b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok".as_slice()
+                } else {
+                    b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok"
+                        .as_slice()
+                };
+                stream.write_all(response).unwrap();
+            }
+        });
+        let first_config = HttpClient::platform_tls_config().unwrap();
+        let second_config = HttpClient::platform_tls_config().unwrap();
+        let generation = Arc::new(AtomicU64::new(1));
+        let provider_generation = generation.clone();
+        let provider_first = first_config.clone();
+        let provider_second = second_config.clone();
+        let provider = Arc::new(move || match provider_generation.load(Ordering::Acquire) {
+            1 => Ok(TlsConfigSnapshot::new(1, provider_first.clone())),
+            2 => Ok(TlsConfigSnapshot::new(2, provider_second.clone())),
+            _ => unreachable!(),
+        });
+        let observed_configs = Arc::new(StdMutex::new(Vec::new()));
+        let connector_configs = observed_configs.clone();
+        let connector_first = first_config.clone();
+        let connector_second = second_config.clone();
+        let connector = Arc::new(
+            move |_origin: &str,
+                  tls_config: Arc<ClientConfig>,
+                  _timeout: Duration,
+                  addresses: &[SocketAddr]| {
+                let value = if Arc::ptr_eq(&tls_config, &connector_first) {
+                    1
+                } else if Arc::ptr_eq(&tls_config, &connector_second) {
+                    2
+                } else {
+                    0
+                };
+                connector_configs.lock().unwrap().push(value);
+                HttpClient::connect(addresses[0])
+            },
+        );
+        let observer = Arc::new(RecordingObserver::default());
+        let client = Client::builder()
+            .resolver(Arc::new(StaticResolver(address)))
+            .tls_config_provider(provider)
+            .test_connector(connector)
+            .observer(observer.clone())
+            .build()
+            .unwrap();
+
+        client
+            .get(&format!("https://identity.internal:{}/one", address.port()))
+            .unwrap()
+            .send()
+            .unwrap();
+        generation.store(2, Ordering::Release);
+        client
+            .get(&format!("https://identity.internal:{}/two", address.port()))
+            .unwrap()
+            .send()
+            .unwrap();
+        server.join().unwrap();
+
+        assert_eq!(*observed_configs.lock().unwrap(), vec![1, 2]);
+        assert_eq!(client.stats().connections_created, 2);
+        assert_eq!(client.stats().connections_discarded, 2);
+        assert!(observer
+            .events()
+            .iter()
+            .any(|event| event == "tls-generation:2:1:2:1"));
+    }
+
+    #[test]
+    fn tls_rotation_uses_the_new_mtls_client_identity() {
+        use rcgen::{generate_simple_self_signed, CertifiedKey};
+        use rustls::pki_types::PrivatePkcs8KeyDer;
+        use rustls::server::WebPkiClientVerifier;
+        use rustls::{ClientConfig, RootCertStore, ServerConfig, ServerConnection, StreamOwned};
+
+        let CertifiedKey {
+            cert: server_cert,
+            signing_key: server_key,
+        } = generate_simple_self_signed(vec!["identity.internal".to_owned()]).unwrap();
+        let CertifiedKey {
+            cert: client_a_cert,
+            signing_key: client_a_key,
+        } = generate_simple_self_signed(vec!["client-a.internal".to_owned()]).unwrap();
+        let CertifiedKey {
+            cert: client_b_cert,
+            signing_key: client_b_key,
+        } = generate_simple_self_signed(vec!["client-b.internal".to_owned()]).unwrap();
+        let provider = Arc::new(rustls::crypto::ring::default_provider());
+
+        let mut client_roots = RootCertStore::empty();
+        client_roots.add(client_a_cert.der().clone()).unwrap();
+        client_roots.add(client_b_cert.der().clone()).unwrap();
+        let client_verifier =
+            WebPkiClientVerifier::builder_with_provider(Arc::new(client_roots), provider.clone())
+                .build()
+                .unwrap();
+        let server_config = ServerConfig::builder_with_provider(provider.clone())
+            .with_safe_default_protocol_versions()
+            .unwrap()
+            .with_client_cert_verifier(client_verifier)
+            .with_single_cert(
+                vec![server_cert.der().clone()],
+                PrivatePkcs8KeyDer::from(server_key.serialize_der()).into(),
+            )
+            .unwrap();
+
+        fn client_config(
+            provider: Arc<rustls::crypto::CryptoProvider>,
+            server_cert: rustls::pki_types::CertificateDer<'static>,
+            client_cert: rustls::pki_types::CertificateDer<'static>,
+            client_key: Vec<u8>,
+        ) -> Arc<ClientConfig> {
+            let mut roots = RootCertStore::empty();
+            roots.add(server_cert).unwrap();
+            Arc::new(
+                ClientConfig::builder_with_provider(provider)
+                    .with_safe_default_protocol_versions()
+                    .unwrap()
+                    .with_root_certificates(roots)
+                    .with_client_auth_cert(
+                        vec![client_cert],
+                        PrivatePkcs8KeyDer::from(client_key).into(),
+                    )
+                    .unwrap(),
+            )
+        }
+        let config_a = client_config(
+            provider.clone(),
+            server_cert.der().clone(),
+            client_a_cert.der().clone(),
+            client_a_key.serialize_der(),
+        );
+        let config_b = client_config(
+            provider,
+            server_cert.der().clone(),
+            client_b_cert.der().clone(),
+            client_b_key.serialize_der(),
+        );
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server_config = Arc::new(server_config);
+        let expected = [client_a_cert.der().clone(), client_b_cert.der().clone()];
+        let server = thread::spawn(move || {
+            for expected_cert in expected {
+                let (stream, _) = listener.accept().unwrap();
+                let connection = ServerConnection::new(server_config.clone()).unwrap();
+                let mut tls = StreamOwned::new(connection, stream);
+                let _ = read_head(&mut tls);
+                let peer = tls
+                    .conn
+                    .peer_certificates()
+                    .and_then(|certificates| certificates.first())
+                    .expect("mTLS peer certificate must be available");
+                assert_eq!(peer.as_ref(), expected_cert.as_ref());
+                tls.write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok",
+                )
+                .unwrap();
+                tls.flush().unwrap();
+            }
+        });
+
+        let generation = Arc::new(AtomicU64::new(1));
+        let provider_generation = generation.clone();
+        let provider_config_a = config_a.clone();
+        let provider_config_b = config_b.clone();
+        let tls_provider = Arc::new(move || {
+            Ok(match provider_generation.load(Ordering::Acquire) {
+                1 => TlsConfigSnapshot::new(1, provider_config_a.clone()),
+                2 => TlsConfigSnapshot::new(2, provider_config_b.clone()),
+                _ => unreachable!(),
+            })
+        });
+        let client = Client::builder()
+            .resolver(Arc::new(StaticResolver(address)))
+            .tls_config_provider(tls_provider)
+            .build()
+            .unwrap();
+        client
+            .get(&format!("https://identity.internal:{}/a", address.port()))
+            .unwrap()
+            .send()
+            .unwrap();
+        generation.store(2, Ordering::Release);
+        client
+            .get(&format!("https://identity.internal:{}/b", address.port()))
+            .unwrap()
+            .send()
+            .unwrap();
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn tls_provider_failure_can_use_last_known_good_snapshot() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            for _ in 0..2 {
+                let _ = read_head(&mut stream);
+                stream
+                    .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok")
+                    .unwrap();
+                stream.flush().unwrap();
+            }
+        });
+        let config = HttpClient::platform_tls_config().unwrap();
+        let provider_config = config.clone();
+        let available = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let provider_available = available.clone();
+        let provider = Arc::new(move || {
+            if provider_available.load(Ordering::Acquire) {
+                Ok(TlsConfigSnapshot::new(1, provider_config.clone()))
+            } else {
+                Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "private key must-never-escape",
+                ))
+            }
+        });
+        let connector = Arc::new(
+            move |_origin: &str,
+                  _tls_config: Arc<ClientConfig>,
+                  _timeout: Duration,
+                  addresses: &[SocketAddr]| { HttpClient::connect(addresses[0]) },
+        );
+        let observer = Arc::new(RecordingObserver::default());
+        let client = Client::builder()
+            .resolver(Arc::new(StaticResolver(address)))
+            .tls_config_provider(provider)
+            .tls_config_failure_policy(TlsConfigFailurePolicy::UseLastKnownGood)
+            .test_connector(connector)
+            .observer(observer.clone())
+            .build()
+            .unwrap();
+        client
+            .get(&format!("https://identity.internal:{}/one", address.port()))
+            .unwrap()
+            .send()
+            .unwrap();
+        available.store(false, Ordering::Release);
+        client
+            .get(&format!("https://identity.internal:{}/two", address.port()))
+            .unwrap()
+            .send()
+            .unwrap();
+        server.join().unwrap();
+
+        assert_eq!(client.stats().connections_created, 1);
+        assert_eq!(client.stats().connections_reused, 1);
+        let events = observer.events();
+        assert!(events
+            .iter()
+            .any(|event| event == "tls-config:2:Some(1):true:Some(Tls)"));
+        assert!(!events.join("|").contains("must-never-escape"));
+    }
+
+    #[test]
+    fn tls_provider_failure_fails_closed_before_connect_by_default() {
+        let config = HttpClient::platform_tls_config().unwrap();
+        let provider_config = config.clone();
+        let available = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let provider_available = available.clone();
+        let provider = Arc::new(move || {
+            if provider_available.load(Ordering::Acquire) {
+                Ok(TlsConfigSnapshot::new(1, provider_config.clone()))
+            } else {
+                Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "private key must-never-escape",
+                ))
+            }
+        });
+        let connector_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let calls = connector_calls.clone();
+        let connector = Arc::new(
+            move |_origin: &str,
+                  _tls_config: Arc<ClientConfig>,
+                  _timeout: Duration,
+                  _addresses: &[SocketAddr]| {
+                calls.fetch_add(1, Ordering::Relaxed);
+                Err(io::Error::other("connector must not run"))
+            },
+        );
+        let client = Client::builder()
+            .tls_config_provider(provider)
+            .test_connector(connector)
+            .build()
+            .unwrap();
+        available.store(false, Ordering::Release);
+
+        let error = client
+            .get("https://identity.internal/fail-closed")
+            .unwrap()
+            .send_typed()
+            .unwrap_err();
+        assert_eq!(error.kind(), ClientErrorKind::Tls);
+        assert!(!error.to_string().contains("must-never-escape"));
+        assert_eq!(connector_calls.load(Ordering::Relaxed), 0);
     }
 
     #[test]

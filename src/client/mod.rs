@@ -15,6 +15,7 @@ mod resolver;
 mod response;
 mod rich;
 mod shared;
+mod tls;
 
 pub use cancellation::CancellationToken;
 pub use client_impl::HttpClient;
@@ -31,3 +32,4 @@ pub use rich::{
     BufferedResponse, Client, ClientBuilder, ClientError, ClientErrorKind, ClientStats,
     RedirectPolicy, RequestBuilder, StreamingResponse,
 };
+pub use tls::{TlsConfigFailurePolicy, TlsConfigProvider, TlsConfigSnapshot};

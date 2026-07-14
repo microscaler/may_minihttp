@@ -38,6 +38,19 @@ pub enum ClientEvent<'a> {
         duration: Duration,
         error: Option<ClientErrorKind>,
     },
+    TlsConfigCompleted {
+        request_id: u64,
+        duration: Duration,
+        generation: Option<u64>,
+        fallback_used: bool,
+        error: Option<ClientErrorKind>,
+    },
+    TlsGenerationChanged {
+        request_id: u64,
+        previous_generation: u64,
+        generation: u64,
+        retired_idle_connections: usize,
+    },
     PoolWaited {
         request_id: u64,
         origin: ObservedOrigin<'a>,

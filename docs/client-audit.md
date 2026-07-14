@@ -10,8 +10,9 @@ Scope: coroutine-native east-west HTTP communication for Microscaler services
 
 The client is complete enough for bounded, secure HTTP/1.1 inter-service communication. It should
 not aim for feature parity with curl, browsers, or `reqwest`. Request-level observation, strict
-service-resolution primitives, cooperative request cancellation, and bounded rotating request
-metadata are now delivered. The next useful work is safe rotation of TLS identities and trust.
+service-resolution primitives, cooperative request cancellation, bounded rotating request
+metadata, and generation-safe TLS identity/trust rotation are now delivered. Further client work
+is discovery-gated rather than required for the current inter-service baseline.
 
 HTTP/2 and response decompression are discovery-gated optimisations. Proxy discovery, cookie jars,
 WebSockets, URL credentials, HSTS, and a Tokio-native pool are not core client requirements.
@@ -21,12 +22,12 @@ Implementation-ready candidate stories are indexed in
 
 ## Client Architecture Summary
 
-The feature-gated client currently contains 7,884 lines across 15 modules:
+The feature-gated client currently contains 8,517 lines across 16 modules:
 
 | Module | Lines | Purpose |
 |---|---:|---|
 | `client_impl.rs` | 538 | Low-level, single-connection `HttpClient` |
-| `rich.rs` | 3,738 | Pooled `Client`, builders, redirects, deadlines, leases, cancellation, metadata application, and event emission |
+| `rich.rs` | 4,291 | Pooled `Client`, builders, redirects, deadlines, leases, cancellation, metadata/TLS rotation, and event emission |
 | `request.rs` | 606 | Request framing and body serialization |
 | `response.rs` | 462 | Response parsing and body dispatch |
 | `body_reader.rs` | 478 | Sized, chunked, EOF, and empty readers |
@@ -35,13 +36,14 @@ The feature-gated client currently contains 7,884 lines across 15 modules:
 | `shared.rs` | 163 | Plain/TLS shared transport plumbing |
 | `buffer.rs` | 214 | Buffered transport I/O |
 | `multipart.rs` | 304 | Bounded multipart encoding and preload boundaries |
-| `observer.rs` | 114 | Sanitized request lifecycle event API |
+| `observer.rs` | 127 | Sanitized request lifecycle event API |
 | `cancellation.rs` | 138 | Cloneable cooperative cancellation token and typed I/O marker |
 | `resolver.rs` | 700 | System, bounded cache, and push-updated service resolution |
 | `metadata.rs` | 106 | Policy-neutral, redacted request metadata provider API |
-| `mod.rs` | 33 | Module layout and public exports |
+| `tls.rs` | 65 | Immutable rustls snapshot and rotation-provider API |
+| `mod.rs` | 35 | Module layout and public exports |
 
-There are 110 client-module unit test functions and 22 dedicated client integration tests, in
+There are 114 client-module unit test functions and 22 dedicated client integration tests, in
 addition to doctests and the wider server/performance suites.
 
 ## Evaluation Criteria
@@ -65,8 +67,8 @@ justification by itself.
 | Protocol | Strict HTTP/1.0 and HTTP/1.1 response parsing; bounded headers, chunks, trailers, and bodies; ambiguous framing rejected |
 | Requests | Standard methods, immutable bytes, optional JSON, bounded multipart, and single-use reader bodies |
 | Responses | Bounded buffering by default and lease-owning streaming when requested |
-| TLS | rustls TLS 1.2/1.3 with ring, platform verification, and injectable configuration for private CAs or mTLS |
-| Pooling | Scheme/host/port/TLS-keyed pool with global/per-origin bounds, idle/lifetime expiry, and coroutine-aware waiting |
+| TLS | rustls TLS 1.2/1.3 with ring, platform verification, static private CA/mTLS configuration, and generation-safe identity/trust rotation |
+| Pooling | Scheme/host/port/TLS-generation-keyed pool with global/per-origin bounds, idle/lifetime expiry, retired-generation discard, and coroutine-aware waiting |
 | Deadlines | Connect, I/O, pool wait, and total request budgets with checked arithmetic |
 | Failure safety | Cancellation-safe RAII leases, explicit cooperative cancellation, partial-body discard, and one stale-idle retry for idempotent replayable requests |
 | Redirects | Disabled by default; bounded same/cross-origin policies with credential stripping and downgrade protection |
@@ -105,13 +107,13 @@ The earlier reqwest comparison contained several incorrect or misleading finding
 | P0 | May-aware resolver and service discovery | Delivered | The default OS resolver can block; internal endpoints and addresses rotate | [CA-02](./client-audit/stories/CA-02-service-discovery-resolver.md) |
 | P1 | Cooperative cancellation | Delivered | Shutdown, abandoned upstream requests, and request races need a safe abort path | [CA-03](./client-audit/stories/CA-03-cooperative-cancellation.md) |
 | P1 | Request metadata provider | Delivered | Rotating service credentials and trace context are applied consistently without transport-level JWT policy | [CA-04](./client-audit/stories/CA-04-request-metadata-provider.md) |
-| P1 | TLS identity rotation | Proposed | Certificate/trust rotation must not reuse connections created under an obsolete TLS identity | [CA-05](./client-audit/stories/CA-05-tls-identity-rotation.md) |
+| P1 | TLS identity rotation | Delivered | Certificate/trust rotation cannot reuse connections created under an obsolete TLS identity | [CA-05](./client-audit/stories/CA-05-tls-identity-rotation.md) |
 | P2 discovery | Bounded decompression | Evidence required | May reduce bandwidth for large payloads, but only if workloads justify complexity and risk | [CA-06](./client-audit/stories/CA-06-bounded-decompression.md) |
 | P2 discovery | HTTP/2 feasibility | Evidence required | Multiplexing may help high-concurrency origins, but must fit strict may architecture and measured demand | [CA-07](./client-audit/stories/CA-07-http2-feasibility.md) |
 
-The delivered CA-01 through CA-04 items are transport primitives, not service-discovery,
-authorization, token-acquisition, or observability-backend policy. The remaining P1 item requires
-separate scheduling and owner approval.
+The delivered CA-01 through CA-05 items are transport primitives, not service-discovery,
+authorization, token-acquisition, certificate-issuance, secret-store, or observability-backend
+policy. Only evidence-gated P2 discovery items remain.
 
 ## Capabilities That Belong Above the Transport
 
@@ -179,6 +181,6 @@ All accepted stories must preserve these invariants:
 
 `may_minihttp` is already a capable HTTP/1.1 transport for Microscaler service calls. It now has
 bounded strict-path service resolution, request-level observation, cooperative cancellation, and
-rotation-safe request metadata. Its material remaining opportunity is TLS identity/trust rotation.
-HTTP/2 and decompression should proceed only after workload evidence. Proxy, cookie, WebSocket,
+rotation-safe request metadata, and generation-safe TLS identity/trust rotation. HTTP/2 and
+decompression should proceed only after workload evidence. Proxy, cookie, WebSocket,
 browser-policy, arbitrary-public-site, and curl-parity features are outside the core remit.

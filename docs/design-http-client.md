@@ -14,7 +14,8 @@ operational counters. It also supports sanitized request lifecycle observers and
 adapters for cached DNS or push-updated service registries. An optional cooperative token safely
 cancels may-aware waits and I/O with a typed, observable outcome. A bounded request metadata
 provider injects rotating service credentials and trace context without adding JWT or tracing
-policy to the transport. The low-level `HttpClient` remains available for direct streaming and
+policy to the transport. Immutable rustls configuration snapshots add generation-safe mTLS
+identity and trust rotation. The low-level `HttpClient` remains available for direct streaming and
 `may_http` compatibility.
 
 The concurrency and policy design is specified in
@@ -106,6 +107,7 @@ may_minihttp/src/
     ├── multipart.rs        # replayable text/byte multipart encoding
     ├── cancellation.rs     # cloneable cooperative request cancellation
     ├── metadata.rs         # bounded rotating request metadata provider
+    ├── tls.rs              # immutable rustls snapshots and rotation policy
     ├── observer.rs         # sanitized request lifecycle events
     ├── resolver.rs         # system, bounded cache, and service registry resolvers
     └── rich.rs             # Client, pool, redirects, buffered/streaming responses
@@ -176,6 +178,7 @@ conveniences, not requirements of the current IDAM delivery.
 - Push-updated service resolution with no request-path DNS I/O ✅
 - Cooperative token cancellation with typed and observable outcomes ✅
 - Bounded default/request/provider header precedence and rotating metadata injection ✅
+- Generation-keyed TLS identity/trust rotation with explicit last-known-good policy ✅
 - Compression and HTTP/2 remain optional future capabilities if `may` supports them
 
 ## Resolved Questions
@@ -208,6 +211,7 @@ now closes them without introducing Tokio, Hyper, reqwest, or AWS-LC into its no
 | Service resolution | Functional/operational | Delivered through `CachingResolver` and `ServiceResolver` | Bounded TTL/cache/address counts; single-flight cold lookup; address rotation; explicit invalidation; logical Host/SNI retained |
 | Cooperative cancellation | Functional/operational | Delivered through `CancellationToken` | May-scoped request race; typed `Cancelled`; prompt may-I/O wakeup; incomplete transport discard; one terminal event |
 | Request metadata | Security/operational | Delivered through `RequestMetadataProvider` | Per-attempt refresh; bounded headers; request precedence; transport-owned framing; redacted typed failure; redirect credential stripping |
+| TLS identity/trust rotation | Security/operational | Delivered through `TlsConfigProvider` | Immutable per-request snapshot; generation-keyed pool; retired idle discard; redacted fail-closed or explicit last-known-good policy; rustls/ring only |
 | Async/Tokio API | Deliberate non-goal | Sync call surface over coroutine-aware `may::net` I/O | Keep core runtime-neutral from Tokio; use an adapter only when an external async harness requires it |
 
 Ordinary functional tests should use `Client` or `HttpClient` so their HTTP parsing, header behavior,

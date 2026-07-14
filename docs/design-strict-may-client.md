@@ -5,7 +5,7 @@
 Implemented direction, 2026-07-14. HTTPS, replay-aware requests, buffered and streaming responses,
 redirects, bounded pooling, cancellation-safe leases, and cooperative cancellation follow this
 design without an async runtime or hidden blocking worker pool. Bounded request metadata injection
-follows the same lock-free callback and redaction boundary.
+and generation-safe TLS rotation follow the same lock-free callback and redaction boundary.
 
 ## Runtime invariants
 
@@ -25,6 +25,8 @@ follows the same lock-free callback and redaction boundary.
    contain origins and operational outcomes, never paths, queries, headers, or bodies.
 9. Metadata-provider callbacks run before pool checkout and receive only a sanitized method/origin
    context. Returned headers are bounded and their values never enter observations or debug output.
+10. TLS-provider callbacks run before pool checkout. Immutable rustls snapshots are captured once
+    per logical HTTPS request and private key or certificate data never enters errors or events.
 
 The `client` feature explicitly enables `may/io_timeout`; it must compile with the crate's default
 features disabled.
@@ -86,7 +88,7 @@ The pool stores idle transports, not live response objects and not concurrently 
 `HttpConnection` handles. Its key is:
 
 ```text
-(scheme, canonical host, effective port, TLS profile identity)
+(scheme, canonical host, effective port, TLS generation)
 ```
 
 The state is protected by `may::sync::Mutex`; capacity waiters use a may condition variable or
@@ -104,6 +106,25 @@ allowed when:
 
 Stale idle sockets may be replaced once for idempotent, replayable requests. They must never cause
 an automatic retry of a non-idempotent request after bytes may have reached the peer.
+
+### TLS rotation layer
+
+Static `.tls_config(Arc<ClientConfig>)` remains supported as one fixed generation. A rotating
+client instead injects `TlsConfigProvider`, which returns an immutable `TlsConfigSnapshot` with a
+non-zero, monotonically increasing generation. Construction must establish the initial known-good
+snapshot. The provider is called once when each logical request first reaches an HTTPS origin; the
+captured snapshot remains stable across redirects and the stale-connection retry.
+
+Accepting a newer generation updates the active snapshot atomically, removes idle HTTPS
+connections under older generations, and prevents older active leases from checking back in.
+Existing rustls sessions are never mutated and may finish their current request. A same or older
+provider result uses the already accepted snapshot, preventing concurrent calls from rotating
+backwards.
+
+Provider failures are redacted. `FailRequest` is the default and stops before DNS/connect;
+`UseLastKnownGood` is an explicit availability policy. Provider callbacks, rustls configuration
+loading, and handshakes run without the pool lock. Certificate issuance, secret-store access, key
+parsing, and authorization from a peer certificate remain outside the transport.
 
 ### Resolution layer
 
@@ -182,7 +203,7 @@ request readers are single-use and never retried.
 ### Pooling
 
 - Bounds are enforced under concurrent may coroutines without an OS-thread wait.
-- The pool key separates HTTP, HTTPS, ports, and TLS profiles.
+- The pool key separates HTTP, HTTPS, ports, and TLS generations.
 - Locks are demonstrably not held during network I/O.
 - Fully consumed persistent responses reuse a connection; close/error/incomplete responses do not.
 - Idle and lifetime expiry are deterministic under an injectable clock in unit tests.
@@ -212,3 +233,14 @@ The normal `client` and `json` feature graphs contain no Tokio, reqwest, hyper, 
 - Provider failure and invalid metadata return typed, redacted errors before a connection opens.
 - Transport-owned framing headers, field count, and aggregate encoded size are enforced.
 - The normal feature graph gains no JWT, OAuth, tracing-vendor, async-runtime, or TLS dependency.
+
+### TLS rotation
+
+- A local rustls mTLS test rotates client identity A to B and the server observes B on the second
+  connection.
+- Generation B never checks out or checks in a generation-A connection.
+- Rotation immediately removes retired idle connections and accounts for their discard.
+- Fail-closed provider errors occur before connect; explicit fallback retains last-known-good.
+- TLS observations expose only generation, duration, fallback, error class, and retired count.
+- The normal graph continues to use rustls with ring and contains no `openssl`/`openssl-sys` TLS
+  implementation or AWS-LC (`openssl-probe` may discover platform trust paths).
