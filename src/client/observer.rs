@@ -29,6 +29,15 @@ pub enum ClientEvent<'a> {
         method: &'a Method,
         origin: ObservedOrigin<'a>,
     },
+    RequestMetadataCompleted {
+        request_id: u64,
+        origin: ObservedOrigin<'a>,
+        attempt: u32,
+        redirect_hop: usize,
+        stale_retry: bool,
+        duration: Duration,
+        error: Option<ClientErrorKind>,
+    },
     PoolWaited {
         request_id: u64,
         origin: ObservedOrigin<'a>,

@@ -18,11 +18,14 @@ use url::Url;
 
 use super::cancellation::{cancelled_error, is_cancelled_error};
 use super::{
-    CancellationToken, ClientEvent, ClientObserver, ObservedOrigin, Resolver, SystemResolver,
+    CancellationToken, ClientEvent, ClientObserver, ObservedOrigin, RequestMetadata,
+    RequestMetadataContext, RequestMetadataProvider, Resolver, SystemResolver,
 };
 use super::{HttpClient, MultipartForm};
 
 const DEFAULT_MAX_RESPONSE_BODY: usize = 8 * 1024 * 1024;
+const DEFAULT_MAX_REQUEST_HEADERS: usize = 64;
+const DEFAULT_MAX_REQUEST_HEADER_BYTES: usize = 16 * 1024;
 
 #[cfg(test)]
 type TestConnector = dyn Fn(&str, Arc<ClientConfig>, Duration, &[std::net::SocketAddr]) -> io::Result<HttpClient>
@@ -63,15 +66,19 @@ pub struct ClientBuilder {
     connect_timeout: Duration,
     io_timeout: Duration,
     request_timeout: Duration,
+    max_request_headers: usize,
+    max_request_header_bytes: usize,
     max_response_header_bytes: usize,
     max_response_body: usize,
     redirect_policy: RedirectPolicy,
     tls_config: Option<Arc<ClientConfig>>,
     resolver: Arc<dyn Resolver>,
     observer: Option<Arc<dyn ClientObserver>>,
+    metadata_provider: Option<Arc<dyn RequestMetadataProvider>>,
     #[cfg(test)]
     connector: Option<Arc<TestConnector>>,
     sensitive_headers: HashSet<HeaderName>,
+    default_headers: HeaderMap,
 }
 
 impl Default for ClientBuilder {
@@ -87,15 +94,19 @@ impl Default for ClientBuilder {
             connect_timeout: Duration::from_secs(10),
             io_timeout: Duration::from_secs(30),
             request_timeout: Duration::from_secs(30),
+            max_request_headers: DEFAULT_MAX_REQUEST_HEADERS,
+            max_request_header_bytes: DEFAULT_MAX_REQUEST_HEADER_BYTES,
             max_response_header_bytes: super::response::DEFAULT_MAX_RESPONSE_HEADER_BYTES,
             max_response_body: DEFAULT_MAX_RESPONSE_BODY,
             redirect_policy: RedirectPolicy::None,
             tls_config: None,
             resolver: Arc::new(SystemResolver),
             observer: None,
+            metadata_provider: None,
             #[cfg(test)]
             connector: None,
             sensitive_headers,
+            default_headers: HeaderMap::new(),
         }
     }
 }
@@ -141,6 +152,18 @@ impl ClientBuilder {
         self
     }
 
+    /// Limit caller- and provider-supplied request header fields after precedence is applied.
+    pub fn max_request_headers(mut self, value: usize) -> Self {
+        self.max_request_headers = value;
+        self
+    }
+
+    /// Limit the aggregate encoded size of caller- and provider-supplied request headers.
+    pub fn max_request_header_bytes(mut self, value: usize) -> Self {
+        self.max_request_header_bytes = value;
+        self
+    }
+
     pub fn max_response_body(mut self, value: usize) -> Self {
         self.max_response_body = value;
         self
@@ -174,6 +197,12 @@ impl ClientBuilder {
         self
     }
 
+    /// Supply rotating credentials or trace context immediately before each network attempt.
+    pub fn request_metadata_provider(mut self, value: Arc<dyn RequestMetadataProvider>) -> Self {
+        self.metadata_provider = Some(value);
+        self
+    }
+
     #[cfg(test)]
     fn test_connector(mut self, value: Arc<TestConnector>) -> Self {
         self.connector = Some(value);
@@ -183,6 +212,18 @@ impl ClientBuilder {
     /// Mark an additional header for removal before a cross-origin redirect.
     pub fn sensitive_header(mut self, value: HeaderName) -> Self {
         self.sensitive_headers.insert(value);
+        self
+    }
+
+    /// Set a low-precedence header applied to every request attempt.
+    pub fn default_header(mut self, name: HeaderName, value: HeaderValue) -> Self {
+        self.default_headers.insert(name, value);
+        self
+    }
+
+    /// Replace the complete low-precedence default header set.
+    pub fn default_headers(mut self, value: HeaderMap) -> Self {
+        self.default_headers = value;
         self
     }
 
@@ -205,6 +246,18 @@ impl ClientBuilder {
                 "response body limit must be non-zero and header limit at least four bytes",
             ));
         }
+        if self.max_request_headers == 0 || self.max_request_header_bytes == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "request header limits must be greater than zero",
+            ));
+        }
+        validate_request_headers(
+            &self.default_headers,
+            self.max_request_headers,
+            self.max_request_header_bytes,
+            "default",
+        )?;
 
         let tls_config = match self.tls_config {
             Some(config) => config,
@@ -221,15 +274,19 @@ impl ClientBuilder {
                     connect_timeout: self.connect_timeout,
                     io_timeout: self.io_timeout,
                     request_timeout: self.request_timeout,
+                    max_request_headers: self.max_request_headers,
+                    max_request_header_bytes: self.max_request_header_bytes,
                     max_response_header_bytes: self.max_response_header_bytes,
                     max_response_body: self.max_response_body,
                     redirect_policy: self.redirect_policy,
                     sensitive_headers: self.sensitive_headers,
+                    default_headers: self.default_headers,
                 },
                 tls_config,
                 tls_profile,
                 resolver: self.resolver,
                 observer: self.observer,
+                metadata_provider: self.metadata_provider,
                 #[cfg(test)]
                 connector: self.connector,
                 pool: Mutex::new(PoolState::default()),
@@ -261,6 +318,7 @@ pub struct ClientStats {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ClientErrorKind {
     Cancelled,
+    Metadata,
     InvalidRequest,
     Dns,
     Connection,
@@ -278,6 +336,7 @@ impl ClientErrorKind {
         let message = source.to_string().to_ascii_lowercase();
         match source.kind() {
             _ if is_cancelled_error(source) => Self::Cancelled,
+            _ if message.starts_with("request metadata provider") => Self::Metadata,
             _ if message.contains("body is not replayable") => Self::BodyNotReplayable,
             io::ErrorKind::InvalidInput => Self::InvalidRequest,
             io::ErrorKind::AddrNotAvailable => Self::Dns,
@@ -383,6 +442,17 @@ struct StreamingExecution<'a> {
     deadline: Instant,
     trace: &'a RequestTrace,
     cancellation: Option<CancellationToken>,
+    attempt: &'a mut u32,
+    sensitive_headers: &'a mut HashSet<HeaderName>,
+}
+
+struct AttemptExecution<'a> {
+    deadline: Instant,
+    trace: &'a RequestTrace,
+    attempt: &'a mut u32,
+    redirect_hop: usize,
+    credentials_stripped: bool,
+    sensitive_headers: &'a mut HashSet<HeaderName>,
 }
 
 fn run_cancellable<T>(
@@ -476,10 +546,25 @@ impl Client {
         let mut visited = HashSet::new();
         visited.insert(normalized_url(&url));
         let mut hops = 0_usize;
+        let mut attempt = 0_u32;
+        let mut credentials_stripped = false;
+        let mut sensitive_headers = self.inner.config.sensitive_headers.clone();
 
         loop {
-            let response =
-                self.execute_once(&method, &url, &headers, &mut body, deadline, trace)?;
+            let response = self.execute_once(
+                &method,
+                &url,
+                &headers,
+                &mut body,
+                AttemptExecution {
+                    deadline,
+                    trace,
+                    attempt: &mut attempt,
+                    redirect_hop: hops,
+                    credentials_stripped,
+                    sensitive_headers: &mut sensitive_headers,
+                },
+            )?;
             let Some(max_hops) = policy.max_hops() else {
                 return Ok(response);
             };
@@ -533,7 +618,8 @@ impl Client {
             }
 
             if !same_origin(&url, &target) {
-                for header in &self.inner.config.sensitive_headers {
+                credentials_stripped = true;
+                for header in &sensitive_headers {
                     headers.remove(header);
                 }
             }
@@ -590,6 +676,8 @@ impl Client {
             })?;
         let cancellation = request.cancellation.clone();
         let mut body = request.body;
+        let mut attempt = 0_u32;
+        let mut sensitive_headers = self.inner.config.sensitive_headers.clone();
         self.execute_streaming_once(
             &request.method,
             &request.url,
@@ -599,6 +687,8 @@ impl Client {
                 deadline,
                 trace: &trace,
                 cancellation,
+                attempt: &mut attempt,
+                sensitive_headers: &mut sensitive_headers,
             },
         )
     }
@@ -609,18 +699,45 @@ impl Client {
         url: &Url,
         headers: &HeaderMap,
         body: &mut RequestBody,
-        deadline: Instant,
-        trace: &RequestTrace,
+        execution: AttemptExecution<'_>,
     ) -> io::Result<BufferedResponse> {
+        let AttemptExecution {
+            deadline,
+            trace,
+            attempt,
+            redirect_hop,
+            credentials_stripped,
+            sensitive_headers,
+        } = execution;
         validate_body_method(method, body)?;
         let key = OriginKey::from_url(url, self.inner.tls_profile)?;
         let mut stale_retry_available = method_is_idempotent(method) && body.is_replayable();
+        let mut stale_retry = false;
         loop {
+            *attempt = attempt.checked_add(1).ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "request attempt counter overflow",
+                )
+            })?;
+            let attempt_headers = self.prepare_attempt_headers(
+                headers,
+                RequestMetadataContext {
+                    request_id: trace.request_id,
+                    method,
+                    origin: observed_url(url),
+                    attempt: *attempt,
+                    redirect_hop,
+                    stale_retry,
+                },
+                credentials_stripped,
+                sensitive_headers,
+            )?;
             let mut lease = self.checkout(&key, deadline, trace)?;
             let reused_idle_connection = lease.reused_idle_connection;
             let result = (|| {
                 let mut response =
-                    self.send_on_lease(&mut lease, method, url, headers, body, deadline)?;
+                    self.send_on_lease(&mut lease, method, url, &attempt_headers, body, deadline)?;
 
                 let status = response.status();
                 self.inner.observe(ClientEvent::ResponseHeaders {
@@ -631,8 +748,13 @@ impl Client {
                 });
                 let version = response.version();
                 let response_headers = response.headers().clone();
-                let reusable =
-                    response_is_reusable(method, status, version, headers, &response_headers);
+                let reusable = response_is_reusable(
+                    method,
+                    status,
+                    version,
+                    &attempt_headers,
+                    &response_headers,
+                );
                 let mut bytes = Vec::new();
                 let limit = self.inner.config.max_response_body;
                 // Keep body buffers off may's deliberately small coroutine stacks.
@@ -682,6 +804,7 @@ impl Client {
                         && stale_connection_error(&error) =>
                 {
                     stale_retry_available = false;
+                    stale_retry = true;
                     self.inner
                         .stats
                         .stale_retries
@@ -713,14 +836,36 @@ impl Client {
             deadline,
             trace,
             cancellation,
+            attempt,
+            sensitive_headers,
         } = execution;
         validate_body_method(method, body)?;
         let key = OriginKey::from_url(url, self.inner.tls_profile)?;
         let mut stale_retry_available = method_is_idempotent(method) && body.is_replayable();
+        let mut stale_retry = false;
         loop {
+            *attempt = attempt.checked_add(1).ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "request attempt counter overflow",
+                )
+            })?;
+            let attempt_headers = self.prepare_attempt_headers(
+                headers,
+                RequestMetadataContext {
+                    request_id: trace.request_id,
+                    method,
+                    origin: observed_url(url),
+                    attempt: *attempt,
+                    redirect_hop: 0,
+                    stale_retry,
+                },
+                false,
+                sensitive_headers,
+            )?;
             let mut lease = self.checkout(&key, deadline, trace)?;
             let reused_idle_connection = lease.reused_idle_connection;
-            match self.send_on_lease(&mut lease, method, url, headers, body, deadline) {
+            match self.send_on_lease(&mut lease, method, url, &attempt_headers, body, deadline) {
                 Ok(response) => {
                     let status = response.status();
                     self.inner.observe(ClientEvent::ResponseHeaders {
@@ -731,8 +876,13 @@ impl Client {
                     });
                     let version = response.version();
                     let response_headers = response.headers().clone();
-                    let reusable =
-                        response_is_reusable(method, status, version, headers, &response_headers);
+                    let reusable = response_is_reusable(
+                        method,
+                        status,
+                        version,
+                        &attempt_headers,
+                        &response_headers,
+                    );
                     let mut streaming = StreamingResponse {
                         response: Some(response),
                         lease: Some(lease),
@@ -763,6 +913,7 @@ impl Client {
                         && stale_connection_error(&error) =>
                 {
                     stale_retry_available = false;
+                    stale_retry = true;
                     self.inner
                         .stats
                         .stale_retries
@@ -780,6 +931,68 @@ impl Client {
                 }
             }
         }
+    }
+
+    fn prepare_attempt_headers(
+        &self,
+        request_headers: &HeaderMap,
+        context: RequestMetadataContext<'_>,
+        credentials_stripped: bool,
+        sensitive_headers: &mut HashSet<HeaderName>,
+    ) -> io::Result<HeaderMap> {
+        validate_request_headers(
+            request_headers,
+            self.inner.config.max_request_headers,
+            self.inner.config.max_request_header_bytes,
+            "request",
+        )?;
+
+        let mut headers = self.inner.config.default_headers.clone();
+        if let Some(provider) = &self.inner.metadata_provider {
+            let started = Instant::now();
+            let metadata = provider
+                .provide(context)
+                .map_err(|error| metadata_provider_error(&format!("failed ({:?})", error.kind())))
+                .and_then(|metadata| {
+                    validate_request_headers(
+                        &metadata.headers,
+                        self.inner.config.max_request_headers,
+                        self.inner.config.max_request_header_bytes,
+                        "provider",
+                    )
+                    .map_err(|error| metadata_provider_error(&error.to_string()))?;
+                    Ok(metadata)
+                });
+            self.inner.observe(ClientEvent::RequestMetadataCompleted {
+                request_id: context.request_id,
+                origin: context.origin,
+                attempt: context.attempt,
+                redirect_hop: context.redirect_hop,
+                stale_retry: context.stale_retry,
+                duration: started.elapsed(),
+                error: metadata.as_ref().err().map(ClientErrorKind::classify),
+            });
+            let RequestMetadata {
+                headers: provided,
+                sensitive_headers: provided_sensitive,
+            } = metadata?;
+            sensitive_headers.extend(provided_sensitive);
+            overlay_headers(&mut headers, &provided);
+        }
+        overlay_headers(&mut headers, request_headers);
+
+        if credentials_stripped {
+            for name in sensitive_headers.iter() {
+                headers.remove(name);
+            }
+        }
+        validate_request_headers(
+            &headers,
+            self.inner.config.max_request_headers,
+            self.inner.config.max_request_header_bytes,
+            "merged",
+        )?;
+        Ok(headers)
     }
 
     fn send_on_lease(
@@ -1355,6 +1568,7 @@ struct ClientInner {
     tls_profile: usize,
     resolver: Arc<dyn Resolver>,
     observer: Option<Arc<dyn ClientObserver>>,
+    metadata_provider: Option<Arc<dyn RequestMetadataProvider>>,
     #[cfg(test)]
     connector: Option<Arc<TestConnector>>,
     pool: Mutex<PoolState>,
@@ -1393,10 +1607,13 @@ struct ClientConfigValues {
     connect_timeout: Duration,
     io_timeout: Duration,
     request_timeout: Duration,
+    max_request_headers: usize,
+    max_request_header_bytes: usize,
     max_response_header_bytes: usize,
     max_response_body: usize,
     redirect_policy: RedirectPolicy,
     sensitive_headers: HashSet<HeaderName>,
+    default_headers: HeaderMap,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -1711,6 +1928,61 @@ fn validate_body_method(method: &Method, body: &RequestBody) -> io::Result<()> {
     Ok(())
 }
 
+fn overlay_headers(target: &mut HeaderMap, source: &HeaderMap) {
+    for name in source.keys() {
+        target.remove(name);
+        for value in source.get_all(name) {
+            target.append(name.clone(), value.clone());
+        }
+    }
+}
+
+fn validate_request_headers(
+    headers: &HeaderMap,
+    max_count: usize,
+    max_bytes: usize,
+    source: &str,
+) -> io::Result<()> {
+    for name in [HOST, CONTENT_LENGTH, TRANSFER_ENCODING] {
+        if headers.contains_key(&name) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("{source} headers cannot set transport-owned {name}"),
+            ));
+        }
+    }
+    if headers.len() > max_count {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("{source} headers exceed the configured {max_count}-field limit"),
+        ));
+    }
+    let mut encoded_bytes = 0_usize;
+    for (name, value) in headers {
+        encoded_bytes = encoded_bytes
+            .checked_add(name.as_str().len())
+            .and_then(|size| size.checked_add(value.as_bytes().len()))
+            .and_then(|size| size.checked_add(4))
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("{source} header size overflow"),
+                )
+            })?;
+    }
+    if encoded_bytes > max_bytes {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("{source} headers exceed the configured {max_bytes}-byte limit"),
+        ));
+    }
+    Ok(())
+}
+
+fn metadata_provider_error(detail: &str) -> io::Error {
+    io::Error::other(format!("request metadata provider {detail}"))
+}
+
 fn stale_connection_error(error: &io::Error) -> bool {
     matches!(
         error.kind(),
@@ -1801,6 +2073,16 @@ mod tests {
                 } => format!(
                     "start:{request_id}:{method}:{}://{}:{}",
                     origin.scheme, origin.host, origin.port
+                ),
+                ClientEvent::RequestMetadataCompleted {
+                    request_id,
+                    attempt,
+                    redirect_hop,
+                    stale_retry,
+                    error,
+                    ..
+                } => format!(
+                    "metadata:{request_id}:{attempt}:{redirect_hop}:{stale_retry}:{error:?}"
                 ),
                 ClientEvent::PoolWaited {
                     request_id,
@@ -1948,6 +2230,167 @@ mod tests {
         assert_eq!(builder.redirect_policy, RedirectPolicy::None);
         assert!(builder.max_connections > 0);
         assert!(builder.max_response_body > 0);
+        assert!(builder.max_request_headers > 0);
+        assert!(builder.max_request_header_bytes > 0);
+    }
+
+    #[test]
+    fn request_metadata_precedence_and_rotation_are_deterministic() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let first = read_head(&mut stream).to_ascii_lowercase();
+            assert!(first.contains("\r\nx-default: default-only\r\n"));
+            assert!(first.contains("\r\nx-priority: request\r\n"));
+            assert!(first.contains("\r\nx-rotating: token-1\r\n"));
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok")
+                .unwrap();
+            stream.flush().unwrap();
+
+            let second = read_head(&mut stream).to_ascii_lowercase();
+            assert!(second.contains("\r\nx-priority: provider\r\n"));
+            assert!(second.contains("\r\nx-rotating: token-2\r\n"));
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok")
+                .unwrap();
+        });
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let provider_calls = calls.clone();
+        let provider = Arc::new(move |context: RequestMetadataContext<'_>| {
+            let call = provider_calls.fetch_add(1, Ordering::Relaxed) + 1;
+            assert_eq!(context.attempt, 1);
+            assert_eq!(context.redirect_hop, 0);
+            assert!(!context.stale_retry);
+            Ok(RequestMetadata::new()
+                .header(
+                    HeaderName::from_static("x-priority"),
+                    HeaderValue::from_static("provider"),
+                )
+                .header(
+                    HeaderName::from_static("x-rotating"),
+                    HeaderValue::from_str(&format!("token-{call}")).unwrap(),
+                ))
+        });
+        let client = Client::builder()
+            .default_header(
+                HeaderName::from_static("x-default"),
+                HeaderValue::from_static("default-only"),
+            )
+            .default_header(
+                HeaderName::from_static("x-priority"),
+                HeaderValue::from_static("default"),
+            )
+            .request_metadata_provider(provider)
+            .build()
+            .unwrap();
+
+        client
+            .get(&format!("http://127.0.0.1:{port}/one"))
+            .unwrap()
+            .header(
+                HeaderName::from_static("x-priority"),
+                HeaderValue::from_static("request"),
+            )
+            .send()
+            .unwrap();
+        client
+            .get(&format!("http://127.0.0.1:{port}/two"))
+            .unwrap()
+            .send()
+            .unwrap();
+        server.join().unwrap();
+        assert_eq!(calls.load(Ordering::Relaxed), 2);
+    }
+
+    #[test]
+    fn metadata_provider_failure_is_redacted_classified_and_pre_connect() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        listener.set_nonblocking(true).unwrap();
+        let observer = Arc::new(RecordingObserver::default());
+        let provider = Arc::new(|_context: RequestMetadataContext<'_>| {
+            Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "Bearer must-never-escape",
+            ))
+        });
+        let client = Client::builder()
+            .observer(observer.clone())
+            .request_metadata_provider(provider)
+            .build()
+            .unwrap();
+
+        let error = client
+            .get(&format!("http://127.0.0.1:{port}/never-sent"))
+            .unwrap()
+            .send_typed()
+            .unwrap_err();
+        assert_eq!(error.kind(), ClientErrorKind::Metadata);
+        assert!(!error.to_string().contains("must-never-escape"));
+        assert_eq!(
+            listener.accept().unwrap_err().kind(),
+            io::ErrorKind::WouldBlock
+        );
+        let events = observer.events();
+        assert!(events
+            .iter()
+            .any(|event| event == "metadata:1:1:0:false:Some(Metadata)"));
+        assert!(events.iter().any(|event| event == "failed:1:Metadata"));
+    }
+
+    #[test]
+    fn transport_owned_and_bounded_request_headers_are_enforced() {
+        for name in [HOST, CONTENT_LENGTH, TRANSFER_ENCODING] {
+            let error = Client::builder()
+                .default_header(name, HeaderValue::from_static("invalid"))
+                .build()
+                .unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+            assert!(error.to_string().contains("transport-owned"));
+        }
+
+        let provider = Arc::new(|_context: RequestMetadataContext<'_>| {
+            Ok(RequestMetadata::new().header(HOST, HeaderValue::from_static("invalid")))
+        });
+        let error = Client::builder()
+            .request_metadata_provider(provider)
+            .build()
+            .unwrap()
+            .get("http://127.0.0.1:9/")
+            .unwrap()
+            .send_typed()
+            .unwrap_err();
+        assert_eq!(error.kind(), ClientErrorKind::Metadata);
+
+        let client = Client::builder()
+            .max_request_headers(1)
+            .default_header(
+                HeaderName::from_static("x-one"),
+                HeaderValue::from_static("1"),
+            )
+            .build()
+            .unwrap();
+        let error = client
+            .get("http://127.0.0.1:9/")
+            .unwrap()
+            .header(
+                HeaderName::from_static("x-two"),
+                HeaderValue::from_static("2"),
+            )
+            .send_typed()
+            .unwrap_err();
+        assert_eq!(error.kind(), ClientErrorKind::InvalidRequest);
+
+        let debug = format!(
+            "{:?}",
+            RequestMetadata::new().header(
+                AUTHORIZATION,
+                HeaderValue::from_static("Bearer must-never-escape")
+            )
+        );
+        assert!(!debug.contains("must-never-escape"));
     }
 
     #[test]
@@ -2806,6 +3249,70 @@ mod tests {
     }
 
     #[test]
+    fn stale_connection_retry_refreshes_attempt_metadata() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = thread::spawn(move || {
+            let (mut stale, _) = listener.accept().unwrap();
+            let prime = read_head(&mut stale).to_ascii_lowercase();
+            assert!(prime.contains("\r\nx-attempt: value-1\r\n"));
+            stale
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok")
+                .unwrap();
+            stale.flush().unwrap();
+            drop(stale);
+
+            let (mut replacement, _) = listener.accept().unwrap();
+            let retried = read_head(&mut replacement).to_ascii_lowercase();
+            assert!(retried.starts_with("get /retry http/1.1\r\n"));
+            assert!(retried.contains("\r\nx-attempt: value-3\r\n"));
+            replacement
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\nConnection: close\r\n\r\nfresh",
+                )
+                .unwrap();
+        });
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let provider_calls = calls.clone();
+        let provider = Arc::new(move |_context: RequestMetadataContext<'_>| {
+            let call = provider_calls.fetch_add(1, Ordering::Relaxed) + 1;
+            Ok(RequestMetadata::new().header(
+                HeaderName::from_static("x-attempt"),
+                HeaderValue::from_str(&format!("value-{call}")).unwrap(),
+            ))
+        });
+        let observer = Arc::new(RecordingObserver::default());
+        let client = Client::builder()
+            .observer(observer.clone())
+            .request_metadata_provider(provider)
+            .build()
+            .unwrap();
+        client
+            .get(&format!("http://127.0.0.1:{port}/prime"))
+            .unwrap()
+            .send()
+            .unwrap();
+        assert_eq!(
+            client
+                .get(&format!("http://127.0.0.1:{port}/retry"))
+                .unwrap()
+                .send()
+                .unwrap()
+                .body(),
+            b"fresh"
+        );
+        server.join().unwrap();
+        assert_eq!(calls.load(Ordering::Relaxed), 3);
+        let events = observer.events();
+        assert!(events
+            .iter()
+            .any(|event| event == "metadata:2:1:0:false:None"));
+        assert!(events
+            .iter()
+            .any(|event| event == "metadata:2:2:0:true:None"));
+    }
+
+    #[test]
     fn stale_idle_connection_does_not_retry_post() {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
@@ -3158,7 +3665,9 @@ mod tests {
         let source_port = source.local_addr().unwrap().port();
         let source_server = thread::spawn(move || {
             let (mut stream, _) = source.accept().unwrap();
-            let _ = read_head(&mut stream);
+            let request = read_head(&mut stream).to_ascii_lowercase();
+            assert!(request.contains("\r\nx-service-token: token-1\r\n"));
+            assert!(request.contains("\r\nx-trace: trace-1\r\n"));
             write!(
                 stream,
                 "HTTP/1.1 302 Found\r\nLocation: http://127.0.0.1:{target_port}/final\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
@@ -3171,17 +3680,39 @@ mod tests {
             assert!(!request.contains("\r\nauthorization:"));
             assert!(!request.contains("\r\ncookie:"));
             assert!(!request.contains("\r\nx-secret:"));
+            assert!(!request.contains("\r\nx-service-token:"));
+            assert!(request.contains("\r\nx-trace: trace-2\r\n"));
             stream
                 .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok")
                 .unwrap();
         });
 
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let provider_calls = calls.clone();
+        let provider = Arc::new(move |context: RequestMetadataContext<'_>| {
+            let call = provider_calls.fetch_add(1, Ordering::Relaxed) + 1;
+            assert_eq!(context.attempt as usize, call);
+            assert_eq!(context.redirect_hop + 1, call);
+            Ok(RequestMetadata::new()
+                .header(
+                    HeaderName::from_static("x-service-token"),
+                    HeaderValue::from_str(&format!("token-{call}")).unwrap(),
+                )
+                .sensitive_header(HeaderName::from_static("x-service-token"))
+                .header(
+                    HeaderName::from_static("x-trace"),
+                    HeaderValue::from_str(&format!("trace-{call}")).unwrap(),
+                ))
+        });
+        let observer = Arc::new(RecordingObserver::default());
         let response = Client::builder()
             .redirect_policy(RedirectPolicy::CrossOrigin {
                 max_hops: 3,
                 allow_https_downgrade: false,
             })
             .sensitive_header(HeaderName::from_static("x-secret"))
+            .request_metadata_provider(provider)
+            .observer(observer.clone())
             .request_timeout(Duration::from_secs(2))
             .build()
             .unwrap()
@@ -3198,5 +3729,10 @@ mod tests {
         assert_eq!(response.body(), b"ok");
         source_server.join().unwrap();
         target_server.join().unwrap();
+        assert_eq!(calls.load(Ordering::Relaxed), 2);
+        assert!(observer
+            .events()
+            .iter()
+            .any(|event| event == "metadata:1:2:1:false:None"));
     }
 }

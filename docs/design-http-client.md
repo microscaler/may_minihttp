@@ -12,8 +12,10 @@ platform certificate verifier, and an explicit ring crypto provider. A cloneable
 lease-owning streaming responses, an opt-in redirect policy, typed error classification, and
 operational counters. It also supports sanitized request lifecycle observers and bounded resolver
 adapters for cached DNS or push-updated service registries. An optional cooperative token safely
-cancels may-aware waits and I/O with a typed, observable outcome. The low-level `HttpClient`
-remains available for direct streaming and `may_http` compatibility.
+cancels may-aware waits and I/O with a typed, observable outcome. A bounded request metadata
+provider injects rotating service credentials and trace context without adding JWT or tracing
+policy to the transport. The low-level `HttpClient` remains available for direct streaming and
+`may_http` compatibility.
 
 The concurrency and policy design is specified in
 [`design-strict-may-client.md`](./design-strict-may-client.md).
@@ -103,6 +105,7 @@ may_minihttp/src/
     ├── shared.rs           # Send-capable, may-Mutex transport plumbing
     ├── multipart.rs        # replayable text/byte multipart encoding
     ├── cancellation.rs     # cloneable cooperative request cancellation
+    ├── metadata.rs         # bounded rotating request metadata provider
     ├── observer.rs         # sanitized request lifecycle events
     ├── resolver.rs         # system, bounded cache, and service registry resolvers
     └── rich.rs             # Client, pool, redirects, buffered/streaming responses
@@ -172,6 +175,7 @@ conveniences, not requirements of the current IDAM delivery.
 - Bounded positive/negative resolver caching, single-flight refresh, and address rotation ✅
 - Push-updated service resolution with no request-path DNS I/O ✅
 - Cooperative token cancellation with typed and observable outcomes ✅
+- Bounded default/request/provider header precedence and rotating metadata injection ✅
 - Compression and HTTP/2 remain optional future capabilities if `may` supports them
 
 ## Resolved Questions
@@ -203,6 +207,7 @@ now closes them without introducing Tokio, Hyper, reqwest, or AWS-LC into its no
 | Request observation | Operational | Delivered through an optional `ClientObserver` | Stable request IDs and phase/outcome events; no paths, queries, headers, or bodies; callbacks outside client locks; cooperative cancellation emits after cleanup |
 | Service resolution | Functional/operational | Delivered through `CachingResolver` and `ServiceResolver` | Bounded TTL/cache/address counts; single-flight cold lookup; address rotation; explicit invalidation; logical Host/SNI retained |
 | Cooperative cancellation | Functional/operational | Delivered through `CancellationToken` | May-scoped request race; typed `Cancelled`; prompt may-I/O wakeup; incomplete transport discard; one terminal event |
+| Request metadata | Security/operational | Delivered through `RequestMetadataProvider` | Per-attempt refresh; bounded headers; request precedence; transport-owned framing; redacted typed failure; redirect credential stripping |
 | Async/Tokio API | Deliberate non-goal | Sync call surface over coroutine-aware `may::net` I/O | Keep core runtime-neutral from Tokio; use an adapter only when an external async harness requires it |
 
 Ordinary functional tests should use `Client` or `HttpClient` so their HTTP parsing, header behavior,

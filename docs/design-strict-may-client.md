@@ -4,7 +4,8 @@
 
 Implemented direction, 2026-07-14. HTTPS, replay-aware requests, buffered and streaming responses,
 redirects, bounded pooling, cancellation-safe leases, and cooperative cancellation follow this
-design without an async runtime or hidden blocking worker pool.
+design without an async runtime or hidden blocking worker pool. Bounded request metadata injection
+follows the same lock-free callback and redaction boundary.
 
 ## Runtime invariants
 
@@ -22,6 +23,8 @@ design without an async runtime or hidden blocking worker pool.
    resolver. Cache waiters use a may condition variable and honour the connect deadline.
 8. Observer callbacks run synchronously after releasing pool and transport locks. Built-in events
    contain origins and operational outcomes, never paths, queries, headers, or bodies.
+9. Metadata-provider callbacks run before pool checkout and receive only a sanitized method/origin
+   context. Returned headers are bounded and their values never enter observations or debug output.
 
 The `client` feature explicitly enables `may/io_timeout`; it must compile with the crate's default
 features disabled.
@@ -40,7 +43,7 @@ multiplexable.
 
 ### Request layer
 
-`RequestBuilder` owns replayable request metadata and a body enum:
+`RequestBuilder` owns request-specific headers and a body enum:
 
 - empty;
 - immutable bytes;
@@ -50,6 +53,32 @@ multiplexable.
 
 Redirect and stale-connection retry logic may replay only bodies marked replayable. A streaming body
 must fail with a typed `BodyNotReplayable` result before a second network attempt.
+
+### Request metadata layer
+
+`ClientBuilder` accepts low-precedence default headers and an optional
+`Arc<dyn RequestMetadataProvider>`. The provider is a narrow transport hook, not JWT, OAuth,
+authorization, or tracing-export policy. It receives the logical request ID, method, sanitized
+origin, monotonically increasing attempt number, redirect hop, and stale-retry flag. It returns a
+`RequestMetadata` header snapshot for that one attempt and may declare additional sensitive header
+names.
+
+Headers merge in this order:
+
+```text
+client defaults < provider snapshot < request-specific headers
+```
+
+A higher-precedence source replaces every value for the same name. `Host`, `Content-Length`, and
+`Transfer-Encoding` remain transport-owned and are rejected from every source. Configurable limits
+bound both the number of fields and aggregate encoded bytes after merging; provider output is also
+validated independently before merging.
+
+The provider runs once before each intended network send, including redirect hops and the one safe
+stale-connection replay. It runs before pool checkout, with no pool or transport lock held, and its
+latency consumes the total request deadline. A returned error prevents DNS, connect, or request
+bytes, is redacted, and maps to `ClientErrorKind::Metadata`. Callback panic and blocking policy
+remain the implementation's responsibility.
 
 ### Pool layer
 
@@ -111,7 +140,9 @@ origin rule. It resolves relative `Location` values, detects loops, and can be r
 same-origin targets. Status-specific method and body rules remain mandatory.
 
 If cross-origin redirects are enabled, `Authorization`, `Cookie`, `Proxy-Authorization`, and caller-
-configured sensitive headers are stripped before the redirected request is sent. HTTPS-to-HTTP
+configured or provider-declared sensitive headers are stripped before the redirected request is
+sent. Sensitive names accumulate for the logical request and remain suppressed after its first
+cross-origin hop. Non-sensitive provider metadata is refreshed for the target attempt. HTTPS-to-HTTP
 downgrades are rejected unless a separate explicit policy permits them. Status handling follows:
 
 - 303: change to GET and discard the body;
@@ -172,3 +203,12 @@ The normal `client` and `json` feature graphs contain no Tokio, reqwest, hyper, 
 - The logical `Host` is preserved when connecting to a registry-provided address.
 - New, reused, redirected, retried, failed, abandoned, buffered, and streaming request
   lifecycles have deterministic observer tests with sanitized event payloads.
+
+### Request metadata
+
+- Defaults, provider headers, and request-specific headers have deterministic precedence.
+- Provider callbacks refresh across logical requests, redirect hops, and a stale-connection retry.
+- Cross-origin redirects suppress built-in, configured, and provider-declared credentials.
+- Provider failure and invalid metadata return typed, redacted errors before a connection opens.
+- Transport-owned framing headers, field count, and aggregate encoded size are enforced.
+- The normal feature graph gains no JWT, OAuth, tracing-vendor, async-runtime, or TLS dependency.

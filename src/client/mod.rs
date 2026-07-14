@@ -7,6 +7,7 @@ mod body;
 mod buffer;
 mod cancellation;
 mod client_impl;
+mod metadata;
 mod multipart;
 mod observer;
 mod request;
@@ -17,6 +18,7 @@ mod shared;
 
 pub use cancellation::CancellationToken;
 pub use client_impl::HttpClient;
+pub use metadata::{RequestMetadata, RequestMetadataContext, RequestMetadataProvider};
 pub use multipart::MultipartForm;
 pub use observer::{ClientEvent, ClientObserver, ObservedOrigin};
 pub use request::Request;
