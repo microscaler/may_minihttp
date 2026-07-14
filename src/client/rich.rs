@@ -3,7 +3,6 @@
 use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::io::{self, Read};
-use std::net::{SocketAddr, ToSocketAddrs};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -17,27 +16,10 @@ use may::sync::{Condvar, Mutex};
 use rustls::ClientConfig;
 use url::Url;
 
+use super::{ClientEvent, ClientObserver, ObservedOrigin, Resolver, SystemResolver};
 use super::{HttpClient, MultipartForm};
 
 const DEFAULT_MAX_RESPONSE_BODY: usize = 8 * 1024 * 1024;
-
-/// Hostname resolver used before coroutine-aware TCP connection attempts.
-///
-/// The default delegates to the operating system and may block during a cache miss. Deployments
-/// requiring a strictly non-blocking scheduler path should inject a cached or may-aware resolver.
-pub trait Resolver: Send + Sync {
-    fn resolve(&self, host: &str, port: u16) -> io::Result<Vec<SocketAddr>>;
-}
-
-/// Operating-system resolver used by default.
-#[derive(Debug, Default)]
-pub struct SystemResolver;
-
-impl Resolver for SystemResolver {
-    fn resolve(&self, host: &str, port: u16) -> io::Result<Vec<SocketAddr>> {
-        (host, port).to_socket_addrs().map(Iterator::collect)
-    }
-}
 
 /// Policy governing whether HTTP redirects are followed.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -78,6 +60,7 @@ pub struct ClientBuilder {
     redirect_policy: RedirectPolicy,
     tls_config: Option<Arc<ClientConfig>>,
     resolver: Arc<dyn Resolver>,
+    observer: Option<Arc<dyn ClientObserver>>,
     sensitive_headers: HashSet<HeaderName>,
 }
 
@@ -99,6 +82,7 @@ impl Default for ClientBuilder {
             redirect_policy: RedirectPolicy::None,
             tls_config: None,
             resolver: Arc::new(SystemResolver),
+            observer: None,
             sensitive_headers,
         }
     }
@@ -172,6 +156,12 @@ impl ClientBuilder {
         self
     }
 
+    /// Observe sanitized request lifecycle events.
+    pub fn observer(mut self, value: Arc<dyn ClientObserver>) -> Self {
+        self.observer = Some(value);
+        self
+    }
+
     /// Mark an additional header for removal before a cross-origin redirect.
     pub fn sensitive_header(mut self, value: HeaderName) -> Self {
         self.sensitive_headers.insert(value);
@@ -221,9 +211,11 @@ impl ClientBuilder {
                 tls_config,
                 tls_profile,
                 resolver: self.resolver,
+                observer: self.observer,
                 pool: Mutex::new(PoolState::default()),
                 available: Condvar::new(),
                 stats: ClientStatsInner::default(),
+                next_request_id: AtomicU64::new(1),
             }),
         })
     }
@@ -260,6 +252,32 @@ pub enum ClientErrorKind {
     Io,
 }
 
+impl ClientErrorKind {
+    fn classify(source: &io::Error) -> Self {
+        let message = source.to_string().to_ascii_lowercase();
+        match source.kind() {
+            _ if message.contains("body is not replayable") => Self::BodyNotReplayable,
+            io::ErrorKind::InvalidInput => Self::InvalidRequest,
+            io::ErrorKind::AddrNotAvailable => Self::Dns,
+            io::ErrorKind::TimedOut => Self::Timeout,
+            io::ErrorKind::PermissionDenied => Self::Redirect,
+            io::ErrorKind::InvalidData if message.contains("body exceeds") => Self::BodyTooLarge,
+            io::ErrorKind::InvalidData if message.contains("redirect") => Self::Redirect,
+            io::ErrorKind::InvalidData | io::ErrorKind::UnexpectedEof => Self::Protocol,
+            io::ErrorKind::BrokenPipe
+            | io::ErrorKind::ConnectionAborted
+            | io::ErrorKind::ConnectionRefused
+            | io::ErrorKind::ConnectionReset
+            | io::ErrorKind::NotConnected
+            | io::ErrorKind::WriteZero => Self::Connection,
+            io::ErrorKind::Other if message.contains("tls") || message.contains("certificate") => {
+                Self::Tls
+            }
+            _ => Self::Io,
+        }
+    }
+}
+
 /// Classified error returned by [`RequestBuilder::send_typed`].
 #[derive(Debug)]
 pub struct ClientError {
@@ -291,29 +309,7 @@ impl std::error::Error for ClientError {
 
 impl From<io::Error> for ClientError {
     fn from(source: io::Error) -> Self {
-        let message = source.to_string().to_ascii_lowercase();
-        let kind = match source.kind() {
-            _ if message.contains("body is not replayable") => ClientErrorKind::BodyNotReplayable,
-            io::ErrorKind::InvalidInput => ClientErrorKind::InvalidRequest,
-            io::ErrorKind::AddrNotAvailable => ClientErrorKind::Dns,
-            io::ErrorKind::TimedOut => ClientErrorKind::Timeout,
-            io::ErrorKind::PermissionDenied => ClientErrorKind::Redirect,
-            io::ErrorKind::InvalidData if message.contains("body exceeds") => {
-                ClientErrorKind::BodyTooLarge
-            }
-            io::ErrorKind::InvalidData if message.contains("redirect") => ClientErrorKind::Redirect,
-            io::ErrorKind::InvalidData | io::ErrorKind::UnexpectedEof => ClientErrorKind::Protocol,
-            io::ErrorKind::BrokenPipe
-            | io::ErrorKind::ConnectionAborted
-            | io::ErrorKind::ConnectionRefused
-            | io::ErrorKind::ConnectionReset
-            | io::ErrorKind::NotConnected
-            | io::ErrorKind::WriteZero => ClientErrorKind::Connection,
-            io::ErrorKind::Other if message.contains("tls") || message.contains("certificate") => {
-                ClientErrorKind::Tls
-            }
-            _ => ClientErrorKind::Io,
-        };
+        let kind = ClientErrorKind::classify(&source);
         Self { kind, source }
     }
 }
@@ -355,6 +351,12 @@ impl fmt::Debug for Client {
     }
 }
 
+#[derive(Debug, Clone, Copy)]
+struct RequestTrace {
+    request_id: u64,
+    started: Instant,
+}
+
 impl Client {
     pub fn builder() -> ClientBuilder {
         ClientBuilder::new()
@@ -390,6 +392,24 @@ impl Client {
     }
 
     fn execute(&self, request: RequestBuilder) -> io::Result<BufferedResponse> {
+        let trace = self.begin_request(&request.method, &request.url);
+        let result = self.execute_buffered(request, &trace);
+        match &result {
+            Ok(response) => self.inner.observe(ClientEvent::RequestCompleted {
+                request_id: trace.request_id,
+                status: response.status,
+                total_duration: trace.started.elapsed(),
+            }),
+            Err(error) => self.observe_failure(&trace, error),
+        }
+        result
+    }
+
+    fn execute_buffered(
+        &self,
+        request: RequestBuilder,
+        trace: &RequestTrace,
+    ) -> io::Result<BufferedResponse> {
         let deadline = Instant::now()
             .checked_add(request.timeout.unwrap_or(self.inner.config.request_timeout))
             .ok_or_else(|| {
@@ -405,7 +425,8 @@ impl Client {
         let mut hops = 0_usize;
 
         loop {
-            let response = self.execute_once(&method, &url, &headers, &mut body, deadline)?;
+            let response =
+                self.execute_once(&method, &url, &headers, &mut body, deadline, trace)?;
             let Some(max_hops) = policy.max_hops() else {
                 return Ok(response);
             };
@@ -463,6 +484,12 @@ impl Client {
                     headers.remove(header);
                 }
             }
+            self.inner.observe(ClientEvent::RedirectFollowed {
+                request_id: trace.request_id,
+                status: response.status,
+                from: observed_url(&url),
+                to: observed_url(&target),
+            });
             if response.status == StatusCode::SEE_OTHER && method != Method::HEAD {
                 method = Method::GET;
                 body = RequestBody::Empty;
@@ -480,6 +507,19 @@ impl Client {
     }
 
     fn execute_streaming(&self, request: RequestBuilder) -> io::Result<StreamingResponse> {
+        let trace = self.begin_request(&request.method, &request.url);
+        let result = self.execute_streaming_inner(request, trace);
+        if let Err(error) = &result {
+            self.observe_failure(&trace, error);
+        }
+        result
+    }
+
+    fn execute_streaming_inner(
+        &self,
+        request: RequestBuilder,
+        trace: RequestTrace,
+    ) -> io::Result<StreamingResponse> {
         if self.inner.config.redirect_policy != RedirectPolicy::None {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -498,6 +538,7 @@ impl Client {
             &request.headers,
             &mut body,
             deadline,
+            &trace,
         )
     }
 
@@ -508,18 +549,25 @@ impl Client {
         headers: &HeaderMap,
         body: &mut RequestBody,
         deadline: Instant,
+        trace: &RequestTrace,
     ) -> io::Result<BufferedResponse> {
         validate_body_method(method, body)?;
         let key = OriginKey::from_url(url, self.inner.tls_profile)?;
         let mut stale_retry_available = method_is_idempotent(method) && body.is_replayable();
         loop {
-            let mut lease = self.checkout(&key, deadline)?;
+            let mut lease = self.checkout(&key, deadline, trace)?;
             let reused_idle_connection = lease.reused_idle_connection;
             let result = (|| {
                 let mut response =
                     self.send_on_lease(&mut lease, method, url, headers, body, deadline)?;
 
                 let status = response.status();
+                self.inner.observe(ClientEvent::ResponseHeaders {
+                    request_id: trace.request_id,
+                    origin: observed_url(url),
+                    status,
+                    elapsed: trace.started.elapsed(),
+                });
                 let version = response.version();
                 let response_headers = response.headers().clone();
                 let reusable =
@@ -577,6 +625,10 @@ impl Client {
                         .stats
                         .stale_retries
                         .fetch_add(1, Ordering::Relaxed);
+                    self.inner.observe(ClientEvent::StaleConnectionRetried {
+                        request_id: trace.request_id,
+                        origin: observed_url(url),
+                    });
                     drop(lease);
                     let _ = remaining(deadline)?;
                 }
@@ -595,16 +647,23 @@ impl Client {
         headers: &HeaderMap,
         body: &mut RequestBody,
         deadline: Instant,
+        trace: &RequestTrace,
     ) -> io::Result<StreamingResponse> {
         validate_body_method(method, body)?;
         let key = OriginKey::from_url(url, self.inner.tls_profile)?;
         let mut stale_retry_available = method_is_idempotent(method) && body.is_replayable();
         loop {
-            let mut lease = self.checkout(&key, deadline)?;
+            let mut lease = self.checkout(&key, deadline, trace)?;
             let reused_idle_connection = lease.reused_idle_connection;
             match self.send_on_lease(&mut lease, method, url, headers, body, deadline) {
                 Ok(response) => {
                     let status = response.status();
+                    self.inner.observe(ClientEvent::ResponseHeaders {
+                        request_id: trace.request_id,
+                        origin: observed_url(url),
+                        status,
+                        elapsed: trace.started.elapsed(),
+                    });
                     let version = response.version();
                     let response_headers = response.headers().clone();
                     let reusable =
@@ -619,6 +678,9 @@ impl Client {
                         version,
                         headers: response_headers,
                         final_url: url.clone(),
+                        inner: Arc::clone(&self.inner),
+                        trace: *trace,
+                        terminal_observed: false,
                     };
                     if streaming
                         .response
@@ -639,6 +701,10 @@ impl Client {
                         .stats
                         .stale_retries
                         .fetch_add(1, Ordering::Relaxed);
+                    self.inner.observe(ClientEvent::StaleConnectionRetried {
+                        request_id: trace.request_id,
+                        origin: observed_url(url),
+                    });
                     drop(lease);
                     let _ = remaining(deadline)?;
                 }
@@ -720,7 +786,33 @@ impl Client {
         }
     }
 
-    fn checkout(&self, key: &OriginKey, deadline: Instant) -> io::Result<PoolLease> {
+    fn begin_request(&self, method: &Method, url: &Url) -> RequestTrace {
+        let trace = RequestTrace {
+            request_id: self.inner.next_request_id.fetch_add(1, Ordering::Relaxed),
+            started: Instant::now(),
+        };
+        self.inner.observe(ClientEvent::RequestStarted {
+            request_id: trace.request_id,
+            method,
+            origin: observed_url(url),
+        });
+        trace
+    }
+
+    fn observe_failure(&self, trace: &RequestTrace, error: &io::Error) {
+        self.inner.observe(ClientEvent::RequestFailed {
+            request_id: trace.request_id,
+            error: ClientErrorKind::classify(error),
+            total_duration: trace.started.elapsed(),
+        });
+    }
+
+    fn checkout(
+        &self,
+        key: &OriginKey,
+        deadline: Instant,
+        trace: &RequestTrace,
+    ) -> io::Result<PoolLease> {
         loop {
             let now = Instant::now();
             let mut state = self
@@ -739,11 +831,18 @@ impl Client {
                         .stats
                         .connections_reused
                         .fetch_add(1, Ordering::Relaxed);
-                    return Ok(PoolLease::with_connection(
+                    let lease = PoolLease::with_connection(
                         Arc::clone(&self.inner),
                         key.clone(),
                         connection,
-                    ));
+                        trace.request_id,
+                    );
+                    drop(state);
+                    self.inner.observe(ClientEvent::ConnectionReused {
+                        request_id: trace.request_id,
+                        origin: observed_key(key),
+                    });
+                    return Ok(lease);
                 }
             }
             let per_origin = state.per_origin.get(key).copied().unwrap_or(0);
@@ -754,20 +853,29 @@ impl Client {
                 *state.per_origin.entry(key.clone()).or_default() += 1;
                 drop(state);
 
-                let mut lease = PoolLease::reserved(Arc::clone(&self.inner), key.clone());
+                let mut lease =
+                    PoolLease::reserved(Arc::clone(&self.inner), key.clone(), trace.request_id);
 
                 let connect_budget = self.inner.config.connect_timeout.min(remaining(deadline)?);
                 let connect_deadline =
                     Instant::now().checked_add(connect_budget).ok_or_else(|| {
                         io::Error::new(io::ErrorKind::InvalidInput, "connect timeout overflow")
                     })?;
-                let addresses = self.inner.resolver.resolve(&key.host, key.port)?;
-                if addresses.is_empty() {
-                    return Err(io::Error::new(
-                        io::ErrorKind::AddrNotAvailable,
-                        "resolver returned no addresses",
-                    ));
-                }
+                let dns_started = Instant::now();
+                let resolution = self.inner.resolver.resolve_with_deadline(
+                    &key.host,
+                    key.port,
+                    connect_deadline,
+                );
+                self.inner.observe(ClientEvent::DnsCompleted {
+                    request_id: trace.request_id,
+                    origin: observed_key(key),
+                    duration: dns_started.elapsed(),
+                    address_count: resolution.as_ref().map_or(0, |value| value.addresses.len()),
+                    source: resolution.as_ref().ok().map(|value| value.source),
+                    error: resolution.as_ref().err().map(ClientErrorKind::classify),
+                });
+                let addresses = resolution?.addresses;
                 let timeout = connect_deadline
                     .checked_duration_since(Instant::now())
                     .ok_or_else(|| {
@@ -777,12 +885,21 @@ impl Client {
                         )
                     })?;
                 let origin = key.connect_url();
+                let connect_started = Instant::now();
                 let client = HttpClient::from_url_with_resolved_options(
                     &origin,
                     Arc::clone(&self.inner.tls_config),
                     timeout,
                     &addresses,
-                )?;
+                );
+                self.inner.observe(ClientEvent::ConnectionCompleted {
+                    request_id: trace.request_id,
+                    origin: observed_key(key),
+                    duration: connect_started.elapsed(),
+                    tls: key.scheme == "https",
+                    error: client.as_ref().err().map(ClientErrorKind::classify),
+                });
+                let client = client?;
                 lease.connection = Some(PooledConnection {
                     client,
                     created: Instant::now(),
@@ -797,11 +914,19 @@ impl Client {
 
             let wait = remaining(deadline)?;
             self.inner.stats.pool_waits.fetch_add(1, Ordering::Relaxed);
-            let (_state, timeout) = self
+            let wait_started = Instant::now();
+            let (state_after_wait, timeout) = self
                 .inner
                 .available
                 .wait_timeout(state, wait)
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
+            drop(state_after_wait);
+            self.inner.observe(ClientEvent::PoolWaited {
+                request_id: trace.request_id,
+                origin: observed_key(key),
+                duration: wait_started.elapsed(),
+                timed_out: timeout.timed_out(),
+            });
             if timeout.timed_out() {
                 return Err(io::Error::new(
                     io::ErrorKind::TimedOut,
@@ -989,6 +1114,9 @@ pub struct StreamingResponse {
     version: Version,
     headers: HeaderMap,
     final_url: Url,
+    inner: Arc<ClientInner>,
+    trace: RequestTrace,
+    terminal_observed: bool,
 }
 
 impl fmt::Debug for StreamingResponse {
@@ -1028,14 +1156,47 @@ impl StreamingResponse {
                 lease.checkin();
             }
         }
+        if !self.terminal_observed {
+            self.inner.observe(ClientEvent::RequestCompleted {
+                request_id: self.trace.request_id,
+                status: self.status,
+                total_duration: self.trace.started.elapsed(),
+            });
+            self.terminal_observed = true;
+        }
     }
 
-    fn discard(&mut self) {
+    fn discard_connection(&mut self) {
         if let Some(response) = self.response.as_mut() {
             response.abandon_body();
         }
         drop(self.response.take());
         drop(self.lease.take());
+    }
+
+    fn fail(&mut self, error: &io::Error) {
+        self.discard_connection();
+        if !self.terminal_observed {
+            self.inner.observe(ClientEvent::RequestFailed {
+                request_id: self.trace.request_id,
+                error: ClientErrorKind::classify(error),
+                total_duration: self.trace.started.elapsed(),
+            });
+            self.terminal_observed = true;
+        }
+    }
+
+    fn abandon(&mut self) {
+        let incomplete = self.response.is_some();
+        self.discard_connection();
+        if incomplete && !self.terminal_observed {
+            self.inner.observe(ClientEvent::RequestAbandoned {
+                request_id: self.trace.request_id,
+                status: self.status,
+                total_duration: self.trace.started.elapsed(),
+            });
+            self.terminal_observed = true;
+        }
     }
 }
 
@@ -1047,7 +1208,7 @@ impl Read for StreamingResponse {
         let timeout = match remaining(self.deadline) {
             Ok(remaining) => self.io_timeout.min(remaining),
             Err(error) => {
-                self.discard();
+                self.fail(&error);
                 return Err(error);
             }
         };
@@ -1055,7 +1216,7 @@ impl Read for StreamingResponse {
             return Ok(0);
         };
         if let Err(error) = response.set_timeout(Some(timeout)) {
-            self.discard();
+            self.fail(&error);
             return Err(error);
         }
         match response.read(buffer) {
@@ -1067,7 +1228,7 @@ impl Read for StreamingResponse {
                 Ok(read)
             }
             Err(error) => {
-                self.discard();
+                self.fail(&error);
                 Err(error)
             }
         }
@@ -1076,7 +1237,7 @@ impl Read for StreamingResponse {
 
 impl Drop for StreamingResponse {
     fn drop(&mut self) {
-        self.discard();
+        self.abandon();
     }
 }
 
@@ -1085,9 +1246,19 @@ struct ClientInner {
     tls_config: Arc<ClientConfig>,
     tls_profile: usize,
     resolver: Arc<dyn Resolver>,
+    observer: Option<Arc<dyn ClientObserver>>,
     pool: Mutex<PoolState>,
     available: Condvar,
     stats: ClientStatsInner,
+    next_request_id: AtomicU64,
+}
+
+impl ClientInner {
+    fn observe(&self, event: ClientEvent<'_>) {
+        if let Some(observer) = &self.observer {
+            observer.observe(event);
+        }
+    }
 }
 
 struct ClientConfigValues {
@@ -1187,16 +1358,18 @@ struct PooledConnection {
 struct PoolLease {
     inner: Arc<ClientInner>,
     key: OriginKey,
+    request_id: u64,
     connection: Option<PooledConnection>,
     accounted: bool,
     reused_idle_connection: bool,
 }
 
 impl PoolLease {
-    fn reserved(inner: Arc<ClientInner>, key: OriginKey) -> Self {
+    fn reserved(inner: Arc<ClientInner>, key: OriginKey, request_id: u64) -> Self {
         Self {
             inner,
             key,
+            request_id,
             connection: None,
             accounted: true,
             reused_idle_connection: false,
@@ -1207,10 +1380,12 @@ impl PoolLease {
         inner: Arc<ClientInner>,
         key: OriginKey,
         connection: PooledConnection,
+        request_id: u64,
     ) -> Self {
         Self {
             inner,
             key,
+            request_id,
             connection: Some(connection),
             accounted: true,
             reused_idle_connection: true,
@@ -1256,7 +1431,8 @@ impl Drop for PoolLease {
         if !self.accounted {
             return;
         }
-        if self.connection.is_some() {
+        let discarded = self.connection.is_some();
+        if discarded {
             self.inner
                 .stats
                 .connections_discarded
@@ -1277,6 +1453,12 @@ impl Drop for PoolLease {
         self.accounted = false;
         drop(state);
         self.inner.available.notify_one();
+        if discarded {
+            self.inner.observe(ClientEvent::ConnectionDiscarded {
+                request_id: self.request_id,
+                origin: observed_key(&self.key),
+            });
+        }
     }
 }
 
@@ -1321,6 +1503,22 @@ fn normalized_url(url: &Url) -> String {
     let mut normalized = url.clone();
     normalized.set_fragment(None);
     normalized.to_string()
+}
+
+fn observed_url(url: &Url) -> ObservedOrigin<'_> {
+    ObservedOrigin {
+        scheme: url.scheme(),
+        host: url.host_str().unwrap_or_default(),
+        port: url.port_or_known_default().unwrap_or_default(),
+    }
+}
+
+fn observed_key(key: &OriginKey) -> ObservedOrigin<'_> {
+    ObservedOrigin {
+        scheme: &key.scheme,
+        host: &key.host,
+        port: key.port,
+    }
 }
 
 fn same_origin(left: &Url, right: &Url) -> bool {
@@ -1446,8 +1644,10 @@ fn remaining(deadline: Instant) -> io::Result<Duration> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::client::ServiceResolver;
     use std::io::{Read, Write};
-    use std::net::{TcpListener, TcpStream};
+    use std::net::{SocketAddr, TcpListener};
+    use std::sync::Mutex as StdMutex;
     use std::thread;
 
     struct StaticResolver(SocketAddr);
@@ -1458,7 +1658,74 @@ mod tests {
         }
     }
 
-    fn read_head(stream: &mut TcpStream) -> String {
+    #[derive(Default)]
+    struct RecordingObserver(StdMutex<Vec<String>>);
+
+    impl RecordingObserver {
+        fn events(&self) -> Vec<String> {
+            self.0.lock().unwrap().clone()
+        }
+    }
+
+    impl ClientObserver for RecordingObserver {
+        fn observe(&self, event: ClientEvent<'_>) {
+            let value = match event {
+                ClientEvent::RequestStarted {
+                    request_id,
+                    method,
+                    origin,
+                } => format!(
+                    "start:{request_id}:{method}:{}://{}:{}",
+                    origin.scheme, origin.host, origin.port
+                ),
+                ClientEvent::PoolWaited {
+                    request_id,
+                    timed_out,
+                    ..
+                } => format!("wait:{request_id}:{timed_out}"),
+                ClientEvent::DnsCompleted {
+                    request_id,
+                    address_count,
+                    source,
+                    error,
+                    ..
+                } => format!("dns:{request_id}:{address_count}:{source:?}:{error:?}"),
+                ClientEvent::ConnectionCompleted {
+                    request_id,
+                    tls,
+                    error,
+                    ..
+                } => format!("connect:{request_id}:{tls}:{error:?}"),
+                ClientEvent::ConnectionReused { request_id, .. } => {
+                    format!("reuse:{request_id}")
+                }
+                ClientEvent::ConnectionDiscarded { request_id, .. } => {
+                    format!("discard:{request_id}")
+                }
+                ClientEvent::ResponseHeaders {
+                    request_id, status, ..
+                } => format!("headers:{request_id}:{}", status.as_u16()),
+                ClientEvent::RedirectFollowed {
+                    request_id, status, ..
+                } => format!("redirect:{request_id}:{}", status.as_u16()),
+                ClientEvent::StaleConnectionRetried { request_id, .. } => {
+                    format!("retry:{request_id}")
+                }
+                ClientEvent::RequestCompleted {
+                    request_id, status, ..
+                } => format!("complete:{request_id}:{}", status.as_u16()),
+                ClientEvent::RequestFailed {
+                    request_id, error, ..
+                } => format!("failed:{request_id}:{error:?}"),
+                ClientEvent::RequestAbandoned {
+                    request_id, status, ..
+                } => format!("abandoned:{request_id}:{}", status.as_u16()),
+            };
+            self.0.lock().unwrap().push(value);
+        }
+    }
+
+    fn read_head(stream: &mut impl Read) -> String {
         let mut request = Vec::new();
         let mut byte = [0_u8; 1];
         while !request.ends_with(b"\r\n\r\n") {
@@ -1604,6 +1871,113 @@ mod tests {
     }
 
     #[test]
+    fn service_resolver_preserves_logical_host_and_reports_source() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let request = read_head(&mut stream).to_ascii_lowercase();
+            assert!(request.contains("\r\nhost: identity.internal:"));
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok")
+                .unwrap();
+        });
+        let resolver = Arc::new(ServiceResolver::default());
+        let unavailable = SocketAddr::from(([127, 0, 0, 2], address.port()));
+        resolver
+            .update(
+                "identity.internal",
+                address.port(),
+                vec![unavailable, address],
+            )
+            .unwrap();
+        let observer = Arc::new(RecordingObserver::default());
+        let client = Client::builder()
+            .resolver(resolver)
+            .observer(observer.clone())
+            .build()
+            .unwrap();
+
+        assert_eq!(
+            client
+                .get(&format!(
+                    "http://identity.internal:{}/health",
+                    address.port()
+                ))
+                .unwrap()
+                .send()
+                .unwrap()
+                .body(),
+            b"ok"
+        );
+        server.join().unwrap();
+        assert!(observer
+            .events()
+            .iter()
+            .any(|event| event == "dns:1:2:Some(ServiceRegistry):None"));
+    }
+
+    #[test]
+    fn service_resolver_preserves_logical_tls_identity() {
+        use rcgen::{generate_simple_self_signed, CertifiedKey};
+        use rustls::pki_types::PrivatePkcs8KeyDer;
+        use rustls::{ClientConfig, RootCertStore, ServerConfig, ServerConnection, StreamOwned};
+
+        let CertifiedKey { cert, signing_key } =
+            generate_simple_self_signed(vec!["identity.internal".to_owned()]).unwrap();
+        let provider = Arc::new(rustls::crypto::ring::default_provider());
+        let server_config = ServerConfig::builder_with_provider(provider.clone())
+            .with_safe_default_protocol_versions()
+            .unwrap()
+            .with_no_client_auth()
+            .with_single_cert(
+                vec![cert.der().clone()],
+                PrivatePkcs8KeyDer::from(signing_key.serialize_der()).into(),
+            )
+            .unwrap();
+        let mut roots = RootCertStore::empty();
+        roots.add(cert.der().clone()).unwrap();
+        let client_config = ClientConfig::builder_with_provider(provider)
+            .with_safe_default_protocol_versions()
+            .unwrap()
+            .with_root_certificates(roots)
+            .with_no_client_auth();
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let connection = ServerConnection::new(Arc::new(server_config)).unwrap();
+            let mut tls = StreamOwned::new(connection, stream);
+            let request = read_head(&mut tls).to_ascii_lowercase();
+            assert!(request.contains("\r\nhost: identity.internal:"));
+            tls.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok")
+                .unwrap();
+            tls.flush().unwrap();
+        });
+        let resolver = Arc::new(ServiceResolver::default());
+        resolver
+            .update("identity.internal", address.port(), vec![address])
+            .unwrap();
+        let client = Client::builder()
+            .resolver(resolver)
+            .tls_config(Arc::new(client_config))
+            .build()
+            .unwrap();
+
+        let response = client
+            .get(&format!(
+                "https://identity.internal:{}/health",
+                address.port()
+            ))
+            .unwrap()
+            .send()
+            .unwrap();
+        assert_eq!(response.body(), b"ok");
+        server.join().unwrap();
+    }
+
+    #[test]
     fn resolver_time_counts_against_connect_deadline() {
         struct SlowResolver;
         impl Resolver for SlowResolver {
@@ -1655,6 +2029,55 @@ mod tests {
         assert_eq!(stats.connections_created, 1);
         assert_eq!(stats.connections_reused, 1);
         server.join().unwrap();
+    }
+
+    #[test]
+    fn observer_records_sanitized_new_and_reused_request_lifecycles() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            for _ in 0..2 {
+                let _ = read_head(&mut stream);
+                stream
+                    .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok")
+                    .unwrap();
+                stream.flush().unwrap();
+            }
+        });
+        let observer = Arc::new(RecordingObserver::default());
+        let client = Client::builder()
+            .observer(observer.clone())
+            .build()
+            .unwrap();
+
+        for path in ["one?token=do-not-observe", "two"] {
+            assert_eq!(
+                client
+                    .get(&format!("http://127.0.0.1:{port}/{path}"))
+                    .unwrap()
+                    .header(AUTHORIZATION, HeaderValue::from_static("Bearer secret"))
+                    .send()
+                    .unwrap()
+                    .body(),
+                b"ok"
+            );
+        }
+        server.join().unwrap();
+
+        let events = observer.events();
+        assert_eq!(events[0], format!("start:1:GET:http://127.0.0.1:{port}"));
+        assert!(events
+            .iter()
+            .any(|event| event == "dns:1:1:Some(Resolver):None"));
+        assert!(events.iter().any(|event| event == "connect:1:false:None"));
+        assert!(events.iter().any(|event| event == "complete:1:200"));
+        assert!(events.iter().any(|event| event == "reuse:2"));
+        assert!(events.iter().any(|event| event == "complete:2:200"));
+        let joined = events.join("|");
+        assert!(!joined.contains("do-not-observe"));
+        assert!(!joined.contains("Bearer"));
+        assert!(!joined.contains("secret"));
     }
 
     #[test]
@@ -1747,6 +2170,68 @@ mod tests {
     }
 
     #[test]
+    fn observer_marks_partial_streaming_response_abandoned() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let _ = read_head(&mut stream);
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 4\r\n\r\ndata")
+                .unwrap();
+        });
+        let observer = Arc::new(RecordingObserver::default());
+        let client = Client::builder()
+            .observer(observer.clone())
+            .build()
+            .unwrap();
+        let mut response = client
+            .get(&format!("http://127.0.0.1:{port}/stream"))
+            .unwrap()
+            .send_streaming()
+            .unwrap();
+        let mut byte = [0_u8; 1];
+        response.read_exact(&mut byte).unwrap();
+        drop(response);
+        server.join().unwrap();
+
+        let events = observer.events();
+        assert!(events.iter().any(|event| event == "discard:1"));
+        assert!(events.iter().any(|event| event == "abandoned:1:200"));
+    }
+
+    #[test]
+    fn observer_records_connection_failure_once() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        drop(listener);
+        let observer = Arc::new(RecordingObserver::default());
+        let client = Client::builder()
+            .resolver(Arc::new(StaticResolver(address)))
+            .observer(observer.clone())
+            .build()
+            .unwrap();
+
+        let error = client
+            .get(&format!("http://service.invalid:{}/", address.port()))
+            .unwrap()
+            .send()
+            .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::ConnectionRefused);
+        let events = observer.events();
+        assert!(events
+            .iter()
+            .any(|event| event == "connect:1:false:Some(Connection)"));
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| *event == "failed:1:Connection")
+                .count(),
+            1
+        );
+    }
+
+    #[test]
     fn streaming_response_rejects_implicit_redirect_following() {
         let client = test_client(RedirectPolicy::SameOrigin { max_hops: 1 });
         let error = client
@@ -1780,7 +2265,13 @@ mod tests {
                 .unwrap();
         });
 
-        let client = test_client(RedirectPolicy::None);
+        let observer = Arc::new(RecordingObserver::default());
+        let client = Client::builder()
+            .redirect_policy(RedirectPolicy::None)
+            .request_timeout(Duration::from_secs(2))
+            .observer(observer.clone())
+            .build()
+            .unwrap();
         assert_eq!(
             client
                 .get(&format!("http://127.0.0.1:{port}/first"))
@@ -1800,6 +2291,7 @@ mod tests {
             b"fresh"
         );
         assert_eq!(client.stats().stale_retries, 1);
+        assert!(observer.events().iter().any(|event| event == "retry:2"));
         server.join().unwrap();
     }
 
@@ -1857,10 +2349,12 @@ mod tests {
             }
         });
 
+        let observer = Arc::new(RecordingObserver::default());
         let client = Client::builder()
             .max_connections(1)
             .max_connections_per_origin(1)
             .request_timeout(Duration::from_secs(2))
+            .observer(observer.clone())
             .build()
             .unwrap();
         let first = client.clone();
@@ -1879,6 +2373,10 @@ mod tests {
         });
         assert_eq!(one.join().unwrap().unwrap().body(), b"ok");
         assert_eq!(two.join().unwrap().unwrap().body(), b"ok");
+        assert!(observer
+            .events()
+            .iter()
+            .any(|event| event.starts_with("wait:")));
         server.join().unwrap();
     }
 
@@ -1971,13 +2469,30 @@ mod tests {
                 .unwrap();
         });
 
-        let response = test_client(RedirectPolicy::SameOrigin { max_hops: 3 })
+        let observer = Arc::new(RecordingObserver::default());
+        let client = Client::builder()
+            .redirect_policy(RedirectPolicy::SameOrigin { max_hops: 3 })
+            .request_timeout(Duration::from_secs(2))
+            .observer(observer.clone())
+            .build()
+            .unwrap();
+        let response = client
             .get(&format!("http://127.0.0.1:{port}/start"))
             .unwrap()
             .send()
             .unwrap();
         assert_eq!(response.body(), b"done!");
         assert_eq!(response.final_url().path(), "/final");
+        let events = observer.events();
+        let redirect = events
+            .iter()
+            .position(|event| event == "redirect:1:302")
+            .unwrap();
+        let completed = events
+            .iter()
+            .position(|event| event == "complete:1:200")
+            .unwrap();
+        assert!(redirect < completed);
         server.join().unwrap();
     }
 

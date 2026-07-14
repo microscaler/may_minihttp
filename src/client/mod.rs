@@ -7,16 +7,23 @@ mod body;
 mod buffer;
 mod client_impl;
 mod multipart;
+mod observer;
 mod request;
+mod resolver;
 mod response;
 mod rich;
 mod shared;
 
 pub use client_impl::HttpClient;
 pub use multipart::MultipartForm;
+pub use observer::{ClientEvent, ClientObserver, ObservedOrigin};
 pub use request::Request;
+pub use resolver::{
+    CachingResolver, Resolution, ResolutionSource, Resolver, ResolverCacheConfig, ServiceResolver,
+    ServiceResolverConfig, SystemResolver,
+};
 pub use response::Response;
 pub use rich::{
     BufferedResponse, Client, ClientBuilder, ClientError, ClientErrorKind, ClientStats,
-    RedirectPolicy, RequestBuilder, Resolver, StreamingResponse, SystemResolver,
+    RedirectPolicy, RequestBuilder, StreamingResponse,
 };

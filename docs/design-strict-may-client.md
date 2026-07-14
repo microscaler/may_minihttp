@@ -17,8 +17,11 @@ runtime or hidden blocking worker pool.
    writes, and response reads occur after releasing it.
 6. Responses can stream. A connection is reusable only after its framing boundary is fully consumed;
    partial bodies are discarded without performing I/O from `Drop`.
-7. System DNS is an explicit possible blocking boundary. Strict deployments inject a cached or
-   may-aware `Resolver`; its elapsed time still consumes the connect deadline.
+7. System DNS is an explicit possible blocking boundary. Strict deployments inject a
+   push-updated `ServiceResolver`, or a `CachingResolver` around an application-owned may-aware
+   resolver. Cache waiters use a may condition variable and honour the connect deadline.
+8. Observer callbacks run synchronously after releasing pool and transport locks. Built-in events
+   contain origins and operational outcomes, never paths, queries, headers, or bodies.
 
 The `client` feature explicitly enables `may/io_timeout`; it must compile with the crate's default
 features disabled.
@@ -72,6 +75,26 @@ allowed when:
 
 Stale idle sockets may be replaced once for idempotent, replayable requests. They must never cause
 an automatic retry of a non-idempotent request after bytes may have reached the peer.
+
+### Resolution layer
+
+`SystemResolver` remains the compatibility default and may block in the operating-system resolver.
+`CachingResolver` bounds positive and negative TTLs, entries, and addresses; coalesces one cold
+lookup; rotates address order; and supports explicit invalidation. Its scheduler safety is inherited
+from the wrapped resolver. `ServiceResolver` is the strict request path: discovery code pushes
+bounded address sets into it, and requests perform no DNS network I/O. Both preserve the logical URL
+host for the HTTP `Host` header and rustls server name while connecting to the selected socket
+address.
+
+### Observation layer
+
+An optional `ClientObserver` receives request start, pool wait, resolution, connect/reuse, response,
+redirect/retry, and terminal outcome events. Early abandonment of a streaming response is reported.
+May cancellation currently unwinds through `Drop`, where calling arbitrary consumer code can
+re-enter may's cancellation machinery; a cancellation event is therefore deferred to the explicit
+cooperative mechanism in CA-03. Event origins contain only scheme, host, and effective port.
+Callback latency and panic policy belong to the consumer; callbacks cannot alter request control
+flow.
 
 ## Redirect policy
 
@@ -130,3 +153,12 @@ request readers are single-use and never retried.
 ### Dependency boundary
 
 The normal `client` and `json` feature graphs contain no Tokio, reqwest, hyper, or AWS-LC packages.
+
+### Resolution and observation
+
+- Positive/negative cache expiry and invalidation are deterministic under an injected instant.
+- Concurrent cold cache lookups are coalesced and a waiting coroutine honours its connect deadline.
+- Push-updated entries are bounded, replaceable, removable, and rotate their first address.
+- The logical `Host` is preserved when connecting to a registry-provided address.
+- New, reused, redirected, retried, failed, abandoned, buffered, and streaming request
+  lifecycles have deterministic observer tests with sanitized event payloads.

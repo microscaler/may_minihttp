@@ -81,9 +81,17 @@ assert!(response.status().is_success());
 ```
 
 The rich client also provides optional JSON helpers, bounded multipart preloading, single-use
-request readers, typed error classification, operational pool counters, and injectable DNS
-resolution. Multipart filesystem helpers are deliberately named `blocking_*` and must be called
-outside latency-sensitive may coroutines. Automatic stale-socket retry is limited to one attempt for
+request readers, typed error classification, operational pool counters, sanitized lifecycle
+observation, and injectable resolution. `ServiceResolver` is a bounded push-updated registry with
+no request-path DNS I/O. `CachingResolver` adds positive/negative TTLs, address rotation, and
+single-flight refresh to an application-owned resolver; wrapping the default `SystemResolver`
+reduces but does not eliminate its possible blocking DNS boundary. Observer events intentionally
+omit paths, query strings, headers, and bodies, and callbacks run outside pool and transport locks.
+May cancellation unwinds do not invoke observer callbacks; a safe cancellation event is deferred to
+the cooperative-cancellation API rather than calling consumer code from a cancellation `Drop`.
+
+Multipart filesystem helpers are deliberately named `blocking_*` and must be called outside
+latency-sensitive may coroutines. Automatic stale-socket retry is limited to one attempt for
 idempotent requests with replayable bodies.
 
 The normal client graph uses `may`, rustls, and the ring provider selected through rustls. It does
