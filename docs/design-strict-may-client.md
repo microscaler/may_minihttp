@@ -3,8 +3,8 @@
 ## Status
 
 Implemented direction, 2026-07-14. HTTPS, replay-aware requests, buffered and streaming responses,
-redirects, bounded pooling, and cancellation-safe leases follow this design without an async
-runtime or hidden blocking worker pool.
+redirects, bounded pooling, cancellation-safe leases, and cooperative cancellation follow this
+design without an async runtime or hidden blocking worker pool.
 
 ## Runtime invariants
 
@@ -90,11 +90,19 @@ address.
 
 An optional `ClientObserver` receives request start, pool wait, resolution, connect/reuse, response,
 redirect/retry, and terminal outcome events. Early abandonment of a streaming response is reported.
-May cancellation currently unwinds through `Drop`, where calling arbitrary consumer code can
-re-enter may's cancellation machinery; a cancellation event is therefore deferred to the explicit
-cooperative mechanism in CA-03. Event origins contain only scheme, host, and effective port.
-Callback latency and panic policy belong to the consumer; callbacks cannot alter request control
-flow.
+Explicit token cancellation emits from the parent after its request child has unwound. Direct unsafe
+coroutine cancellation invokes no observer from `Drop`. Event origins contain only scheme, host,
+and effective port. Callback latency and panic policy belong to the consumer; callbacks cannot
+alter request control flow.
+
+### Cancellation layer
+
+`CancellationToken` is cloneable, sticky, and idempotent. A token-bearing request uses may's scoped
+completion queue to race the request child against a may condition-variable wait. If cancellation
+wins, the scope cancels and joins the child before returning. Incomplete transports are discarded by
+RAII, and only then does the parent emit `RequestCancelled`. Streaming reads use the same race and
+discard their exclusive lease before returning the typed cancellation error. The no-token path does
+not allocate or spawn cancellation coroutines.
 
 ## Redirect policy
 
@@ -148,6 +156,8 @@ request readers are single-use and never retried.
 - Fully consumed persistent responses reuse a connection; close/error/incomplete responses do not.
 - Idle and lifetime expiry are deterministic under an injectable clock in unit tests.
 - Coroutine cancellation and partial streaming-response drop release capacity without drain I/O.
+- Cooperative cancellation is tested during resolution, connect, pool wait, buffered response wait,
+  and streaming reads; completion races have one terminal event.
 - A stale idle socket is retried once only for idempotent requests with replayable bodies.
 
 ### Dependency boundary

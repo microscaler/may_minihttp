@@ -5,6 +5,7 @@
 
 mod body;
 mod buffer;
+mod cancellation;
 mod client_impl;
 mod multipart;
 mod observer;
@@ -14,6 +15,7 @@ mod response;
 mod rich;
 mod shared;
 
+pub use cancellation::CancellationToken;
 pub use client_impl::HttpClient;
 pub use multipart::MultipartForm;
 pub use observer::{ClientEvent, ClientObserver, ObservedOrigin};

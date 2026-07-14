@@ -16,10 +16,18 @@ use may::sync::{Condvar, Mutex};
 use rustls::ClientConfig;
 use url::Url;
 
-use super::{ClientEvent, ClientObserver, ObservedOrigin, Resolver, SystemResolver};
+use super::cancellation::{cancelled_error, is_cancelled_error};
+use super::{
+    CancellationToken, ClientEvent, ClientObserver, ObservedOrigin, Resolver, SystemResolver,
+};
 use super::{HttpClient, MultipartForm};
 
 const DEFAULT_MAX_RESPONSE_BODY: usize = 8 * 1024 * 1024;
+
+#[cfg(test)]
+type TestConnector = dyn Fn(&str, Arc<ClientConfig>, Duration, &[std::net::SocketAddr]) -> io::Result<HttpClient>
+    + Send
+    + Sync;
 
 /// Policy governing whether HTTP redirects are followed.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -61,6 +69,8 @@ pub struct ClientBuilder {
     tls_config: Option<Arc<ClientConfig>>,
     resolver: Arc<dyn Resolver>,
     observer: Option<Arc<dyn ClientObserver>>,
+    #[cfg(test)]
+    connector: Option<Arc<TestConnector>>,
     sensitive_headers: HashSet<HeaderName>,
 }
 
@@ -83,6 +93,8 @@ impl Default for ClientBuilder {
             tls_config: None,
             resolver: Arc::new(SystemResolver),
             observer: None,
+            #[cfg(test)]
+            connector: None,
             sensitive_headers,
         }
     }
@@ -162,6 +174,12 @@ impl ClientBuilder {
         self
     }
 
+    #[cfg(test)]
+    fn test_connector(mut self, value: Arc<TestConnector>) -> Self {
+        self.connector = Some(value);
+        self
+    }
+
     /// Mark an additional header for removal before a cross-origin redirect.
     pub fn sensitive_header(mut self, value: HeaderName) -> Self {
         self.sensitive_headers.insert(value);
@@ -212,6 +230,8 @@ impl ClientBuilder {
                 tls_profile,
                 resolver: self.resolver,
                 observer: self.observer,
+                #[cfg(test)]
+                connector: self.connector,
                 pool: Mutex::new(PoolState::default()),
                 available: Condvar::new(),
                 stats: ClientStatsInner::default(),
@@ -240,6 +260,7 @@ pub struct ClientStats {
 /// Stable high-level classification for client failures.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ClientErrorKind {
+    Cancelled,
     InvalidRequest,
     Dns,
     Connection,
@@ -256,6 +277,7 @@ impl ClientErrorKind {
     fn classify(source: &io::Error) -> Self {
         let message = source.to_string().to_ascii_lowercase();
         match source.kind() {
+            _ if is_cancelled_error(source) => Self::Cancelled,
             _ if message.contains("body is not replayable") => Self::BodyNotReplayable,
             io::ErrorKind::InvalidInput => Self::InvalidRequest,
             io::ErrorKind::AddrNotAvailable => Self::Dns,
@@ -357,6 +379,32 @@ struct RequestTrace {
     started: Instant,
 }
 
+struct StreamingExecution<'a> {
+    deadline: Instant,
+    trace: &'a RequestTrace,
+    cancellation: Option<CancellationToken>,
+}
+
+fn run_cancellable<T>(
+    token: &CancellationToken,
+    operation: impl FnOnce() -> io::Result<T> + Send,
+) -> io::Result<T>
+where
+    T: Send,
+{
+    token.check()?;
+    let mut result = None;
+    let selected = may::select!(
+        value = operation() => result = Some(value),
+        _ = token.wait() => {}
+    );
+    if selected == 1 {
+        Err(cancelled_error())
+    } else {
+        result.expect("completed cancellation race must retain the operation result")
+    }
+}
+
 impl Client {
     pub fn builder() -> ClientBuilder {
         ClientBuilder::new()
@@ -375,6 +423,7 @@ impl Client {
             headers: HeaderMap::new(),
             body: RequestBody::Empty,
             timeout: None,
+            cancellation: None,
         })
     }
 
@@ -393,7 +442,11 @@ impl Client {
 
     fn execute(&self, request: RequestBuilder) -> io::Result<BufferedResponse> {
         let trace = self.begin_request(&request.method, &request.url);
-        let result = self.execute_buffered(request, &trace);
+        let cancellation = request.cancellation.clone();
+        let result = match cancellation {
+            Some(token) => run_cancellable(&token, || self.execute_buffered(request, &trace)),
+            None => self.execute_buffered(request, &trace),
+        };
         match &result {
             Ok(response) => self.inner.observe(ClientEvent::RequestCompleted {
                 request_id: trace.request_id,
@@ -508,7 +561,11 @@ impl Client {
 
     fn execute_streaming(&self, request: RequestBuilder) -> io::Result<StreamingResponse> {
         let trace = self.begin_request(&request.method, &request.url);
-        let result = self.execute_streaming_inner(request, trace);
+        let cancellation = request.cancellation.clone();
+        let result = match cancellation {
+            Some(token) => run_cancellable(&token, || self.execute_streaming_inner(request, trace)),
+            None => self.execute_streaming_inner(request, trace),
+        };
         if let Err(error) = &result {
             self.observe_failure(&trace, error);
         }
@@ -531,14 +588,18 @@ impl Client {
             .ok_or_else(|| {
                 io::Error::new(io::ErrorKind::InvalidInput, "request timeout overflow")
             })?;
+        let cancellation = request.cancellation.clone();
         let mut body = request.body;
         self.execute_streaming_once(
             &request.method,
             &request.url,
             &request.headers,
             &mut body,
-            deadline,
-            &trace,
+            StreamingExecution {
+                deadline,
+                trace: &trace,
+                cancellation,
+            },
         )
     }
 
@@ -646,9 +707,13 @@ impl Client {
         url: &Url,
         headers: &HeaderMap,
         body: &mut RequestBody,
-        deadline: Instant,
-        trace: &RequestTrace,
+        execution: StreamingExecution<'_>,
     ) -> io::Result<StreamingResponse> {
+        let StreamingExecution {
+            deadline,
+            trace,
+            cancellation,
+        } = execution;
         validate_body_method(method, body)?;
         let key = OriginKey::from_url(url, self.inner.tls_profile)?;
         let mut stale_retry_available = method_is_idempotent(method) && body.is_replayable();
@@ -680,6 +745,7 @@ impl Client {
                         final_url: url.clone(),
                         inner: Arc::clone(&self.inner),
                         trace: *trace,
+                        cancellation,
                         terminal_observed: false,
                     };
                     if streaming
@@ -800,11 +866,19 @@ impl Client {
     }
 
     fn observe_failure(&self, trace: &RequestTrace, error: &io::Error) {
-        self.inner.observe(ClientEvent::RequestFailed {
-            request_id: trace.request_id,
-            error: ClientErrorKind::classify(error),
-            total_duration: trace.started.elapsed(),
-        });
+        let error = ClientErrorKind::classify(error);
+        if error == ClientErrorKind::Cancelled {
+            self.inner.observe(ClientEvent::RequestCancelled {
+                request_id: trace.request_id,
+                total_duration: trace.started.elapsed(),
+            });
+        } else {
+            self.inner.observe(ClientEvent::RequestFailed {
+                request_id: trace.request_id,
+                error,
+                total_duration: trace.started.elapsed(),
+            });
+        }
     }
 
     fn checkout(
@@ -886,7 +960,7 @@ impl Client {
                     })?;
                 let origin = key.connect_url();
                 let connect_started = Instant::now();
-                let client = HttpClient::from_url_with_resolved_options(
+                let client = self.inner.connect(
                     &origin,
                     Arc::clone(&self.inner.tls_config),
                     timeout,
@@ -945,6 +1019,7 @@ pub struct RequestBuilder {
     headers: HeaderMap,
     body: RequestBody,
     timeout: Option<Duration>,
+    cancellation: Option<CancellationToken>,
 }
 
 impl RequestBuilder {
@@ -1009,6 +1084,12 @@ impl RequestBuilder {
 
     pub fn timeout(mut self, value: Duration) -> Self {
         self.timeout = Some(value);
+        self
+    }
+
+    /// Cancel this request cooperatively when `token` is cancelled.
+    pub fn cancellation_token(mut self, token: CancellationToken) -> Self {
+        self.cancellation = Some(token);
         self
     }
 
@@ -1116,6 +1197,7 @@ pub struct StreamingResponse {
     final_url: Url,
     inner: Arc<ClientInner>,
     trace: RequestTrace,
+    cancellation: Option<CancellationToken>,
     terminal_observed: bool,
 }
 
@@ -1186,6 +1268,18 @@ impl StreamingResponse {
         }
     }
 
+    fn cancel(&mut self) -> io::Error {
+        self.discard_connection();
+        if !self.terminal_observed {
+            self.inner.observe(ClientEvent::RequestCancelled {
+                request_id: self.trace.request_id,
+                total_duration: self.trace.started.elapsed(),
+            });
+            self.terminal_observed = true;
+        }
+        cancelled_error()
+    }
+
     fn abandon(&mut self) {
         let incomplete = self.response.is_some();
         self.discard_connection();
@@ -1198,31 +1292,24 @@ impl StreamingResponse {
             self.terminal_observed = true;
         }
     }
-}
 
-impl Read for StreamingResponse {
-    fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
-        if buffer.is_empty() {
-            return Ok(0);
-        }
-        let timeout = match remaining(self.deadline) {
-            Ok(remaining) => self.io_timeout.min(remaining),
-            Err(error) => {
-                self.fail(&error);
-                return Err(error);
-            }
-        };
+    fn read_transport(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+        let timeout = remaining(self.deadline)?.min(self.io_timeout);
         let Some(response) = self.response.as_mut() else {
             return Ok(0);
         };
-        if let Err(error) = response.set_timeout(Some(timeout)) {
-            self.fail(&error);
-            return Err(error);
-        }
-        match response.read(buffer) {
+        response.set_timeout(Some(timeout))?;
+        response.read(buffer)
+    }
+
+    fn finish_read(&mut self, result: io::Result<usize>) -> io::Result<usize> {
+        match result {
             Ok(read) => {
-                let complete = response.body_complete();
-                if complete {
+                if self
+                    .response
+                    .as_ref()
+                    .is_some_and(super::Response::body_complete)
+                {
                     self.complete();
                 }
                 Ok(read)
@@ -1235,9 +1322,30 @@ impl Read for StreamingResponse {
     }
 }
 
+impl Read for StreamingResponse {
+    fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+        if buffer.is_empty() || self.response.is_none() {
+            return Ok(0);
+        }
+        let cancellation = self.cancellation.clone();
+        let result = match cancellation {
+            Some(token) => run_cancellable(&token, || self.read_transport(buffer)),
+            None => self.read_transport(buffer),
+        };
+        if result.as_ref().err().is_some_and(is_cancelled_error) {
+            return Err(self.cancel());
+        }
+        self.finish_read(result)
+    }
+}
+
 impl Drop for StreamingResponse {
     fn drop(&mut self) {
-        self.abandon();
+        if std::thread::panicking() {
+            self.discard_connection();
+        } else {
+            self.abandon();
+        }
     }
 }
 
@@ -1247,6 +1355,8 @@ struct ClientInner {
     tls_profile: usize,
     resolver: Arc<dyn Resolver>,
     observer: Option<Arc<dyn ClientObserver>>,
+    #[cfg(test)]
+    connector: Option<Arc<TestConnector>>,
     pool: Mutex<PoolState>,
     available: Condvar,
     stats: ClientStatsInner,
@@ -1258,6 +1368,20 @@ impl ClientInner {
         if let Some(observer) = &self.observer {
             observer.observe(event);
         }
+    }
+
+    fn connect(
+        &self,
+        origin: &str,
+        tls_config: Arc<ClientConfig>,
+        timeout: Duration,
+        addresses: &[std::net::SocketAddr],
+    ) -> io::Result<HttpClient> {
+        #[cfg(test)]
+        if let Some(connector) = &self.connector {
+            return connector(origin, tls_config, timeout, addresses);
+        }
+        HttpClient::from_url_with_resolved_options(origin, tls_config, timeout, addresses)
     }
 }
 
@@ -1453,7 +1577,7 @@ impl Drop for PoolLease {
         self.accounted = false;
         drop(state);
         self.inner.available.notify_one();
-        if discarded {
+        if discarded && !std::thread::panicking() {
             self.inner.observe(ClientEvent::ConnectionDiscarded {
                 request_id: self.request_id,
                 origin: observed_key(&self.key),
@@ -1717,6 +1841,9 @@ mod tests {
                 ClientEvent::RequestFailed {
                     request_id, error, ..
                 } => format!("failed:{request_id}:{error:?}"),
+                ClientEvent::RequestCancelled { request_id, .. } => {
+                    format!("cancelled:{request_id}")
+                }
                 ClientEvent::RequestAbandoned {
                     request_id, status, ..
                 } => format!("abandoned:{request_id}:{}", status.as_u16()),
@@ -2201,6 +2328,124 @@ mod tests {
     }
 
     #[test]
+    fn cancellation_interrupts_streaming_read_without_abandonment_event() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let (partial_tx, partial_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let server = thread::spawn(move || {
+            let (mut cancelled, _) = listener.accept().unwrap();
+            assert!(read_head(&mut cancelled).starts_with("GET /stream HTTP/1.1\r\n"));
+            cancelled
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 4\r\n\r\na")
+                .unwrap();
+            cancelled.flush().unwrap();
+            partial_tx.send(()).unwrap();
+            release_rx.recv().unwrap();
+            let _ = cancelled.write_all(b"bcd");
+            drop(cancelled);
+
+            let (mut replacement, _) = listener.accept().unwrap();
+            assert!(read_head(&mut replacement).starts_with("GET /fresh HTTP/1.1\r\n"));
+            replacement
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\nConnection: close\r\n\r\nfresh",
+                )
+                .unwrap();
+        });
+        let observer = Arc::new(RecordingObserver::default());
+        let client = Client::builder()
+            .max_connections(1)
+            .max_connections_per_origin(1)
+            .request_timeout(Duration::from_secs(2))
+            .observer(observer.clone())
+            .build()
+            .unwrap();
+        let token = CancellationToken::new();
+        let mut response = client
+            .get(&format!("http://127.0.0.1:{port}/stream"))
+            .unwrap()
+            .cancellation_token(token.clone())
+            .send_streaming()
+            .unwrap();
+        partial_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        let mut first = [0_u8; 1];
+        response.read_exact(&mut first).unwrap();
+        assert_eq!(&first, b"a");
+
+        let blocked_read = may::go!(move || {
+            let mut next = [0_u8; 1];
+            let result = response.read(&mut next);
+            (response, result)
+        });
+        thread::sleep(Duration::from_millis(20));
+        assert!(token.cancel());
+        let (response, error) = blocked_read.join().unwrap();
+        let error = error.unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::Interrupted);
+        drop(response);
+        assert_eq!(client.stats().connections_discarded, 1);
+
+        release_tx.send(()).unwrap();
+        assert_eq!(
+            client
+                .get(&format!("http://127.0.0.1:{port}/fresh"))
+                .unwrap()
+                .send()
+                .unwrap()
+                .body(),
+            b"fresh"
+        );
+        server.join().unwrap();
+        let events = observer.events();
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| *event == "cancelled:1")
+                .count(),
+            1
+        );
+        assert!(events.iter().any(|event| event == "discard:1"));
+        assert!(!events.iter().any(|event| event == "abandoned:1:200"));
+    }
+
+    #[test]
+    fn cancellation_after_stream_completion_preserves_eof_outcome() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let _ = read_head(&mut stream);
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok")
+                .unwrap();
+        });
+        let observer = Arc::new(RecordingObserver::default());
+        let client = Client::builder()
+            .observer(observer.clone())
+            .build()
+            .unwrap();
+        let token = CancellationToken::new();
+        let mut response = client
+            .get(&format!("http://127.0.0.1:{port}/"))
+            .unwrap()
+            .cancellation_token(token.clone())
+            .send_streaming()
+            .unwrap();
+        let mut body = Vec::new();
+        response.read_to_end(&mut body).unwrap();
+        assert_eq!(body, b"ok");
+        assert!(token.cancel());
+        let mut byte = [0_u8; 1];
+        assert_eq!(response.read(&mut byte).unwrap(), 0);
+        drop(response);
+        server.join().unwrap();
+        let events = observer.events();
+        assert!(events.iter().any(|event| event == "complete:1:200"));
+        assert!(!events.iter().any(|event| event == "cancelled:1"));
+    }
+
+    #[test]
     fn observer_records_connection_failure_once() {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
@@ -2226,6 +2471,271 @@ mod tests {
             events
                 .iter()
                 .filter(|event| *event == "failed:1:Connection")
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn pre_cancelled_request_has_typed_error_and_one_terminal_event() {
+        let token = CancellationToken::new();
+        assert!(token.cancel());
+        let observer = Arc::new(RecordingObserver::default());
+        let client = Client::builder()
+            .observer(observer.clone())
+            .build()
+            .unwrap();
+
+        let error = client
+            .get("http://127.0.0.1:9/never-connect")
+            .unwrap()
+            .cancellation_token(token)
+            .send_typed()
+            .unwrap_err();
+        assert_eq!(error.kind(), ClientErrorKind::Cancelled);
+        assert_eq!(error.into_io_error().kind(), io::ErrorKind::Interrupted);
+        let events = observer.events();
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event.starts_with("cancelled:"))
+                .count(),
+            1
+        );
+        assert!(!events.iter().any(|event| event.starts_with("failed:")));
+        assert!(!events.iter().any(|event| event.starts_with("connect:")));
+    }
+
+    #[test]
+    fn cancellation_interrupts_may_aware_resolution() {
+        struct SleepingResolver(std::sync::mpsc::Sender<()>);
+
+        impl Resolver for SleepingResolver {
+            fn resolve(&self, _host: &str, port: u16) -> io::Result<Vec<SocketAddr>> {
+                self.0.send(()).unwrap();
+                may::coroutine::sleep(Duration::from_secs(5));
+                Ok(vec![SocketAddr::from(([127, 0, 0, 1], port))])
+            }
+        }
+
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let token = CancellationToken::new();
+        let request_token = token.clone();
+        let client = Client::builder()
+            .resolver(Arc::new(SleepingResolver(started_tx)))
+            .connect_timeout(Duration::from_secs(10))
+            .build()
+            .unwrap();
+        let request = may::go!(move || {
+            client
+                .get("http://resolution.internal:8080/")
+                .unwrap()
+                .cancellation_token(request_token)
+                .send_typed()
+        });
+        started_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+
+        let cancelled_at = Instant::now();
+        assert!(token.cancel());
+        let error = request.join().unwrap().unwrap_err();
+        assert_eq!(error.kind(), ClientErrorKind::Cancelled);
+        assert!(cancelled_at.elapsed() < Duration::from_millis(500));
+    }
+
+    #[test]
+    fn cancellation_interrupts_connect_and_releases_reservation() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            assert!(read_head(&mut stream).starts_with("GET /after HTTP/1.1\r\n"));
+            stream
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\nConnection: close\r\n\r\nafter",
+                )
+                .unwrap();
+        });
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let connector_calls = calls.clone();
+        let connector = Arc::new(
+            move |origin: &str,
+                  tls_config: Arc<ClientConfig>,
+                  timeout: Duration,
+                  addresses: &[SocketAddr]| {
+                if connector_calls.fetch_add(1, Ordering::Relaxed) == 0 {
+                    started_tx.send(()).unwrap();
+                    may::coroutine::sleep(Duration::from_secs(5));
+                    return Err(io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        "injected connect did not complete",
+                    ));
+                }
+                HttpClient::from_url_with_resolved_options(origin, tls_config, timeout, addresses)
+            },
+        );
+        let client = Client::builder()
+            .max_connections(1)
+            .max_connections_per_origin(1)
+            .resolver(Arc::new(StaticResolver(address)))
+            .test_connector(connector)
+            .build()
+            .unwrap();
+        let token = CancellationToken::new();
+        let request_token = token.clone();
+        let cancelled_client = client.clone();
+        let request = may::go!(move || {
+            cancelled_client
+                .get(&format!(
+                    "http://connect.internal:{}/cancel",
+                    address.port()
+                ))
+                .unwrap()
+                .cancellation_token(request_token)
+                .send_typed()
+        });
+        started_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        assert!(token.cancel());
+        assert_eq!(
+            request.join().unwrap().unwrap_err().kind(),
+            ClientErrorKind::Cancelled
+        );
+
+        assert_eq!(
+            client
+                .get(&format!("http://connect.internal:{}/after", address.port()))
+                .unwrap()
+                .send()
+                .unwrap()
+                .body(),
+            b"after"
+        );
+        assert_eq!(calls.load(Ordering::Relaxed), 2);
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn cancellation_interrupts_buffered_response_and_releases_capacity() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let (blocked_tx, blocked_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let server = thread::spawn(move || {
+            let (mut cancelled, _) = listener.accept().unwrap();
+            assert!(read_head(&mut cancelled).starts_with("GET /cancel HTTP/1.1\r\n"));
+            blocked_tx.send(()).unwrap();
+            release_rx.recv().unwrap();
+            let _ = cancelled.write_all(
+                b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\nConnection: close\r\n\r\nstale",
+            );
+            drop(cancelled);
+
+            let (mut replacement, _) = listener.accept().unwrap();
+            assert!(read_head(&mut replacement).starts_with("GET /fresh HTTP/1.1\r\n"));
+            replacement
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\nConnection: close\r\n\r\nfresh",
+                )
+                .unwrap();
+        });
+        let observer = Arc::new(RecordingObserver::default());
+        let client = Client::builder()
+            .max_connections(1)
+            .max_connections_per_origin(1)
+            .request_timeout(Duration::from_secs(2))
+            .observer(observer.clone())
+            .build()
+            .unwrap();
+        let token = CancellationToken::new();
+        let request_token = token.clone();
+        let cancelled_client = client.clone();
+        let request = may::go!(move || {
+            cancelled_client
+                .get(&format!("http://127.0.0.1:{port}/cancel"))
+                .unwrap()
+                .cancellation_token(request_token)
+                .send_typed()
+        });
+        blocked_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+
+        let cancelled_at = Instant::now();
+        assert!(token.cancel());
+        let error = request.join().unwrap().unwrap_err();
+        assert_eq!(error.kind(), ClientErrorKind::Cancelled);
+        assert!(cancelled_at.elapsed() < Duration::from_millis(500));
+        assert_eq!(client.stats().connections_discarded, 1);
+
+        release_tx.send(()).unwrap();
+        let response = client
+            .get(&format!("http://127.0.0.1:{port}/fresh"))
+            .unwrap()
+            .send()
+            .unwrap();
+        assert_eq!(response.body(), b"fresh");
+        server.join().unwrap();
+
+        let events = observer.events();
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| *event == "cancelled:1")
+                .count(),
+            1
+        );
+        assert!(!events.iter().any(|event| event == "discard:1"));
+        assert!(events.iter().any(|event| event == "complete:2:200"));
+    }
+
+    #[test]
+    fn cancellation_completion_race_emits_one_terminal_outcome() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let barrier = Arc::new(std::sync::Barrier::new(3));
+        let server_barrier = barrier.clone();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let _ = read_head(&mut stream);
+            server_barrier.wait();
+            let _ = stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok");
+        });
+        let observer = Arc::new(RecordingObserver::default());
+        let client = Client::builder()
+            .observer(observer.clone())
+            .build()
+            .unwrap();
+        let token = CancellationToken::new();
+        let request_token = token.clone();
+        let request = may::go!(move || {
+            client
+                .get(&format!("http://127.0.0.1:{port}/race"))
+                .unwrap()
+                .cancellation_token(request_token)
+                .send_typed()
+        });
+        let cancel_barrier = barrier.clone();
+        let canceller = thread::spawn(move || {
+            cancel_barrier.wait();
+            token.cancel();
+        });
+        barrier.wait();
+
+        let result = request.join().unwrap();
+        if let Err(error) = result {
+            assert_eq!(error.kind(), ClientErrorKind::Cancelled);
+        }
+        canceller.join().unwrap();
+        server.join().unwrap();
+        let events = observer.events();
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| {
+                    event.starts_with("complete:")
+                        || event.starts_with("cancelled:")
+                        || event.starts_with("failed:")
+                        || event.starts_with("abandoned:")
+                })
                 .count(),
             1
         );
@@ -2378,6 +2888,81 @@ mod tests {
             .iter()
             .any(|event| event.starts_with("wait:")));
         server.join().unwrap();
+    }
+
+    #[test]
+    fn cancellation_wakes_pool_wait_without_consuming_the_connection() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let (holding_tx, holding_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            assert!(read_head(&mut stream).starts_with("GET /hold HTTP/1.1\r\n"));
+            holding_tx.send(()).unwrap();
+            release_rx.recv().unwrap();
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok")
+                .unwrap();
+            stream.flush().unwrap();
+            assert!(read_head(&mut stream).starts_with("GET /after HTTP/1.1\r\n"));
+            stream
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\nConnection: close\r\n\r\nafter",
+                )
+                .unwrap();
+        });
+        let observer = Arc::new(RecordingObserver::default());
+        let client = Client::builder()
+            .max_connections(1)
+            .max_connections_per_origin(1)
+            .request_timeout(Duration::from_secs(2))
+            .observer(observer.clone())
+            .build()
+            .unwrap();
+        let holding_client = client.clone();
+        let holding = may::go!(move || {
+            holding_client
+                .get(&format!("http://127.0.0.1:{port}/hold"))
+                .unwrap()
+                .send()
+        });
+        holding_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+
+        let token = CancellationToken::new();
+        let wait_token = token.clone();
+        let waiting_client = client.clone();
+        let waiting = may::go!(move || {
+            waiting_client
+                .get(&format!("http://127.0.0.1:{port}/must-not-send"))
+                .unwrap()
+                .cancellation_token(wait_token)
+                .send_typed()
+        });
+        let wait_deadline = Instant::now() + Duration::from_secs(1);
+        while client.stats().pool_waits == 0 && Instant::now() < wait_deadline {
+            thread::sleep(Duration::from_millis(1));
+        }
+        assert_eq!(client.stats().pool_waits, 1);
+        assert!(token.cancel());
+        assert_eq!(
+            waiting.join().unwrap().unwrap_err().kind(),
+            ClientErrorKind::Cancelled
+        );
+
+        release_tx.send(()).unwrap();
+        assert_eq!(holding.join().unwrap().unwrap().body(), b"ok");
+        assert_eq!(
+            client
+                .get(&format!("http://127.0.0.1:{port}/after"))
+                .unwrap()
+                .send()
+                .unwrap()
+                .body(),
+            b"after"
+        );
+        server.join().unwrap();
+        assert!(observer.events().iter().any(|event| event == "cancelled:2"));
     }
 
     #[test]

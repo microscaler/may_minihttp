@@ -52,10 +52,10 @@ OpenTelemetry implementation or exposing sensitive request data.
 
 ## Cancellation Boundary
 
-May cancellation is delivered as an unwind. Invoking an arbitrary observer from a cancellation
-`Drop` can re-enter may's cancellation machinery and trigger another panic. CA-01 therefore does
-not emit a cancellation callback. CA-03 owns a safe explicit cancellation event alongside its
-cooperative API; existing cancellation-safe pool cleanup remains unchanged.
+Direct may coroutine cancellation is delivered as an unwind. Invoking an arbitrary observer from a
+cancellation `Drop` can re-enter may's cancellation machinery and trigger another panic, so that
+legacy path emits no callback. CA-03's explicit `CancellationToken` emits `RequestCancelled` from
+the parent only after scoped unwind cleanup is complete.
 
 ## Verification
 

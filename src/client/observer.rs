@@ -84,6 +84,10 @@ pub enum ClientEvent<'a> {
         error: ClientErrorKind,
         total_duration: Duration,
     },
+    RequestCancelled {
+        request_id: u64,
+        total_duration: Duration,
+    },
     RequestAbandoned {
         request_id: u64,
         status: StatusCode,
