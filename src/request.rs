@@ -228,6 +228,22 @@ impl BufRead for BodyReader<'_, '_> {
     }
 }
 
+impl<'buf, 'stream> BodyReader<'buf, 'stream> {
+    /// Drain any remaining request body and return the TCP stream so the
+    /// service can write a streamed response (chunked / SSE) inside `call`.
+    pub fn into_stream(self) -> &'stream mut TcpStream {
+        let mut this = std::mem::ManuallyDrop::new(self);
+        while let Ok(n) = this.fill_buf().map(|b| b.len()) {
+            if n == 0 {
+                break;
+            }
+            this.consume(n);
+        }
+        // Safety: body drained; ManuallyDrop skips Drop; return the stream borrow.
+        unsafe { &mut *std::ptr::addr_of_mut!(this.stream).read() }
+    }
+}
+
 impl Drop for BodyReader<'_, '_> {
     fn drop(&mut self) {
         // consume all the remaining bytes
@@ -275,6 +291,12 @@ impl<'buf, 'stream> Request<'buf, '_, 'stream> {
             stream: self.stream,
             req_buf: self.req_buf,
         }
+    }
+
+    /// Mutable access to the underlying TCP stream (response streaming / SSE).
+    #[inline]
+    pub fn stream_mut(&mut self) -> &mut TcpStream {
+        self.stream
     }
 
     fn content_length(&self) -> usize {

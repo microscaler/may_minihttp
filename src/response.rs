@@ -1,9 +1,10 @@
 use std::borrow::Cow;
-use std::io;
+use std::io::{self, Write};
 
 use crate::request::MAX_HEADERS;
 
 use bytes::BytesMut;
+use may::net::TcpStream;
 
 /// A single HTTP response header value.
 ///
@@ -109,6 +110,9 @@ pub struct Response<'a> {
     status_message: StatusMessage,
     body: Body,
     rsp_buf: &'a mut BytesMut,
+    /// When true, headers/body were already written to the socket (chunked/SSE).
+    /// [`encode`] becomes a no-op so the connection loop does not double-write.
+    streamed: bool,
 }
 
 enum Body {
@@ -133,7 +137,14 @@ impl<'a> Response<'a> {
                 msg: "Ok",
             },
             rsp_buf,
+            streamed: false,
         }
+    }
+
+    /// `true` when [`Self::begin_chunked_stream`] already wrote this response.
+    #[inline]
+    pub fn is_streamed(&self) -> bool {
+        self.streamed
     }
 
     #[inline]
@@ -176,6 +187,30 @@ impl<'a> Response<'a> {
     #[inline]
     pub fn body_vec(&mut self, v: Vec<u8>) {
         self.body = Body::Vec(v);
+    }
+
+    /// Write status + headers with `Transfer-Encoding: chunked`, then return a
+    /// writer for incremental body chunks (SSE / live flush). Marks this
+    /// response as streamed so the server loop skips [`encode`].
+    pub fn begin_chunked_stream<'s>(
+        &mut self,
+        stream: &'s mut TcpStream,
+    ) -> io::Result<ChunkedBodyWriter<'s>> {
+        if self.streamed {
+            return Err(io::Error::other("response already streamed"));
+        }
+        let mut head = BytesMut::with_capacity(256);
+        write_status_and_headers(self, &mut head, /*chunked=*/ true);
+        stream.write_all(&head)?;
+        stream.flush()?;
+        self.streamed = true;
+        // Clear buffered body — wire path owns the payload now.
+        self.body = Body::Dummy;
+        self.rsp_buf.clear();
+        Ok(ChunkedBodyWriter {
+            stream,
+            finished: false,
+        })
     }
 
     #[inline]
@@ -226,7 +261,50 @@ impl Drop for Response<'_> {
     }
 }
 
-pub(crate) fn encode(mut rsp: Response, buf: &mut BytesMut) {
+/// Writer returned by [`Response::begin_chunked_stream`].
+pub struct ChunkedBodyWriter<'s> {
+    stream: &'s mut TcpStream,
+    finished: bool,
+}
+
+impl ChunkedBodyWriter<'_> {
+    /// Write one chunk and flush (clients observe data immediately).
+    pub fn write_chunk(&mut self, data: &[u8]) -> io::Result<()> {
+        if self.finished {
+            return Err(io::Error::other("chunked stream already finished"));
+        }
+        if data.is_empty() {
+            return Ok(());
+        }
+        write!(self.stream, "{:x}\r\n", data.len())?;
+        self.stream.write_all(data)?;
+        self.stream.write_all(b"\r\n")?;
+        self.stream.flush()?;
+        Ok(())
+    }
+
+    /// Terminate the chunked body (`0\r\n\r\n`).
+    pub fn finish(mut self) -> io::Result<()> {
+        if !self.finished {
+            self.stream.write_all(b"0\r\n\r\n")?;
+            self.stream.flush()?;
+            self.finished = true;
+        }
+        Ok(())
+    }
+}
+
+impl Drop for ChunkedBodyWriter<'_> {
+    fn drop(&mut self) {
+        if !self.finished {
+            let _ = self.stream.write_all(b"0\r\n\r\n");
+            let _ = self.stream.flush();
+            self.finished = true;
+        }
+    }
+}
+
+fn write_status_and_headers(rsp: &Response<'_>, buf: &mut BytesMut, chunked: bool) {
     if rsp.status_message.code == 200 {
         buf.extend_from_slice(b"HTTP/1.1 200 Ok\r\nServer: M\r\nDate: ");
     } else {
@@ -238,9 +316,13 @@ pub(crate) fn encode(mut rsp: Response, buf: &mut BytesMut) {
         buf.extend_from_slice(b"\r\nServer: M\r\nDate: ");
     }
     crate::date::append_date(buf);
-    buf.extend_from_slice(b"\r\nContent-Length: ");
-    let mut length = itoa::Buffer::new();
-    buf.extend_from_slice(length.format(rsp.body_len()).as_bytes());
+    if chunked {
+        buf.extend_from_slice(b"\r\nTransfer-Encoding: chunked");
+    } else {
+        buf.extend_from_slice(b"\r\nContent-Length: ");
+        let mut length = itoa::Buffer::new();
+        buf.extend_from_slice(length.format(rsp.body_len()).as_bytes());
+    }
 
     // SAFETY: we already have bound check when insert headers
     let headers = unsafe { rsp.headers.get_unchecked(..rsp.headers_len) };
@@ -250,6 +332,13 @@ pub(crate) fn encode(mut rsp: Response, buf: &mut BytesMut) {
     }
 
     buf.extend_from_slice(b"\r\n\r\n");
+}
+
+pub(crate) fn encode(mut rsp: Response, buf: &mut BytesMut) {
+    if rsp.streamed {
+        return;
+    }
+    write_status_and_headers(&rsp, buf, /*chunked=*/ false);
     buf.extend_from_slice(rsp.get_body());
 }
 

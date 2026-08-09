@@ -13,4 +13,4 @@ pub use http_server::{HttpServer, HttpServerWithHeaders, HttpService, HttpServic
 pub use request::{
     decode_default, decode_large, decode_standard, decode_xlarge, BodyReader, MaxHeaders, Request,
 };
-pub use response::{IntoResponseHeader, Response, ResponseHeader};
+pub use response::{ChunkedBodyWriter, IntoResponseHeader, Response, ResponseHeader};
