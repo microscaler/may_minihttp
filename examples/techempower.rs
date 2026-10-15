@@ -298,7 +298,7 @@ mod __impl {
 
         fn new_service(&self, id: usize) -> Self::Service {
             let db = self.db_pool.get_connection(id);
-            let rng = WyRand::new();
+            let rng = WyRand::new_seed(0);
             Techempower { db, rng }
         }
     }

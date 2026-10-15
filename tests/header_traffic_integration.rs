@@ -139,7 +139,7 @@ impl HeaderTestServer {
         // - The JoinHandle keeps the server running
         // - No thread::spawn needed - MAY handles concurrency with coroutines
         let handle = HttpServer(TestService)
-            .start(&format!("127.0.0.1:{}", port))
+            .start(format!("127.0.0.1:{}", port))
             .expect("Failed to start test server");
 
         let fixture = Self {
@@ -168,7 +168,7 @@ impl HeaderTestServer {
         for attempt in 0..max_attempts {
             if let Ok(mut stream) = TcpStream::connect(format!("127.0.0.1:{}", self.port)) {
                 // Send a minimal HTTP request
-                let request = format!("GET / HTTP/1.1\r\nHost: localhost\r\n\r\n");
+                let request = "GET / HTTP/1.1\r\nHost: localhost\r\n\r\n";
                 if stream.write_all(request.as_bytes()).is_ok() {
                     // Try to read some response
                     let mut buf = [0u8; 256];
