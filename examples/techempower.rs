@@ -230,7 +230,7 @@ mod __impl {
                 id: 0,
                 message: "Additional fortune added at request time.",
             });
-            fortunes.sort_by(|it, next| it.message.cmp(next.message));
+            fortunes.sort_unstable_by(|it, next| it.message.cmp(next.message));
 
             let mut body = unsafe { std::ptr::read(buf) };
             ywrite_html!(body, "{{> fortune }}");
