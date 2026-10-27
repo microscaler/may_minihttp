@@ -66,6 +66,18 @@ fn connect_remap(e: io::Error) -> io::Error {
     }
 }
 
+/// One error kind for a refused connection on every connect path (`connect`, `from_url`, the pool's
+/// deadline-bounded connect), whatever the platform reports.
+#[cfg(windows)]
+fn connect_error(e: io::Error) -> io::Error {
+    connect_remap(e)
+}
+
+#[cfg(not(windows))]
+fn connect_error(e: io::Error) -> io::Error {
+    e
+}
+
 /// Requests are written whole (see `Request::write_head_with`), so Nagle only ever delays them: with it on, a write
 /// that follows one not yet acknowledged waits for the peer's delayed ACK (~40 ms on Linux). A failure to set it is not
 /// a reason to fail the connection.
@@ -199,7 +211,7 @@ impl HttpClient {
                         connected = Some(stream);
                         break;
                     }
-                    Err(error) => last_error = Some(error),
+                    Err(error) => last_error = Some(connect_error(error)),
                 }
             }
             connected.ok_or_else(|| {
@@ -211,7 +223,7 @@ impl HttpClient {
                 })
             })?
         } else {
-            let stream = TcpStream::connect((host, port))?;
+            let stream = TcpStream::connect((host, port)).map_err(connect_error)?;
             nodelay(&stream);
             stream
         };

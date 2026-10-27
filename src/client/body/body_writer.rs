@@ -215,7 +215,7 @@ mod tests {
     fn test_sized_writer_drop_fills_padding() {
         let (cw, bytes) = capture();
         let mut bw = BodyWriter::SizedWriter(cw.clone(), 10);
-        bw.write(b"hi").unwrap();
+        assert_eq!(bw.write(b"hi").unwrap(), 2);
         drop(bw);
         let captured = bytes.lock().unwrap().clone();
         assert_eq!(captured.len(), 10);
@@ -235,7 +235,7 @@ mod tests {
     fn test_chunk_writer_format() {
         let (cw, bytes) = capture();
         let mut bw = BodyWriter::ChunkWriter(cw.clone(), false);
-        bw.write(b"hello").unwrap();
+        assert_eq!(bw.write(b"hello").unwrap(), 5);
         bw.flush().unwrap();
         assert_eq!(bytes.lock().unwrap().as_slice(), b"5\r\nhello\r\n");
     }
@@ -253,8 +253,8 @@ mod tests {
     fn test_chunk_writer_multiple_writes() {
         let (cw, bytes) = capture();
         let mut bw = BodyWriter::ChunkWriter(cw.clone(), false);
-        bw.write(b"hello").unwrap();
-        bw.write(b"world").unwrap();
+        assert_eq!(bw.write(b"hello").unwrap(), 5);
+        assert_eq!(bw.write(b"world").unwrap(), 5);
         bw.flush().unwrap();
         assert_eq!(
             bytes.lock().unwrap().as_slice(),
@@ -266,7 +266,7 @@ mod tests {
     fn test_chunk_writer_drop_terminator() {
         let (cw, bytes) = capture();
         let mut bw = BodyWriter::ChunkWriter(cw.clone(), false);
-        bw.write(b"test").unwrap();
+        assert_eq!(bw.write(b"test").unwrap(), 4);
         drop(bw);
         let captured = bytes.lock().unwrap().clone();
         assert!(

@@ -194,10 +194,13 @@ jobs:
           name: reports-client-windows-latest
           path: reports/client-windows/
 
-      # Download goose reports
+      # Download goose reports. The goose job only runs when every test job passed; when it was
+      # skipped there is no artifact, and the combined report already says "Skipped". Its absence
+      # must not fail this job and hide the real failure behind a second red X.
       - name: Download goose reports
         uses: actions/download-artifact@v4
         if: always()
+        continue-on-error: true
         with:
           name: goose-reports
           path: reports/goose/
@@ -287,22 +290,25 @@ jobs:
             head -c 50000 target/reports/combined.md > /tmp/pr-body.md
           fi
           
-          # Check for existing bot comment and update, otherwise create
+          # Check for existing bot comment and update, otherwise create. stderr is kept out of
+          # COMMENT_ID: an API error message used to land in it and be passed to `gh api` as 16
+          # arguments ("accepts 1 arg(s), received 16"), failing the job. Posting the report is a
+          # convenience; failing to post it must not fail CI.
           COMMENT_ID=$(gh api repos/${{ github.repository }}/issues/${PR_NUMBER}/comments \
             --jq '.[] | select(.user.login == "github-actions[bot]" and (.body | contains("## Test Report"))) | .id' \
-            2>&1 | head -1)
+            2>/dev/null | head -1 || true)
           
-          if [[ -n "$COMMENT_ID" ]]; then
+          if [[ "$COMMENT_ID" =~ ^[0-9]+$ ]]; then
             gh api repos/${{ github.repository }}/issues/comments/${COMMENT_ID} \
               --method PATCH \
-              --field body="$(cat /tmp/pr-body.md)" \
-              2>&1
-            echo "Updated existing PR comment $COMMENT_ID"
+              --field body="$(cat /tmp/pr-body.md)" > /dev/null \
+              && echo "Updated existing PR comment $COMMENT_ID" \
+              || echo "::warning::could not update the PR comment"
           else
             gh api repos/${{ github.repository }}/issues/${PR_NUMBER}/comments \
-              --field body="$(cat /tmp/pr-body.md)" \
-              2>&1
-            echo "Created new PR comment for PR $PR_NUMBER"
+              --field body="$(cat /tmp/pr-body.md)" > /dev/null \
+              && echo "Created new PR comment for PR $PR_NUMBER" \
+              || echo "::warning::could not create the PR comment"
           fi
 
   ci-summary:
