@@ -3948,7 +3948,11 @@ mod tests {
             stale.flush().unwrap();
             // The connection dies after the client wrote its next request on it (the pool's
             // idle check passed): the server reads that request and closes without answering.
+            // The body is read too, so the close is a FIN: closing over unread bytes sends a
+            // reset, which Windows reports as an uncategorised error.
             let _ = read_head(&mut stale);
+            let mut body = [0_u8; 11];
+            stale.read_exact(&mut body).unwrap();
             drop(stale);
 
             thread::sleep(Duration::from_millis(150));
