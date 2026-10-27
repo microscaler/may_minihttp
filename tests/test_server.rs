@@ -34,7 +34,7 @@ impl ConfigurableTestServer {
         // For now, start with default - we'll add configuration support next
         let server_handle = thread::spawn(move || {
             let _server = HttpServer(TestService)
-                .start(&format!("127.0.0.1:{}", port))
+                .start(format!("127.0.0.1:{}", port))
                 .expect("Failed to start test server");
 
             while !shutdown_clone.load(Ordering::Relaxed) {
