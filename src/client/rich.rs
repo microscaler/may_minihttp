@@ -19,6 +19,7 @@ use url::Url;
 
 use super::cancellation::{cancelled_error, is_cancelled_error, run_cancellable};
 use super::interceptor::{Interceptor, NoInterceptor, OutgoingRequest, ResponseHead, Timing};
+use super::trace::{self, client_event, client_span, phase_span, span_record};
 use super::{
     CancellationToken, ClientEvent, ClientObserver, ObservedOrigin, RequestMetadata,
     RequestMetadataContext, RequestMetadataProvider, Resolver, SystemResolver,
@@ -391,6 +392,24 @@ pub enum ClientErrorKind {
 }
 
 impl ClientErrorKind {
+    /// A stable snake_case name, suitable as a metric label or an `error.type` attribute.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Cancelled => "cancelled",
+            Self::Metadata => "metadata",
+            Self::InvalidRequest => "invalid_request",
+            Self::Dns => "dns",
+            Self::Connection => "connection",
+            Self::Tls => "tls",
+            Self::Timeout => "timeout",
+            Self::Protocol => "protocol",
+            Self::BodyTooLarge => "body_too_large",
+            Self::BodyNotReplayable => "body_not_replayable",
+            Self::Redirect => "redirect",
+            Self::Io => "io",
+        }
+    }
+
     fn classify(source: &io::Error) -> Self {
         let message = source.to_string().to_ascii_lowercase();
         match source.kind() {
@@ -493,10 +512,12 @@ impl<I> fmt::Debug for Client<I> {
     }
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 struct RequestTrace {
     request_id: u64,
     started: Instant,
+    /// The request's span (feature `tracing`; zero-sized otherwise).
+    span: trace::Span,
 }
 
 struct StreamingExecution<'a> {
@@ -506,6 +527,13 @@ struct StreamingExecution<'a> {
     attempt: &'a mut u32,
     sensitive_headers: &'a mut HashSet<HeaderName>,
     tls_snapshot: &'a mut Option<TlsConfigSnapshot>,
+}
+
+/// What `RequestBuilder::parent_span` / `request_span` chose (feature `tracing`).
+#[cfg_attr(not(feature = "tracing"), allow(dead_code))]
+enum SpanChoice {
+    Parent(trace::Span),
+    Own(trace::Span),
 }
 
 struct AttemptInfo<'a> {
@@ -556,6 +584,7 @@ impl<I: Interceptor> Client<I> {
         let url = parse_url(url)?;
         Ok(RequestBuilder {
             client: self.clone(),
+            span: None,
             method,
             url,
             headers: HeaderMap::new(),
@@ -578,19 +607,26 @@ impl<I: Interceptor> Client<I> {
         self.inner.stats.snapshot()
     }
 
-    fn execute(&self, request: RequestBuilder<I>) -> io::Result<BufferedResponse> {
-        let trace = self.begin_request(&request.method, &request.url);
+    fn execute(&self, mut request: RequestBuilder<I>) -> io::Result<BufferedResponse> {
+        let trace = self.begin_request(&request.method, &request.url, request.span.take());
         let cancellation = request.cancellation.clone();
         let result = match cancellation {
             Some(token) => run_cancellable(&token, || self.execute_buffered(request, &trace)),
             None => self.execute_buffered(request, &trace),
         };
         match &result {
-            Ok(response) => self.inner.observe(ClientEvent::RequestCompleted {
-                request_id: trace.request_id,
-                status: response.status,
-                total_duration: trace.started.elapsed(),
-            }),
+            Ok(response) => {
+                span_record!(
+                    trace.span,
+                    "http.response.status_code",
+                    response.status.as_u16()
+                );
+                self.inner.observe(ClientEvent::RequestCompleted {
+                    request_id: trace.request_id,
+                    status: response.status,
+                    total_duration: trace.started.elapsed(),
+                })
+            }
             Err(error) => self.observe_failure(&trace, error),
         }
         result
@@ -726,12 +762,14 @@ impl<I: Interceptor> Client<I> {
         }
     }
 
-    fn execute_streaming(&self, request: RequestBuilder<I>) -> io::Result<StreamingResponse> {
-        let trace = self.begin_request(&request.method, &request.url);
+    fn execute_streaming(&self, mut request: RequestBuilder<I>) -> io::Result<StreamingResponse> {
+        let trace = self.begin_request(&request.method, &request.url, request.span.take());
         let cancellation = request.cancellation.clone();
         let result = match cancellation {
-            Some(token) => run_cancellable(&token, || self.execute_streaming_inner(request, trace)),
-            None => self.execute_streaming_inner(request, trace),
+            Some(token) => {
+                run_cancellable(&token, || self.execute_streaming_inner(request, &trace))
+            }
+            None => self.execute_streaming_inner(request, &trace),
         };
         if let Err(error) = &result {
             self.observe_failure(&trace, error);
@@ -742,7 +780,7 @@ impl<I: Interceptor> Client<I> {
     fn execute_streaming_inner(
         &self,
         request: RequestBuilder<I>,
-        trace: RequestTrace,
+        trace: &RequestTrace,
     ) -> io::Result<StreamingResponse> {
         if self.inner.config.redirect_policy != RedirectPolicy::None {
             return Err(io::Error::new(
@@ -769,7 +807,7 @@ impl<I: Interceptor> Client<I> {
             &mut body,
             StreamingExecution {
                 deadline,
-                trace: &trace,
+                trace,
                 cancellation,
                 attempt: &mut attempt,
                 sensitive_headers: &mut sensitive_headers,
@@ -822,6 +860,14 @@ impl<I: Interceptor> Client<I> {
             )?;
             let mut lease = self.checkout(&key, Arc::clone(&tls_config), deadline, trace)?;
             let reused_idle_connection = lease.reused_idle_connection;
+            span_record!(
+                trace.span,
+                "may_minihttp.connection_reused",
+                reused_idle_connection
+            );
+            if *attempt > 1 {
+                span_record!(trace.span, "http.request.resend_count", *attempt - 1);
+            }
             let timing = self.before_send(
                 &mut attempt_headers,
                 AttemptInfo {
@@ -835,8 +881,15 @@ impl<I: Interceptor> Client<I> {
                 },
             );
             let result = (|| {
-                let mut response =
-                    self.send_on_lease(&mut lease, method, url, &attempt_headers, body, deadline)?;
+                let mut response = self.send_on_lease(
+                    &mut lease,
+                    method,
+                    url,
+                    &attempt_headers,
+                    body,
+                    deadline,
+                    &trace.span,
+                )?;
 
                 let status = response.status();
                 if I::ENABLED {
@@ -879,6 +932,12 @@ impl<I: Interceptor> Client<I> {
                     .and_then(|value| value.trim().parse::<usize>().ok())
                     .map_or(0, |length| length.min(limit));
                 let mut bytes = Vec::with_capacity(expected);
+                let body_span = phase_span!(
+                    DEBUG,
+                    parent: &trace.span,
+                    "http_client_body",
+                    "http.response.body.size" = tracing::field::Empty
+                );
                 loop {
                     if response.body_complete() {
                         break;
@@ -904,6 +963,8 @@ impl<I: Interceptor> Client<I> {
                         ));
                     }
                 }
+                span_record!(body_span, "http.response.body.size", bytes.len() as u64);
+                drop(body_span);
                 drop(response);
                 Ok((
                     BufferedResponse {
@@ -1001,6 +1062,14 @@ impl<I: Interceptor> Client<I> {
             )?;
             let mut lease = self.checkout(&key, Arc::clone(&tls_config), deadline, trace)?;
             let reused_idle_connection = lease.reused_idle_connection;
+            span_record!(
+                trace.span,
+                "may_minihttp.connection_reused",
+                reused_idle_connection
+            );
+            if *attempt > 1 {
+                span_record!(trace.span, "http.request.resend_count", *attempt - 1);
+            }
             let timing = self.before_send(
                 &mut attempt_headers,
                 AttemptInfo {
@@ -1013,8 +1082,15 @@ impl<I: Interceptor> Client<I> {
                     reused_connection: reused_idle_connection,
                 },
             );
-            let sent =
-                self.send_on_lease(&mut lease, method, url, &attempt_headers, body, deadline);
+            let sent = self.send_on_lease(
+                &mut lease,
+                method,
+                url,
+                &attempt_headers,
+                body,
+                deadline,
+                &trace.span,
+            );
             if I::ENABLED {
                 if let Some(timing) = &timing {
                     match &sent {
@@ -1034,6 +1110,7 @@ impl<I: Interceptor> Client<I> {
             match sent {
                 Ok(response) => {
                     let status = response.status();
+                    span_record!(trace.span, "http.response.status_code", status.as_u16());
                     self.inner.observe(ClientEvent::ResponseHeaders {
                         request_id: trace.request_id,
                         origin: observed_url(url),
@@ -1061,7 +1138,8 @@ impl<I: Interceptor> Client<I> {
                         headers: response_headers,
                         final_url: url.clone(),
                         inner: Arc::clone(&self.inner),
-                        trace: *trace,
+                        trace: trace.clone(),
+                        body_span: phase_span!(DEBUG, parent: &trace.span, "http_client_body"),
                         cancellation,
                         terminal_observed: false,
                         reused_connection: reused_idle_connection,
@@ -1310,6 +1388,7 @@ impl<I: Interceptor> Client<I> {
         Ok(Cow::Owned(headers))
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn send_on_lease(
         &self,
         lease: &mut PoolLease,
@@ -1318,7 +1397,9 @@ impl<I: Interceptor> Client<I> {
         headers: &HeaderMap,
         body: &mut RequestBody,
         deadline: Instant,
+        span: &trace::Span,
     ) -> io::Result<super::Response> {
+        let _ = span;
         if headers.contains_key(HOST) {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -1341,6 +1422,7 @@ impl<I: Interceptor> Client<I> {
             .client
             .set_max_response_header_bytes(self.inner.config.max_response_header_bytes)?;
         let target = origin_form(url)?;
+        let write_span = phase_span!(DEBUG, parent: span, "http_client_write");
         let mut request = lease
             .connection_mut()
             .client
@@ -1349,15 +1431,9 @@ impl<I: Interceptor> Client<I> {
             request.headers_mut().append(name, value.clone());
         }
         match body {
-            RequestBody::Empty => lease.connection_mut().client.send_request(request),
-            RequestBody::Bytes(bytes) => {
-                request.send(bytes)?;
-                lease.connection_mut().client.send_request(request)
-            }
-            RequestBody::Multipart(form) => {
-                request.send_multipart(form)?;
-                lease.connection_mut().client.send_request(request)
-            }
+            RequestBody::Empty => {}
+            RequestBody::Bytes(bytes) => request.send(bytes)?,
+            RequestBody::Multipart(form) => request.send_multipart(form)?,
             RequestBody::Reader {
                 reader,
                 content_length,
@@ -1375,15 +1451,59 @@ impl<I: Interceptor> Client<I> {
                     )
                 })?;
                 request.send_reader(&mut *reader, *content_length)?;
-                lease.connection_mut().client.send_request(request)
             }
         }
+        let client = &mut lease.connection_mut().client;
+        client.write_request(request)?;
+        drop(write_span);
+        let wait_span = phase_span!(
+            DEBUG,
+            parent: span,
+            "http_client_wait",
+            "http.response.status_code" = tracing::field::Empty
+        );
+        let response = client.read_response()?;
+        span_record!(
+            wait_span,
+            "http.response.status_code",
+            response.status().as_u16()
+        );
+        drop(wait_span);
+        Ok(response)
     }
 
-    fn begin_request(&self, method: &Method, url: &Url) -> RequestTrace {
+    fn begin_request(
+        &self,
+        method: &Method,
+        url: &Url,
+        choice: Option<SpanChoice>,
+    ) -> RequestTrace {
+        let span = match choice {
+            Some(SpanChoice::Own(span)) => span,
+            choice => {
+                let _parent = match choice {
+                    Some(SpanChoice::Parent(parent)) => parent,
+                    _ => trace::current_parent(),
+                };
+                client_span!(
+                    INFO,
+                    parent: &_parent,
+                    "http_client_request",
+                    "http.request.method" = method.as_str(),
+                    "server.address" = url.host_str().unwrap_or_default(),
+                    "server.port" = url.port_or_known_default().unwrap_or_default(),
+                    "url.scheme" = url.scheme(),
+                    "http.response.status_code" = tracing::field::Empty,
+                    "error.type" = tracing::field::Empty,
+                    "http.request.resend_count" = tracing::field::Empty,
+                    "may_minihttp.connection_reused" = tracing::field::Empty,
+                )
+            }
+        };
         let trace = RequestTrace {
             request_id: self.inner.next_request_id.fetch_add(1, Ordering::Relaxed),
             started: Instant::now(),
+            span,
         };
         self.inner.observe(ClientEvent::RequestStarted {
             request_id: trace.request_id,
@@ -1395,6 +1515,7 @@ impl<I: Interceptor> Client<I> {
 
     fn observe_failure(&self, trace: &RequestTrace, error: &io::Error) {
         let error = ClientErrorKind::classify(error);
+        span_record!(trace.span, "error.type", error.as_str());
         if error == ClientErrorKind::Cancelled {
             self.inner.observe(ClientEvent::RequestCancelled {
                 request_id: trace.request_id,
@@ -1433,6 +1554,12 @@ impl<I: Interceptor> Client<I> {
                     .stats
                     .connections_expired
                     .fetch_add(expired as u64, Ordering::Relaxed);
+                client_event!(
+                    parent: &trace.span,
+                    reason = "expired",
+                    count = expired as u64,
+                    "pool_evict"
+                );
             }
             let idle = state.idle.get_mut(key).and_then(Vec::pop);
             if let Some(connection) = idle {
@@ -1454,6 +1581,12 @@ impl<I: Interceptor> Client<I> {
                 {
                     // dropping the lease releases its slot and counts it discarded
                     drop(lease);
+                    client_event!(
+                        parent: &trace.span,
+                        reason = "closed",
+                        count = 1_u64,
+                        "pool_evict"
+                    );
                     continue;
                 }
                 self.inner
@@ -1464,6 +1597,7 @@ impl<I: Interceptor> Client<I> {
                     request_id: trace.request_id,
                     origin: observed_key(key),
                 });
+                client_event!(parent: &trace.span, result = "hit", "pool_checkout");
                 return Ok(lease);
             }
             let per_origin = state.per_origin.get(key).copied().unwrap_or(0);
@@ -1476,6 +1610,15 @@ impl<I: Interceptor> Client<I> {
 
                 let mut lease =
                     PoolLease::reserved(Arc::clone(&self.inner), key.clone(), trace.request_id);
+                client_event!(parent: &trace.span, result = "miss", "pool_checkout");
+                let connect_span = phase_span!(
+                    INFO,
+                    parent: &trace.span,
+                    "http_client_connect",
+                    "server.address" = &*key.host,
+                    "server.port" = key.port,
+                    "error.type" = tracing::field::Empty
+                );
 
                 let connect_budget = self.inner.config.connect_timeout.min(remaining(deadline)?);
                 let connect_deadline =
@@ -1496,6 +1639,13 @@ impl<I: Interceptor> Client<I> {
                     source: resolution.as_ref().ok().map(|value| value.source),
                     error: resolution.as_ref().err().map(ClientErrorKind::classify),
                 });
+                if let Err(_error) = &resolution {
+                    span_record!(
+                        connect_span,
+                        "error.type",
+                        ClientErrorKind::classify(_error).as_str()
+                    );
+                }
                 let addresses = resolution?.addresses;
                 let timeout = connect_deadline
                     .checked_duration_since(Instant::now())
@@ -1517,6 +1667,14 @@ impl<I: Interceptor> Client<I> {
                     tls: key.scheme == "https",
                     error: client.as_ref().err().map(ClientErrorKind::classify),
                 });
+                if let Err(_error) = &client {
+                    span_record!(
+                        connect_span,
+                        "error.type",
+                        ClientErrorKind::classify(_error).as_str()
+                    );
+                }
+                drop(connect_span);
                 let client = client?;
                 lease.connection = Some(PooledConnection {
                     client,
@@ -1532,6 +1690,7 @@ impl<I: Interceptor> Client<I> {
 
             let wait = remaining(deadline)?;
             self.inner.stats.pool_waits.fetch_add(1, Ordering::Relaxed);
+            client_event!(parent: &trace.span, result = "wait", "pool_checkout");
             let wait_started = Instant::now();
             let (state_after_wait, timeout) = self
                 .inner
@@ -1558,6 +1717,8 @@ impl<I: Interceptor> Client<I> {
 /// Request builder whose body explicitly records whether it can be replayed.
 pub struct RequestBuilder<I = NoInterceptor> {
     client: Client<I>,
+    /// Parent of the request's span, or the request's span itself (feature `tracing`).
+    span: Option<SpanChoice>,
     method: Method,
     url: Url,
     headers: HeaderMap,
@@ -1634,6 +1795,25 @@ impl<I: Interceptor> RequestBuilder<I> {
     /// Cancel this request cooperatively when `token` is cancelled.
     pub fn cancellation_token(mut self, token: CancellationToken) -> Self {
         self.cancellation = Some(token);
+        self
+    }
+
+    /// Make `span` the parent of this request's spans (feature `tracing`). Without it the parent
+    /// is [`tracing::Span::current()`] at the time of sending. Coroutine code should pass the
+    /// parent explicitly: a span entered on a thread is not a coroutine's context.
+    #[cfg(feature = "tracing")]
+    pub fn parent_span(mut self, span: &tracing::Span) -> Self {
+        self.span = Some(SpanChoice::Parent(span.clone()));
+        self
+    }
+
+    /// Use `span` as this request's span instead of creating `http_client_request` (feature
+    /// `tracing`): the client records its request fields on it (only those the span declares,
+    /// e.g. as `tracing::field::Empty`) and opens its connect/write/wait/body spans under it.
+    /// For a caller that wants one span per request with its own name and attributes.
+    #[cfg(feature = "tracing")]
+    pub fn request_span(mut self, span: &tracing::Span) -> Self {
+        self.span = Some(SpanChoice::Own(span.clone()));
         self
     }
 
@@ -1750,6 +1930,9 @@ pub struct StreamingResponse {
     cancellation: Option<CancellationToken>,
     terminal_observed: bool,
     reused_connection: bool,
+    /// Open while the body is read (feature `tracing`).
+    #[cfg_attr(not(feature = "tracing"), allow(dead_code))]
+    body_span: trace::Span,
 }
 
 impl fmt::Debug for StreamingResponse {
@@ -1794,6 +1977,7 @@ impl StreamingResponse {
     }
 
     fn complete(&mut self) {
+        self.close_spans(None);
         drop(self.response.take());
         if let Some(lease) = self.lease.take() {
             if self.reusable {
@@ -1810,6 +1994,20 @@ impl StreamingResponse {
         }
     }
 
+    /// End the body and request spans at the end of the body rather than when the response is
+    /// dropped. No-op without the `tracing` feature.
+    fn close_spans(&mut self, error: Option<ClientErrorKind>) {
+        let _ = error;
+        #[cfg(feature = "tracing")]
+        {
+            if let Some(error) = error {
+                self.trace.span.record("error.type", error.as_str());
+            }
+            self.body_span = tracing::Span::none();
+            self.trace.span = tracing::Span::none();
+        }
+    }
+
     fn discard_connection(&mut self) {
         if let Some(response) = self.response.as_mut() {
             response.abandon_body();
@@ -1819,6 +2017,7 @@ impl StreamingResponse {
     }
 
     fn fail(&mut self, error: &io::Error) {
+        self.close_spans(Some(ClientErrorKind::classify(error)));
         self.discard_connection();
         if !self.terminal_observed {
             self.inner.observe(ClientEvent::RequestFailed {
@@ -1831,6 +2030,7 @@ impl StreamingResponse {
     }
 
     fn cancel(&mut self) -> io::Error {
+        self.close_spans(Some(ClientErrorKind::Cancelled));
         self.discard_connection();
         if !self.terminal_observed {
             self.inner.observe(ClientEvent::RequestCancelled {

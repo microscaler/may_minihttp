@@ -17,6 +17,7 @@ mod response;
 mod rich;
 mod shared;
 mod tls;
+mod trace;
 
 pub use cancellation::CancellationToken;
 pub use client_impl::HttpClient;

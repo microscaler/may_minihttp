@@ -356,7 +356,13 @@ impl HttpClient {
 
     /// Send a request built from this client and read the response.
     #[inline]
-    pub fn send_request(&mut self, mut req: Request) -> io::Result<Response> {
+    pub fn send_request(&mut self, req: Request) -> io::Result<Response> {
+        self.write_request(req)?;
+        self.get_rsp()
+    }
+
+    /// The first half of [`send_request`](Self::send_request): finish writing the request.
+    pub(crate) fn write_request(&mut self, mut req: Request) -> io::Result<()> {
         debug_assert!(
             self.conn.ptr_eq(req.conn()),
             "client and request must share the same connection"
@@ -364,6 +370,11 @@ impl HttpClient {
         self.expect_body = req.expect_body_request();
         req.finish()?;
         drop(req);
+        Ok(())
+    }
+
+    /// The second half of [`send_request`](Self::send_request): read the response head.
+    pub(crate) fn read_response(&mut self) -> io::Result<Response> {
         self.get_rsp()
     }
 

@@ -29,6 +29,7 @@ rustls-platform-verifier = { version = "0.7", optional = true }
 url = { version = "2", optional = true }
 serde = { version = "1", optional = true }
 serde_json = { version = "1", optional = true }
+tracing = { version = "0.1", default-features = false, features = ["std"], optional = true }
 
 [dev-dependencies]
 atoi = "2"
@@ -51,6 +52,8 @@ testcontainers = "0.15"
 tokio = { version = "1", features = ["full"] }
 rcgen = "0.14"
 flate2 = "1.1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", default-features = false, features = ["registry", "std"] }
 
 [target.'cfg(unix)'.dev-dependencies]
 may_postgres = { git = "https://github.com/Xudong-Huang/may_postgres.git", default-features = false }
@@ -61,6 +64,8 @@ default = ["may/default"]
 client = ["http", "may/io_timeout", "dep:generator", "dep:rustls", "dep:rustls-platform-verifier", "dep:url"]
 # Typed JSON request/response helpers. Kept optional so the core HTTP transport stays lean.
 json = ["client", "dep:serde", "dep:serde_json"]
+# `tracing` spans and events in the client (see `client::trace`). Off: nothing is compiled in.
+tracing = ["client", "dep:tracing"]
 
 # Examples that use the client module — automatically enable the `client` feature.
 [[example]]
@@ -152,6 +157,10 @@ required-features = ["client"]
 [[test]]
 name = "tcp_nodelay_stall"
 required-features = ["client"]
+
+[[test]]
+name = "client_tracing"
+required-features = ["tracing"]
 
 [profile.release]
 opt-level = 3

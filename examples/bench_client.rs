@@ -18,6 +18,10 @@
 //! `header-bytes` adds an `X-Pad` header of that size (a bearer token with claims is 1-6 KiB);
 //! `body-bytes > 0` makes the request a POST with a body of that size (`/echo` on bench_server).
 //! Workers are may coroutines. Pair with `examples/bench_server.rs`.
+//!
+//! Built with `--features tracing`, `BENCH_TRACING=info` (or `debug`) installs a
+//! `tracing-subscriber` registry at that level, so the client's spans are created and closed;
+//! unset, the feature is compiled in with no subscriber.
 
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::io::{self, Read};
@@ -143,6 +147,20 @@ fn main() -> io::Result<()> {
     let body_bytes: usize = arg(args.next(), 0);
 
     may::config().set_stack_size(0x8000);
+    #[cfg(feature = "tracing")]
+    {
+        use tracing_subscriber::filter::LevelFilter;
+        use tracing_subscriber::layer::SubscriberExt;
+        let level = match std::env::var("BENCH_TRACING").as_deref() {
+            Ok("info") => Some(LevelFilter::INFO),
+            Ok("debug") => Some(LevelFilter::DEBUG),
+            _ => None,
+        };
+        if let Some(level) = level {
+            tracing::subscriber::set_global_default(tracing_subscriber::registry().with(level))
+                .expect("install the tracing subscriber");
+        }
+    }
     let parsed: Uri = url.parse().map_err(io::Error::other)?;
     let path: Uri = parsed
         .path_and_query()
