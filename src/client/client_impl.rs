@@ -66,13 +66,24 @@ fn connect_remap(e: io::Error) -> io::Error {
     }
 }
 
+/// Requests are written whole (see `Request::write_head_with`), so Nagle only ever delays them: with it on, a write
+/// that follows one not yet acknowledged waits for the peer's delayed ACK (~40 ms on Linux). A failure to set it is not
+/// a reason to fail the connection.
+fn nodelay(stream: &TcpStream) {
+    let _ = stream.set_nodelay(true);
+}
+
 impl HttpClient {
     /// Connect to the given address.
     pub fn connect<A: ToSocketAddrs>(remote: A) -> io::Result<Self> {
         #[cfg(windows)]
         let stream = TcpStream::connect(remote).map_err(connect_remap)?;
+        #[cfg(windows)]
+        nodelay(&stream);
         #[cfg(not(windows))]
         let stream = TcpStream::connect(remote)?;
+        #[cfg(not(windows))]
+        nodelay(&stream);
         Ok(HttpClient {
             conn: SharedStream::new(Transport::Plain(stream)),
             expect_body: true,
@@ -184,6 +195,7 @@ impl HttpClient {
                 })?;
                 match TcpStream::connect_timeout(&address, remaining) {
                     Ok(stream) => {
+                        nodelay(&stream);
                         connected = Some(stream);
                         break;
                     }
@@ -199,7 +211,9 @@ impl HttpClient {
                 })
             })?
         } else {
-            TcpStream::connect((host, port))?
+            let stream = TcpStream::connect((host, port))?;
+            nodelay(&stream);
+            stream
         };
         let transport = if scheme.eq_ignore_ascii_case("https") {
             let tls_config = tls_config.ok_or_else(|| {

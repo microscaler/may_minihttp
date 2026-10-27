@@ -69,7 +69,9 @@ pub trait HttpServiceFactory: Send + Sized + 'static {
                     let id = stream.as_raw_fd() as usize;
                     #[cfg(windows)]
                     let id = stream.as_raw_socket() as usize;
-                    // t_c!(stream.set_nodelay(true));
+                    // Responses are written whole; Nagle would only hold a second write (a streamed
+                    // chunk) for the client's delayed ACK. Not fatal if it cannot be set.
+                    let _ = stream.set_nodelay(true);
                     let service = self.new_service(id);
                     let builder = may::coroutine::Builder::new().id(id);
                     go!(
@@ -266,7 +268,9 @@ impl<T: HttpService + Clone + Send + Sync + 'static> HttpServer<T> {
             move || {
                 for stream in listener.incoming() {
                     let mut stream = t_c!(stream);
-                    // t_c!(stream.set_nodelay(true));
+                    // Responses are written whole; Nagle would only hold a second write (a streamed
+                    // chunk) for the client's delayed ACK. Not fatal if it cannot be set.
+                    let _ = stream.set_nodelay(true);
                     let service = service.clone();
                     go!(
                         move || if let Err(e) = each_connection_loop(&mut stream, service) {
@@ -294,7 +298,9 @@ impl<T: HttpService + Clone + Send + Sync + 'static, const N: usize> HttpServerW
             move || {
                 for stream in listener.incoming() {
                     let mut stream = t_c!(stream);
-                    // t_c!(stream.set_nodelay(true));
+                    // Responses are written whole; Nagle would only hold a second write (a streamed
+                    // chunk) for the client's delayed ACK. Not fatal if it cannot be set.
+                    let _ = stream.set_nodelay(true);
                     let service = service.clone();
                     go!(move || if let Err(e) =
                         each_connection_loop_with_headers::<T, N>(&mut stream, service)
