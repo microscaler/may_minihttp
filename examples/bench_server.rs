@@ -12,6 +12,8 @@
 //! - `GET /big`     1 MiB static body
 //! - `POST /echo`   echoes the request body
 //! - `GET /sse`     1000 chunked-encoding chunks of 24 bytes each (an SSE-like stream)
+//! - `GET /h8`      8 per-response headers built with `format!` + `Response::header`
+//! - `GET /h8kv`    the same 8 headers with `Response::header_kv`
 //! - `GET /__allocs` `allocs=<n> bytes=<n> requests=<n>` since start
 //!
 //! It serves with 32 header slots, as BRRTRouter does. The allocation counter wraps the system
@@ -52,6 +54,20 @@ unsafe impl GlobalAlloc for Counting {
 static GLOBAL: Counting = Counting;
 
 static BIG: [u8; 1 << 20] = [b'x'; 1 << 20];
+
+const HEADER_NAMES: [&str; 8] = [
+    "X-Header-0",
+    "X-Header-1",
+    "X-Header-2",
+    "X-Header-3",
+    "X-Header-4",
+    "X-Header-5",
+    "X-Header-6",
+    "X-Header-7",
+];
+const HEADER_VALUES: [&str; 8] = [
+    "value-0", "value-1", "value-2", "value-3", "value-4", "value-5", "value-6", "value-7",
+];
 
 #[derive(Clone)]
 struct Bench;
@@ -97,6 +113,19 @@ impl HttpService for Bench {
                     events.write_chunk(b"data: {\"tick\":12345}\n\n\n")?;
                 }
                 events.finish()?;
+            }
+            ("GET", "/h8") => {
+                for i in 0..8 {
+                    rsp.header(format!("X-Header-{i}: value-{i}"));
+                }
+                rsp.body("h8");
+            }
+            ("GET", "/h8kv") => {
+                // the same lines as /h8; a per-response value would come from the request
+                for i in 0..8 {
+                    rsp.header_kv(HEADER_NAMES[i], HEADER_VALUES[i]);
+                }
+                rsp.body("h8kv");
             }
             ("POST", "/echo") => {
                 let mut body = Vec::new();

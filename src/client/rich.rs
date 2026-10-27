@@ -352,7 +352,11 @@ pub struct Client {
 pub struct ClientStats {
     pub connections_created: u64,
     pub connections_reused: u64,
+    /// Closed instead of reused: the response left it unusable, the server closed it while idle
+    /// (found by the reuse check), a TLS rotation retired it, or the request failed on it.
     pub connections_discarded: u64,
+    /// Closed because they sat idle past `idle_timeout` or outlived `max_connection_lifetime`.
+    pub connections_expired: u64,
     pub pool_waits: u64,
     pub stale_retries: u64,
     pub redirects_followed: u64,
@@ -444,6 +448,7 @@ struct ClientStatsInner {
     connections_created: AtomicU64,
     connections_reused: AtomicU64,
     connections_discarded: AtomicU64,
+    connections_expired: AtomicU64,
     pool_waits: AtomicU64,
     stale_retries: AtomicU64,
     redirects_followed: AtomicU64,
@@ -455,6 +460,7 @@ impl ClientStatsInner {
             connections_created: self.connections_created.load(Ordering::Relaxed),
             connections_reused: self.connections_reused.load(Ordering::Relaxed),
             connections_discarded: self.connections_discarded.load(Ordering::Relaxed),
+            connections_expired: self.connections_expired.load(Ordering::Relaxed),
             pool_waits: self.pool_waits.load(Ordering::Relaxed),
             stale_retries: self.stale_retries.load(Ordering::Relaxed),
             redirects_followed: self.redirects_followed.load(Ordering::Relaxed),
@@ -1282,11 +1288,17 @@ impl Client {
                 .pool
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
-            state.purge_expired(
+            let expired = state.purge_expired(
                 now,
                 self.inner.config.idle_timeout,
                 self.inner.config.max_connection_lifetime,
             );
+            if expired > 0 {
+                self.inner
+                    .stats
+                    .connections_expired
+                    .fetch_add(expired as u64, Ordering::Relaxed);
+            }
             let idle = state.idle.get_mut(key).and_then(Vec::pop);
             if let Some(connection) = idle {
                 drop(state);
@@ -1888,8 +1900,10 @@ struct PoolState {
 }
 
 impl PoolState {
-    fn purge_expired(&mut self, now: Instant, idle_timeout: Duration, lifetime: Duration) {
+    /// Drop idle connections past their idle timeout or lifetime; returns how many.
+    fn purge_expired(&mut self, now: Instant, idle_timeout: Duration, lifetime: Duration) -> usize {
         let mut removed = Vec::new();
+        let mut expired = 0;
         self.idle.retain(|key, connections| {
             let before = connections.len();
             connections.retain(|connection| {
@@ -1903,6 +1917,7 @@ impl PoolState {
             !connections.is_empty()
         });
         for (key, count) in removed {
+            expired += count;
             self.total = self.total.saturating_sub(count);
             if let Some(origin_count) = self.per_origin.get_mut(&key) {
                 *origin_count = origin_count.saturating_sub(count);
@@ -1911,6 +1926,7 @@ impl PoolState {
                 }
             }
         }
+        expired
     }
 
     fn retire_tls_generations(&mut self, active_generation: u64) -> usize {
@@ -2558,7 +2574,10 @@ mod tests {
             ],
         );
 
-        state.purge_expired(now, Duration::from_secs(2), Duration::from_secs(20));
+        assert_eq!(
+            state.purge_expired(now, Duration::from_secs(2), Duration::from_secs(20)),
+            2
+        );
         assert_eq!(state.total, 0);
         assert!(!state.per_origin.contains_key(&key));
         assert!(!state.idle.contains_key(&key));
