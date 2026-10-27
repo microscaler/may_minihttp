@@ -11,6 +11,9 @@
 //!   per call pays
 //! - `reuse` one `HttpClient` per worker, kept alive across its requests
 //! - `pool`  one shared pooled [`Client`], `max_connections_per_origin = concurrency`
+//! - `pool-hook` the same pool with an interceptor whose hooks are empty but which does not opt
+//!   out (`Interceptor::ENABLED` left true): the cost of building the hook arguments, against
+//!   `pool` (no interceptor)
 //!
 //! `header-bytes` adds an `X-Pad` header of that size (a bearer token with claims is 1-6 KiB);
 //! `body-bytes > 0` makes the request a POST with a body of that size (`/echo` on bench_server).
@@ -23,7 +26,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use http::{HeaderName, HeaderValue, Method, Uri};
-use may_minihttp::client::{Client, HttpClient};
+use may_minihttp::client::{Client, HttpClient, Interceptor};
 
 struct Counting;
 
@@ -53,6 +56,7 @@ enum Mode {
     Fresh,
     Reuse,
     Pool,
+    PoolHook,
 }
 
 struct Job {
@@ -90,7 +94,7 @@ impl Job {
         Ok(sink.len())
     }
 
-    fn pooled(&self, client: &Client) -> io::Result<usize> {
+    fn pooled<I: Interceptor>(&self, client: &Client<I>) -> io::Result<usize> {
         let mut builder = client.request(self.method(), &self.url)?;
         if let Some(pad) = &self.pad {
             builder = builder.header(HeaderName::from_static("x-pad"), pad.clone());
@@ -106,6 +110,12 @@ impl Job {
     }
 }
 
+/// Empty hooks, still called: measures the interceptor plumbing itself.
+#[derive(Clone)]
+struct EmptyHooks;
+
+impl Interceptor for EmptyHooks {}
+
 fn arg<T: std::str::FromStr>(value: Option<String>, default: T) -> T {
     value.and_then(|v| v.parse().ok()).unwrap_or(default)
 }
@@ -116,9 +126,10 @@ fn main() -> io::Result<()> {
         Some("fresh") => Mode::Fresh,
         Some("reuse") => Mode::Reuse,
         Some("pool") => Mode::Pool,
+        Some("pool-hook") => Mode::PoolHook,
         _ => {
             eprintln!(
-                "usage: bench_client fresh|reuse|pool <url> [c] [n] [header-bytes] [body-bytes]"
+                "usage: bench_client fresh|reuse|pool|pool-hook <url> [c] [n] [header-bytes] [body-bytes]"
             );
             std::process::exit(2);
         }
@@ -152,6 +163,7 @@ fn main() -> io::Result<()> {
             .request_timeout(Duration::from_secs(30))
             .build()?,
     );
+    let hooked = Arc::new(pool.with_interceptor(EmptyHooks));
 
     // warm-up: one request per worker's worth of connections, not measured
     {
@@ -168,6 +180,7 @@ fn main() -> io::Result<()> {
         .map(|_| {
             let job = Arc::clone(&job);
             let pool = Arc::clone(&pool);
+            let hooked = Arc::clone(&hooked);
             let latencies = Arc::clone(&latencies);
             let errors = Arc::clone(&errors);
             may::go!(move || {
@@ -189,6 +202,7 @@ fn main() -> io::Result<()> {
                             }
                         }
                         Mode::Pool => job.pooled(&pool),
+                        Mode::PoolHook => job.pooled(&hooked),
                     };
                     match result {
                         Ok(_) => local.push(t.elapsed()),
@@ -224,6 +238,7 @@ fn main() -> io::Result<()> {
             Mode::Fresh => "fresh",
             Mode::Reuse => "reuse",
             Mode::Pool => "pool",
+            Mode::PoolHook => "pool-hook",
         },
         concurrency,
         per_worker,
@@ -237,7 +252,7 @@ fn main() -> io::Result<()> {
         pct(0.99),
         pct(1.0),
         allocs as f64 / (ok.max(1)) as f64,
-        if mode == Mode::Pool {
+        if matches!(mode, Mode::Pool | Mode::PoolHook) {
             format!(" pool={stats:?}")
         } else {
             String::new()

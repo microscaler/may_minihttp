@@ -18,6 +18,7 @@ use rustls::ClientConfig;
 use url::Url;
 
 use super::cancellation::{cancelled_error, is_cancelled_error, run_cancellable};
+use super::interceptor::{Interceptor, NoInterceptor, OutgoingRequest, ResponseHead, Timing};
 use super::{
     CancellationToken, ClientEvent, ClientObserver, ObservedOrigin, RequestMetadata,
     RequestMetadataContext, RequestMetadataProvider, Resolver, SystemResolver,
@@ -246,6 +247,11 @@ impl ClientBuilder {
     }
 
     pub fn build(self) -> io::Result<Client> {
+        self.build_with_interceptor(NoInterceptor)
+    }
+
+    /// Build a client that calls `interceptor` on every attempt (see [`Interceptor`]).
+    pub fn build_with_interceptor<I: Interceptor>(self, interceptor: I) -> io::Result<Client<I>> {
         if self.max_connections == 0 || self.max_connections_per_origin == 0 {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -339,13 +345,17 @@ impl ClientBuilder {
                 stats: ClientStatsInner::default(),
                 next_request_id: AtomicU64::new(1),
             }),
+            interceptor,
         })
     }
 }
 
+/// Pooled HTTP/1.1 client. `I` is the per-attempt [`Interceptor`]; the default does nothing and
+/// compiles away.
 #[derive(Clone)]
-pub struct Client {
+pub struct Client<I = NoInterceptor> {
     inner: Arc<ClientInner>,
+    interceptor: I,
 }
 
 /// Monotonic operational counters for a [`Client`].
@@ -469,7 +479,7 @@ impl ClientStatsInner {
     }
 }
 
-impl fmt::Debug for Client {
+impl<I> fmt::Debug for Client<I> {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("Client")
@@ -498,6 +508,16 @@ struct StreamingExecution<'a> {
     tls_snapshot: &'a mut Option<TlsConfigSnapshot>,
 }
 
+struct AttemptInfo<'a> {
+    method: &'a Method,
+    url: &'a Url,
+    trace: &'a RequestTrace,
+    attempt: u32,
+    redirect_hop: usize,
+    stale_retry: bool,
+    reused_connection: bool,
+}
+
 struct AttemptExecution<'a> {
     deadline: Instant,
     trace: &'a RequestTrace,
@@ -516,8 +536,23 @@ impl Client {
     pub fn new() -> io::Result<Self> {
         Self::builder().build()
     }
+}
 
-    pub fn request(&self, method: Method, url: &str) -> io::Result<RequestBuilder> {
+impl<I: Interceptor> Client<I> {
+    /// The same client (same connection pool, configuration and counters) with another
+    /// interceptor.
+    pub fn with_interceptor<J: Interceptor>(&self, interceptor: J) -> Client<J> {
+        Client {
+            inner: Arc::clone(&self.inner),
+            interceptor,
+        }
+    }
+
+    pub fn interceptor(&self) -> &I {
+        &self.interceptor
+    }
+
+    pub fn request(&self, method: Method, url: &str) -> io::Result<RequestBuilder<I>> {
         let url = parse_url(url)?;
         Ok(RequestBuilder {
             client: self.clone(),
@@ -530,11 +565,11 @@ impl Client {
         })
     }
 
-    pub fn get(&self, url: &str) -> io::Result<RequestBuilder> {
+    pub fn get(&self, url: &str) -> io::Result<RequestBuilder<I>> {
         self.request(Method::GET, url)
     }
 
-    pub fn post(&self, url: &str) -> io::Result<RequestBuilder> {
+    pub fn post(&self, url: &str) -> io::Result<RequestBuilder<I>> {
         self.request(Method::POST, url)
     }
 
@@ -543,7 +578,7 @@ impl Client {
         self.inner.stats.snapshot()
     }
 
-    fn execute(&self, request: RequestBuilder) -> io::Result<BufferedResponse> {
+    fn execute(&self, request: RequestBuilder<I>) -> io::Result<BufferedResponse> {
         let trace = self.begin_request(&request.method, &request.url);
         let cancellation = request.cancellation.clone();
         let result = match cancellation {
@@ -563,7 +598,7 @@ impl Client {
 
     fn execute_buffered(
         &self,
-        request: RequestBuilder,
+        request: RequestBuilder<I>,
         trace: &RequestTrace,
     ) -> io::Result<BufferedResponse> {
         let deadline = Instant::now()
@@ -691,7 +726,7 @@ impl Client {
         }
     }
 
-    fn execute_streaming(&self, request: RequestBuilder) -> io::Result<StreamingResponse> {
+    fn execute_streaming(&self, request: RequestBuilder<I>) -> io::Result<StreamingResponse> {
         let trace = self.begin_request(&request.method, &request.url);
         let cancellation = request.cancellation.clone();
         let result = match cancellation {
@@ -706,7 +741,7 @@ impl Client {
 
     fn execute_streaming_inner(
         &self,
-        request: RequestBuilder,
+        request: RequestBuilder<I>,
         trace: RequestTrace,
     ) -> io::Result<StreamingResponse> {
         if self.inner.config.redirect_policy != RedirectPolicy::None {
@@ -772,7 +807,7 @@ impl Client {
                     "request attempt counter overflow",
                 )
             })?;
-            let attempt_headers = self.prepare_attempt_headers(
+            let mut attempt_headers = self.prepare_attempt_headers(
                 headers,
                 RequestMetadataContext {
                     request_id: trace.request_id,
@@ -787,11 +822,36 @@ impl Client {
             )?;
             let mut lease = self.checkout(&key, Arc::clone(&tls_config), deadline, trace)?;
             let reused_idle_connection = lease.reused_idle_connection;
+            let timing = self.before_send(
+                &mut attempt_headers,
+                AttemptInfo {
+                    method,
+                    url,
+                    trace,
+                    attempt: *attempt,
+                    redirect_hop,
+                    stale_retry,
+                    reused_connection: reused_idle_connection,
+                },
+            );
             let result = (|| {
                 let mut response =
                     self.send_on_lease(&mut lease, method, url, &attempt_headers, body, deadline)?;
 
                 let status = response.status();
+                if I::ENABLED {
+                    if let Some(timing) = &timing {
+                        self.interceptor.after_response(
+                            &ResponseHead {
+                                status,
+                                version: response.version(),
+                                headers: response.headers(),
+                                url,
+                            },
+                            timing,
+                        );
+                    }
+                }
                 self.inner.observe(ClientEvent::ResponseHeaders {
                     request_id: trace.request_id,
                     origin: observed_url(url),
@@ -852,10 +912,16 @@ impl Client {
                         headers: response_headers,
                         body: bytes,
                         final_url: url.clone(),
+                        reused_connection: reused_idle_connection,
                     },
                     reusable,
                 ))
             })();
+            if I::ENABLED {
+                if let (Err(error), Some(timing)) = (&result, &timing) {
+                    self.interceptor.on_error(error, timing);
+                }
+            }
 
             match result {
                 Ok((response, true)) => {
@@ -920,7 +986,7 @@ impl Client {
                     "request attempt counter overflow",
                 )
             })?;
-            let attempt_headers = self.prepare_attempt_headers(
+            let mut attempt_headers = self.prepare_attempt_headers(
                 headers,
                 RequestMetadataContext {
                     request_id: trace.request_id,
@@ -935,7 +1001,37 @@ impl Client {
             )?;
             let mut lease = self.checkout(&key, Arc::clone(&tls_config), deadline, trace)?;
             let reused_idle_connection = lease.reused_idle_connection;
-            match self.send_on_lease(&mut lease, method, url, &attempt_headers, body, deadline) {
+            let timing = self.before_send(
+                &mut attempt_headers,
+                AttemptInfo {
+                    method,
+                    url,
+                    trace,
+                    attempt: *attempt,
+                    redirect_hop: 0,
+                    stale_retry,
+                    reused_connection: reused_idle_connection,
+                },
+            );
+            let sent =
+                self.send_on_lease(&mut lease, method, url, &attempt_headers, body, deadline);
+            if I::ENABLED {
+                if let Some(timing) = &timing {
+                    match &sent {
+                        Ok(response) => self.interceptor.after_response(
+                            &ResponseHead {
+                                status: response.status(),
+                                version: response.version(),
+                                headers: response.headers(),
+                                url,
+                            },
+                            timing,
+                        ),
+                        Err(error) => self.interceptor.on_error(error, timing),
+                    }
+                }
+            }
+            match sent {
                 Ok(response) => {
                     let status = response.status();
                     self.inner.observe(ClientEvent::ResponseHeaders {
@@ -968,6 +1064,7 @@ impl Client {
                         trace: *trace,
                         cancellation,
                         terminal_observed: false,
+                        reused_connection: reused_idle_connection,
                     };
                     if streaming
                         .response
@@ -1002,6 +1099,35 @@ impl Client {
                 }
             }
         }
+    }
+
+    /// Run the interceptor's `before_send` for one attempt; `None` (and no clock read) when the
+    /// interceptor is [`NoInterceptor`].
+    #[inline(always)]
+    fn before_send<'h>(
+        &self,
+        headers: &mut Cow<'h, HeaderMap>,
+        info: AttemptInfo<'_>,
+    ) -> Option<Timing> {
+        if !I::ENABLED {
+            return None;
+        }
+        let timing = Timing {
+            request_started: info.trace.started,
+            attempt_started: Instant::now(),
+            attempt: info.attempt,
+            reused_connection: info.reused_connection,
+        };
+        self.interceptor.before_send(&mut OutgoingRequest {
+            method: info.method,
+            url: info.url,
+            headers,
+            attempt: info.attempt,
+            redirect_hop: info.redirect_hop,
+            stale_retry: info.stale_retry,
+            reused_connection: info.reused_connection,
+        });
+        Some(timing)
     }
 
     fn tls_for_url(
@@ -1430,8 +1556,8 @@ impl Client {
 }
 
 /// Request builder whose body explicitly records whether it can be replayed.
-pub struct RequestBuilder {
-    client: Client,
+pub struct RequestBuilder<I = NoInterceptor> {
+    client: Client<I>,
     method: Method,
     url: Url,
     headers: HeaderMap,
@@ -1440,7 +1566,7 @@ pub struct RequestBuilder {
     cancellation: Option<CancellationToken>,
 }
 
-impl RequestBuilder {
+impl<I: Interceptor> RequestBuilder<I> {
     pub fn header(mut self, name: HeaderName, value: HeaderValue) -> Self {
         self.headers.append(name, value);
         self
@@ -1561,9 +1687,15 @@ pub struct BufferedResponse {
     headers: HeaderMap,
     body: Vec<u8>,
     final_url: Url,
+    reused_connection: bool,
 }
 
 impl BufferedResponse {
+    /// True when the response came over a pooled connection that an earlier request had used.
+    pub fn reused_connection(&self) -> bool {
+        self.reused_connection
+    }
+
     pub fn status(&self) -> StatusCode {
         self.status
     }
@@ -1617,6 +1749,7 @@ pub struct StreamingResponse {
     trace: RequestTrace,
     cancellation: Option<CancellationToken>,
     terminal_observed: bool,
+    reused_connection: bool,
 }
 
 impl fmt::Debug for StreamingResponse {
@@ -1633,6 +1766,11 @@ impl fmt::Debug for StreamingResponse {
 }
 
 impl StreamingResponse {
+    /// True when the response came over a pooled connection that an earlier request had used.
+    pub fn reused_connection(&self) -> bool {
+        self.reused_connection
+    }
+
     pub fn status(&self) -> StatusCode {
         self.status
     }
@@ -3949,6 +4087,137 @@ mod tests {
         );
         assert_eq!(client.stats().stale_retries, 1);
         assert!(observer.events().iter().any(|event| event == "retry:2"));
+        server.join().unwrap();
+    }
+
+    #[derive(Clone, Default)]
+    struct AttemptHeader {
+        events: Arc<std::sync::Mutex<Vec<String>>>,
+    }
+
+    impl Interceptor for AttemptHeader {
+        fn before_send(&self, request: &mut OutgoingRequest<'_, '_>) {
+            let attempt = request.attempt();
+            self.events.lock().unwrap().push(format!(
+                "before:{}:{}:{}",
+                request.url().path(),
+                attempt,
+                request.reused_connection()
+            ));
+            request.headers_mut().insert(
+                HeaderName::from_static("x-attempt"),
+                HeaderValue::from(attempt),
+            );
+        }
+
+        fn after_response(&self, response: &ResponseHead<'_>, timing: &Timing) {
+            self.events.lock().unwrap().push(format!(
+                "after:{}:{}:{}",
+                response.status().as_u16(),
+                timing.attempt(),
+                timing.reused_connection()
+            ));
+        }
+
+        fn on_error(&self, _error: &io::Error, timing: &Timing) {
+            self.events
+                .lock()
+                .unwrap()
+                .push(format!("error:{}", timing.attempt()));
+        }
+    }
+
+    #[test]
+    fn interceptor_runs_on_every_attempt_including_the_stale_retry() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = thread::spawn(move || {
+            let (mut stale, _) = listener.accept().unwrap();
+            let first = read_head(&mut stale).to_ascii_lowercase();
+            assert!(first.contains("x-attempt: 1\r\n"), "{first}");
+            stale
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok")
+                .unwrap();
+            stale.flush().unwrap();
+            let _ = read_head(&mut stale);
+            drop(stale);
+
+            let (mut replacement, _) = listener.accept().unwrap();
+            let retried = read_head(&mut replacement).to_ascii_lowercase();
+            // The header set in before_send is per attempt: the retry carries its own value.
+            assert!(retried.contains("x-attempt: 2\r\n"), "{retried}");
+            assert_eq!(retried.matches("x-attempt").count(), 1, "{retried}");
+            replacement
+                .write_all(
+                    b"HTTP/1.1 201 Created\r\nContent-Length: 5\r\nConnection: close\r\n\r\nfresh",
+                )
+                .unwrap();
+        });
+
+        let interceptor = AttemptHeader::default();
+        let client = Client::builder()
+            .redirect_policy(RedirectPolicy::None)
+            .request_timeout(Duration::from_secs(2))
+            .build_with_interceptor(interceptor.clone())
+            .unwrap();
+        let first = client
+            .get(&format!("http://127.0.0.1:{port}/first"))
+            .unwrap()
+            .send()
+            .unwrap();
+        assert!(!first.reused_connection());
+        let second = client
+            .get(&format!("http://127.0.0.1:{port}/second"))
+            .unwrap()
+            .send()
+            .unwrap();
+        assert_eq!(second.body(), b"fresh");
+        assert!(!second.reused_connection());
+        server.join().unwrap();
+
+        let events = interceptor.events.lock().unwrap().clone();
+        assert_eq!(
+            events,
+            [
+                "before:/first:1:false",
+                "after:200:1:false",
+                "before:/second:1:true",
+                "error:1",
+                "before:/second:2:false",
+                "after:201:2:false",
+            ]
+        );
+    }
+
+    #[test]
+    fn with_interceptor_shares_the_pool_and_reports_reuse() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            for _ in 0..2 {
+                let _ = read_head(&mut stream);
+                stream
+                    .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok")
+                    .unwrap();
+                stream.flush().unwrap();
+            }
+        });
+
+        let plain = test_client(RedirectPolicy::None);
+        let interceptor = AttemptHeader::default();
+        let intercepted = plain.with_interceptor(interceptor.clone());
+        let url = format!("http://127.0.0.1:{port}/");
+        assert!(!plain.get(&url).unwrap().send().unwrap().reused_connection());
+        let streamed = intercepted.get(&url).unwrap().send_streaming().unwrap();
+        assert!(streamed.reused_connection());
+        drop(streamed);
+        assert_eq!(plain.stats().connections_created, 1);
+        assert_eq!(plain.stats().connections_reused, 1);
+        assert_eq!(
+            interceptor.events.lock().unwrap().clone(),
+            ["before:/:1:true", "after:200:1:true"]
+        );
         server.join().unwrap();
     }
 

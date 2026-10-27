@@ -7,6 +7,7 @@ mod body;
 mod buffer;
 mod cancellation;
 mod client_impl;
+mod interceptor;
 mod metadata;
 mod multipart;
 mod observer;
@@ -19,6 +20,7 @@ mod tls;
 
 pub use cancellation::CancellationToken;
 pub use client_impl::HttpClient;
+pub use interceptor::{Interceptor, NoInterceptor, OutgoingRequest, ResponseHead, Timing};
 pub use metadata::{RequestMetadata, RequestMetadataContext, RequestMetadataProvider};
 pub use multipart::MultipartForm;
 pub use observer::{ClientEvent, ClientObserver, ObservedOrigin};
