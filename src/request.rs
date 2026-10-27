@@ -694,19 +694,15 @@ pub(crate) fn decode_with_close<'header, 'buf, 'stream, const N: usize>(
     // so we can transfer the mutable reference to Request
     let buf: &[u8] = unsafe { std::mem::transmute(req_buf.chunk()) };
 
-    // Wait for complete headers before parsing to prevent token errors (issue #18: a head split
-    // across TCP segments). Only the first MAX_REQUEST_HEAD_BYTES are searched: a head that has
-    // not ended by then is refused rather than buffered without bound.
+    // No separate `\r\n\r\n` pre-scan: `httparse` returns `Status::Partial` on any truncated
+    // head (mid-method, mid-path, mid-header, or no terminating `\r\n\r\n` yet), which maps to
+    // `Ok(None)` below, and malformed bytes are a permanent 400 whatever arrives later. Only the
+    // first MAX_REQUEST_HEAD_BYTES are parsed: a head that has not ended by then is refused (431)
+    // rather than buffered or re-parsed without bound.
     let window = &buf[..buf.len().min(MAX_REQUEST_HEAD_BYTES)];
-    if !window.windows(4).any(|w| w == b"\r\n\r\n") {
-        if buf.len() >= MAX_REQUEST_HEAD_BYTES {
-            return reject(431, "request head too large");
-        }
-        return Ok(None); // Need more data
-    }
 
     let header_limit = headers.len();
-    let status = match req.parse_with_uninit_headers(buf, headers) {
+    let status = match req.parse_with_uninit_headers(window, headers) {
         Ok(s) => s,
         Err(httparse::Error::TooManyHeaders) => {
             warn!(
@@ -723,6 +719,9 @@ pub(crate) fn decode_with_close<'header, 'buf, 'stream, const N: usize>(
 
     let len = match status {
         httparse::Status::Complete(amt) => amt,
+        httparse::Status::Partial if buf.len() >= MAX_REQUEST_HEAD_BYTES => {
+            return reject(431, "request head too large");
+        }
         httparse::Status::Partial => return Ok(None),
     };
     let framing = framing(&req)?;
