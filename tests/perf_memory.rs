@@ -16,7 +16,9 @@
 //!   5. endurance — 10 000 requests with RSS checkpoints every 1 000 requests
 //!
 //! Run with:
-//!     cargo test --test perf_memory --features client -- --test-threads=1 --nocapture
+//!     cargo test --test perf_memory --features client -- --nocapture
+//!
+//! The tests serialise themselves (see `serial`), so `--test-threads=1` is not needed.
 
 #[cfg(unix)]
 mod unix {
@@ -31,6 +33,21 @@ mod unix {
     use may_minihttp::{
         HttpServer, HttpService, Request as ServerRequest, Response as ServerResponse,
     };
+
+    // ========================================================================
+    // Serialisation
+    // ========================================================================
+
+    /// Every test here measures the RSS of the whole test process. `cargo test` runs the tests of
+    /// one binary on parallel threads, so each test's delta would include the other tests' servers,
+    /// clients and buffers: 9-10 MB of "growth" against a 3-5 MB budget, which is the other tests'
+    /// working set, not a leak. (nextest runs each test in its own process and never saw it.)
+    /// Holding one lock for the whole test makes the measurement mean what it says under both.
+    fn serial() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        LOCK.lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
 
     // ========================================================================
     // RSS reading helpers (Linux /proc/self/status)
@@ -219,6 +236,7 @@ mod unix {
 
     #[test]
     fn test_sustained_load_rss_delta() {
+        let _serial = serial();
         if read_rss_kb().is_none() {
             eprintln!("  SKIPPED: cannot read /proc/self/status (not Linux?)");
             return;
@@ -285,6 +303,7 @@ mod unix {
 
     #[test]
     fn test_connection_count_per_connection_rss() {
+        let _serial = serial();
         if read_rss_kb().is_none() {
             eprintln!("  SKIPPED: cannot read /proc/self/status (not Linux?)");
             return;
@@ -371,6 +390,7 @@ mod unix {
 
     #[test]
     fn test_body_size_rss_growth() {
+        let _serial = serial();
         if read_rss_kb().is_none() {
             eprintln!("  SKIPPED: cannot read /proc/self/status (not Linux?)");
             return;
@@ -444,6 +464,7 @@ mod unix {
 
     #[test]
     fn test_drop_cleanup_rss() {
+        let _serial = serial();
         if read_rss_kb().is_none() {
             eprintln!("  SKIPPED: cannot read /proc/self/status (not Linux?)");
             return;
@@ -545,6 +566,7 @@ mod unix {
 
     #[test]
     fn test_sustained_load_endurance() {
+        let _serial = serial();
         if read_rss_kb().is_none() {
             eprintln!("  SKIPPED: cannot read /proc/self/status (not Linux?)");
             return;

@@ -16,7 +16,7 @@ use may::sync::{Condvar, Mutex};
 use rustls::ClientConfig;
 use url::Url;
 
-use super::cancellation::{cancelled_error, is_cancelled_error};
+use super::cancellation::{cancelled_error, is_cancelled_error, run_cancellable};
 use super::{
     CancellationToken, ClientEvent, ClientObserver, ObservedOrigin, RequestMetadata,
     RequestMetadataContext, RequestMetadataProvider, Resolver, SystemResolver,
@@ -499,26 +499,6 @@ struct AttemptExecution<'a> {
     credentials_stripped: bool,
     sensitive_headers: &'a mut HashSet<HeaderName>,
     tls_snapshot: &'a mut Option<TlsConfigSnapshot>,
-}
-
-fn run_cancellable<T>(
-    token: &CancellationToken,
-    operation: impl FnOnce() -> io::Result<T> + Send,
-) -> io::Result<T>
-where
-    T: Send,
-{
-    token.check()?;
-    let mut result = None;
-    let selected = may::select!(
-        value = operation() => result = Some(value),
-        _ = token.wait() => {}
-    );
-    if selected == 1 {
-        Err(cancelled_error())
-    } else {
-        result.expect("completed cancellation race must retain the operation result")
-    }
 }
 
 impl Client {

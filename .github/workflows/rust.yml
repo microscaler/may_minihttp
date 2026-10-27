@@ -194,10 +194,13 @@ jobs:
           name: reports-client-windows-latest
           path: reports/client-windows/
 
-      # Download goose reports
+      # Download goose reports. The goose job only runs when every test job passed; when it was
+      # skipped there is no artifact, and the combined report already says "Skipped". Its absence
+      # must not fail this job and hide the real failure behind a second red X.
       - name: Download goose reports
         uses: actions/download-artifact@v4
         if: always()
+        continue-on-error: true
         with:
           name: goose-reports
           path: reports/goose/
