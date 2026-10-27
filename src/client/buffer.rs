@@ -63,6 +63,12 @@ impl<T: Read> Read for BufferIo<T> {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         use std::ptr;
         if self.reader_buf.is_empty() {
+            // Nothing buffered and the caller's buffer is at least as large as ours: read straight
+            // into it rather than into ours and then copy (what std's BufReader does). Body
+            // readers bound `buf` to the body, so this never reads past the response.
+            if buf.len() >= INIT_BUFFER_SIZE {
+                return self.inner.read(buf);
+            }
             self.bump_read()?;
         }
 
@@ -173,6 +179,21 @@ mod tests {
         assert_eq!(rdr.get_reader_buf().as_ref(), b"baz");
         rdr.consume(3);
         assert_eq!(rdr.get_reader_buf().as_ref(), b"");
+    }
+
+    #[test]
+    fn large_read_bypasses_the_buffer_and_small_read_fills_it() {
+        let raw = vec![7u8; 10_000];
+        let mut rdr = BufferIo::with_capacity(&raw[..], 4096);
+        let mut big = vec![0u8; 8192];
+        assert_eq!(rdr.read(&mut big).unwrap(), 8192);
+        assert!(
+            rdr.get_reader_buf().is_empty(),
+            "large read went straight to the caller"
+        );
+        let mut small = [0u8; 16];
+        assert_eq!(rdr.read(&mut small).unwrap(), 16);
+        assert_eq!(rdr.get_reader_buf().len(), 10_000 - 8192 - 16);
     }
 
     #[test]

@@ -231,6 +231,7 @@ impl<'a> Response<'a> {
         Ok(ChunkedBodyWriter {
             stream,
             finished: false,
+            frame: Vec::new(),
         })
     }
 
@@ -286,10 +287,30 @@ impl Drop for Response<'_> {
 pub struct ChunkedBodyWriter<'s> {
     stream: &'s mut TcpStream,
     finished: bool,
+    // one chunk (size line, data, CRLF) assembled here, reused across chunks
+    frame: Vec<u8>,
+}
+
+/// Lower-case hex digits of `n`, most significant first, into the end of `out`; returns the
+/// start index.
+fn hex_digits(mut n: usize, out: &mut [u8; 2 * std::mem::size_of::<usize>()]) -> usize {
+    let mut at = out.len();
+    loop {
+        at -= 1;
+        out[at] = b"0123456789abcdef"[n & 0xf];
+        n >>= 4;
+        if n == 0 {
+            return at;
+        }
+    }
 }
 
 impl ChunkedBodyWriter<'_> {
     /// Write one chunk and flush (clients observe data immediately).
+    ///
+    /// The size line, the data and the trailing CRLF go out in one write: with `TCP_NODELAY` each
+    /// write is its own segment, and the formatted size line alone could be more than one, so one
+    /// SSE event cost 3-4 syscalls and packets.
     pub fn write_chunk(&mut self, data: &[u8]) -> io::Result<()> {
         if self.finished {
             return Err(io::Error::other("chunked stream already finished"));
@@ -297,9 +318,15 @@ impl ChunkedBodyWriter<'_> {
         if data.is_empty() {
             return Ok(());
         }
-        write!(self.stream, "{:x}\r\n", data.len())?;
-        self.stream.write_all(data)?;
-        self.stream.write_all(b"\r\n")?;
+        let mut size = [0_u8; 2 * std::mem::size_of::<usize>()];
+        let at = hex_digits(data.len(), &mut size);
+        self.frame.clear();
+        self.frame.reserve(size.len() - at + data.len() + 4);
+        self.frame.extend_from_slice(&size[at..]);
+        self.frame.extend_from_slice(b"\r\n");
+        self.frame.extend_from_slice(data);
+        self.frame.extend_from_slice(b"\r\n");
+        self.stream.write_all(&self.frame)?;
         self.stream.flush()?;
         Ok(())
     }
@@ -401,6 +428,22 @@ pub(crate) fn encode_error(e: io::Error, buf: &mut BytesMut) {
 mod tests {
     use super::*;
     use std::borrow::Cow;
+
+    #[test]
+    fn chunk_size_line_is_lower_hex() {
+        for (len, hex) in [
+            (1_usize, "1"),
+            (15, "f"),
+            (16, "10"),
+            (255, "ff"),
+            (4096, "1000"),
+            (usize::MAX, "ffffffffffffffff"),
+        ] {
+            let mut size = [0_u8; 2 * std::mem::size_of::<usize>()];
+            let at = hex_digits(len, &mut size);
+            assert_eq!(&size[at..], hex.as_bytes());
+        }
+    }
 
     /// A `&'static str` header takes the Static fast path and stores the
     /// exact same slice. No allocation.

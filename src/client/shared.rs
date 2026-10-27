@@ -33,6 +33,14 @@ impl Transport {
             Self::Test(_) => None,
         };
         if let Some(socket) = socket {
+            // may's setters also call setsockopt(SO_RCVTIMEO / SO_SNDTIMEO): two syscalls, which
+            // the pooled client paid before every request and every body read (each re-deriving
+            // the timeout from the request deadline). The current value is read back from may
+            // without a syscall, and a change within `TIMEOUT_TOLERANCE` is not applied.
+            let current = socket.read_timeout().ok().flatten();
+            if timeout_close_enough(current, timeout) {
+                return;
+            }
             // Coroutine sockets can report EOPNOTSUPP for standard socket options. may still
             // enforces its I/O timeout, so preserve the existing best-effort behavior.
             let _ = socket.set_read_timeout(timeout);
@@ -69,6 +77,18 @@ impl Transport {
         {
             true
         }
+    }
+}
+
+/// Largest timeout change that is not applied: 5 ms, or a tenth of the new timeout if that is
+/// smaller. A deadline can be overshot (or a read cut short) by at most this much.
+const TIMEOUT_TOLERANCE: Duration = Duration::from_millis(5);
+
+fn timeout_close_enough(current: Option<Duration>, new: Option<Duration>) -> bool {
+    match (current, new) {
+        (None, None) => true,
+        (Some(current), Some(new)) => current.abs_diff(new) <= TIMEOUT_TOLERANCE.min(new / 10),
+        _ => false,
     }
 }
 
@@ -195,5 +215,25 @@ impl Write for SharedStream {
 
     fn flush(&mut self) -> io::Result<()> {
         self.with_buffer(Write::flush)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn timeout_changes_within_tolerance_are_skipped() {
+        let s = Duration::from_secs;
+        let ms = Duration::from_millis;
+        assert!(timeout_close_enough(None, None));
+        assert!(!timeout_close_enough(None, Some(s(1))));
+        assert!(!timeout_close_enough(Some(s(1)), None));
+        assert!(timeout_close_enough(Some(s(30)), Some(s(30) - ms(3))));
+        assert!(timeout_close_enough(Some(s(30) - ms(3)), Some(s(30))));
+        assert!(!timeout_close_enough(Some(s(30)), Some(s(30) - ms(6))));
+        // short timeouts: a tenth of the value
+        assert!(timeout_close_enough(Some(ms(20)), Some(ms(19))));
+        assert!(!timeout_close_enough(Some(ms(20)), Some(ms(17))));
     }
 }

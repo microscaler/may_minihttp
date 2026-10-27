@@ -570,7 +570,10 @@ impl Client {
         let mut body = request.body;
         let policy = self.inner.config.redirect_policy;
         let mut visited = HashSet::new();
-        visited.insert(normalized_url(&url));
+        // Only a policy that follows redirects needs loop detection; skip the URL copy otherwise.
+        if policy.max_hops().is_some() {
+            visited.insert(normalized_url(&url));
+        }
         let mut hops = 0_usize;
         let mut attempt = 0_u32;
         let mut credentials_stripped = false;
@@ -779,7 +782,9 @@ impl Client {
                     elapsed: trace.started.elapsed(),
                 });
                 let version = response.version();
-                let response_headers = response.headers().clone();
+                // The body reader does not need the headers: move them out instead of cloning
+                // the map (an allocation per header, per request).
+                let response_headers = std::mem::take(response.headers_mut());
                 let reusable = response_is_reusable(
                     method,
                     status,
@@ -787,19 +792,33 @@ impl Client {
                     &attempt_headers,
                     &response_headers,
                 );
-                let mut bytes = Vec::new();
                 let limit = self.inner.config.max_response_body;
-                // Keep body buffers off may's deliberately small coroutine stacks.
-                let mut chunk = vec![0_u8; 8 * 1024];
+                // Read straight into the result, sized from Content-Length when there is one
+                // (bounded by the limit), instead of through an 8 KiB scratch buffer allocated and
+                // zeroed per request and copied out of.
+                let expected = response_headers
+                    .get(CONTENT_LENGTH)
+                    .and_then(|value| value.to_str().ok())
+                    .and_then(|value| value.trim().parse::<usize>().ok())
+                    .map_or(0, |length| length.min(limit));
+                let mut bytes = Vec::with_capacity(expected);
                 loop {
+                    if response.body_complete() {
+                        break;
+                    }
                     let remaining = remaining(deadline)?;
                     response.set_timeout(Some(self.inner.config.io_timeout.min(remaining)))?;
-                    let allowed = chunk.len().min(limit.saturating_sub(bytes.len()) + 1);
-                    let read = response.read(&mut chunk[..allowed])?;
+                    if bytes.len() == bytes.capacity() {
+                        bytes.reserve(8 * 1024);
+                    }
+                    let filled = bytes.len();
+                    let allowed = (bytes.capacity() - filled).min(limit - filled.min(limit) + 1);
+                    bytes.resize(filled + allowed, 0);
+                    let read = response.read(&mut bytes[filled..])?;
+                    bytes.truncate(filled + read);
                     if read == 0 {
                         break;
                     }
-                    bytes.extend_from_slice(&chunk[..read]);
                     if bytes.len() > limit {
                         response.abandon_body();
                         return Err(io::Error::new(
@@ -909,7 +928,8 @@ impl Client {
                         elapsed: trace.started.elapsed(),
                     });
                     let version = response.version();
-                    let response_headers = response.headers().clone();
+                    let mut response = response;
+                    let response_headers = std::mem::take(response.headers_mut());
                     let reusable = response_is_reusable(
                         method,
                         status,
