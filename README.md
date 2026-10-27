@@ -128,6 +128,25 @@ let client = Client::builder().build_with_interceptor(AttemptId)?;
 # Ok::<(), Box<dyn std::error::Error>>(())
 ```
 
+#### Tracing (feature `tracing`)
+
+With the `tracing` feature, each request through `Client` is a span tree under target
+`may_minihttp::client`:
+
+- `http_client_request` (INFO) has method, server address and port, status, `error.type`, resend
+  count and connection reuse.
+- `http_client_connect` (INFO) covers a new connection.
+- `http_client_write`, `http_client_wait` (time to first byte) and `http_client_body` are at
+  DEBUG level.
+- `pool_checkout` and `pool_evict` are DEBUG events.
+
+Paths, query strings and headers are not recorded.
+
+Spans are never entered, because a coroutine can resume on another thread. Give the parent
+explicitly with `RequestBuilder::parent_span`, or hand the client your own per-request span with
+`RequestBuilder::request_span`. Without the feature, nothing is compiled in, and `tracing` is not a
+dependency.
+
 Multipart filesystem helpers are deliberately named `blocking_*` and must be called outside
 latency-sensitive may coroutines. Automatic stale-socket retry is limited to one attempt for
 idempotent requests with replayable bodies.
