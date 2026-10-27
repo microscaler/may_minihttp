@@ -91,6 +91,10 @@ required-features = ["client"]
 name = "client_pool_audit"
 required-features = ["client"]
 
+[[example]]
+name = "bench_client"
+required-features = ["client"]
+
 # Integration tests that drive the server with the native client. Without `required-features`
 # a plain `cargo test` (default features) failed to compile them.
 [[test]]

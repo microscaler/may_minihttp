@@ -138,6 +138,18 @@ fn nonblock_write(stream: &mut impl Write, rsp_buf: &mut BytesMut) -> io::Result
 }
 
 const BUF_LEN: usize = 4096 * 8;
+
+/// Most buffer capacity a connection keeps between requests.
+#[cfg(unix)]
+const MAX_RETAINED_BUF: usize = 256 * 1024;
+
+#[cfg(unix)]
+#[inline]
+fn shrink_if_idle(buf: &mut BytesMut) {
+    if buf.is_empty() && buf.capacity() > MAX_RETAINED_BUF {
+        *buf = BytesMut::with_capacity(BUF_LEN);
+    }
+}
 #[inline]
 pub(crate) fn reserve_buf(buf: &mut BytesMut) {
     let rem = buf.capacity() - buf.len();
@@ -222,6 +234,12 @@ fn each_connection_loop_with_headers<T: HttpService, const N: usize>(
 
         // write out the responses
         nonblock_write(stream.inner_mut(), &mut rsp_buf)?;
+
+        // A large response or upload grows these buffers; a keep-alive connection would otherwise
+        // hold that memory until it closes, however small its later requests are.
+        shrink_if_idle(&mut rsp_buf);
+        shrink_if_idle(&mut req_buf);
+        shrink_if_idle(&mut body_buf);
 
         if read_blocked {
             stream.wait_io();
