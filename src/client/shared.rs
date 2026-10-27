@@ -43,6 +43,33 @@ impl Transport {
     fn is_tls(&self) -> bool {
         matches!(self, Self::Tls(_))
     }
+
+    /// Whether an idle connection can carry another request, judged without blocking: `false` when
+    /// the peer has closed it (EOF), it errored, or (plain HTTP) it holds bytes nobody asked for,
+    /// such as a late `408`. A TLS connection with pending bytes is kept: they may be a session
+    /// ticket rustls has not read yet. Only implemented on unix, where may sockets are
+    /// non-blocking; elsewhere every connection passes and the stale-retry path covers it.
+    fn idle_usable(&self) -> bool {
+        #[cfg(unix)]
+        {
+            let (socket, tls) = match self {
+                Self::Plain(socket) => (socket, false),
+                Self::Tls(stream) => (&stream.sock, true),
+                #[cfg(test)]
+                Self::Test(_) => return true,
+            };
+            let mut probe = [0_u8; 1];
+            match socket.inner().peek(&mut probe) {
+                Ok(0) => false,
+                Ok(_) => tls,
+                Err(error) => error.kind() == io::ErrorKind::WouldBlock,
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            true
+        }
+    }
 }
 
 impl Read for Transport {
@@ -125,6 +152,15 @@ impl SharedStream {
 
     pub fn is_tls(&self) -> io::Result<bool> {
         self.with_buffer(|buffer| Ok(buffer.inner_mut().is_tls()))
+    }
+
+    /// See [`Transport::idle_usable`]; a connection with buffered, unread response bytes is not
+    /// usable either.
+    pub fn idle_usable(&self) -> bool {
+        self.with_buffer(|buffer| {
+            Ok(buffer.get_reader_buf().is_empty() && buffer.inner_mut().idle_usable())
+        })
+        .unwrap_or(false)
     }
 
     pub fn set_timeout(&self, timeout: Option<Duration>) -> io::Result<()> {

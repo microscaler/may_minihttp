@@ -277,6 +277,12 @@ impl HttpClient {
         Ok(Arc::new(config))
     }
 
+    /// Whether this idle connection can carry another request (peer not closed, nothing unread).
+    /// Never blocks. Used by the pool before reusing a connection.
+    pub(crate) fn idle_usable(&self) -> bool {
+        self.conn.idle_usable()
+    }
+
     /// Set read/write timeout on the underlying connection.
     pub fn set_timeout(&mut self, timeout: Option<Duration>) -> &mut Self {
         let _ = self.conn.set_timeout(timeout);
