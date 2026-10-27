@@ -2354,6 +2354,22 @@ mod tests {
         }
     }
 
+    /// Spawn a test coroutine with a 256 KiB stack. A full client request needs more than may's
+    /// 32 KiB default in Windows debug builds (these tests aborted there with 0xc00000fd); hosts
+    /// configure larger stacks in production (BRRTRouter: 256 KiB). `may::go!` always takes the
+    /// default.
+    fn go<T: Send + 'static>(
+        operation: impl FnOnce() -> T + Send + 'static,
+    ) -> may::coroutine::JoinHandle<T> {
+        // SAFETY: test closures touch no coroutine-unsafe thread-local state.
+        unsafe {
+            may::coroutine::Builder::new()
+                .stack_size(256 * 1024 / std::mem::size_of::<usize>())
+                .spawn(operation)
+        }
+        .expect("spawn test coroutine")
+    }
+
     fn read_head(stream: &mut impl Read) -> String {
         let mut request = Vec::new();
         let mut byte = [0_u8; 1];
@@ -3349,7 +3365,7 @@ mod tests {
         response.read_exact(&mut first).unwrap();
         assert_eq!(&first, b"a");
 
-        let blocked_read = may::go!(move || {
+        let blocked_read = go(move || {
             let mut next = [0_u8; 1];
             let result = response.read(&mut next);
             (response, result)
@@ -3502,7 +3518,7 @@ mod tests {
             .connect_timeout(Duration::from_secs(10))
             .build()
             .unwrap();
-        let request = may::go!(move || {
+        let request = go(move || {
             client
                 .get("http://resolution.internal:8080/")
                 .unwrap()
@@ -3560,7 +3576,7 @@ mod tests {
         let token = CancellationToken::new();
         let request_token = token.clone();
         let cancelled_client = client.clone();
-        let request = may::go!(move || {
+        let request = go(move || {
             cancelled_client
                 .get(&format!(
                     "http://connect.internal:{}/cancel",
@@ -3625,7 +3641,7 @@ mod tests {
         let token = CancellationToken::new();
         let request_token = token.clone();
         let cancelled_client = client.clone();
-        let request = may::go!(move || {
+        let request = go(move || {
             cancelled_client
                 .get(&format!("http://127.0.0.1:{port}/cancel"))
                 .unwrap()
@@ -3682,7 +3698,7 @@ mod tests {
             .unwrap();
         let token = CancellationToken::new();
         let request_token = token.clone();
-        let request = may::go!(move || {
+        let request = go(move || {
             client
                 .get(&format!("http://127.0.0.1:{port}/race"))
                 .unwrap()
@@ -3909,13 +3925,13 @@ mod tests {
             .unwrap();
         let first = client.clone();
         let second = client.clone();
-        let one = may::go!(move || {
+        let one = go(move || {
             first
                 .get(&format!("http://127.0.0.1:{port}/one"))
                 .unwrap()
                 .send()
         });
-        let two = may::go!(move || {
+        let two = go(move || {
             second
                 .get(&format!("http://127.0.0.1:{port}/two"))
                 .unwrap()
@@ -3961,7 +3977,7 @@ mod tests {
             .build()
             .unwrap();
         let holding_client = client.clone();
-        let holding = may::go!(move || {
+        let holding = go(move || {
             holding_client
                 .get(&format!("http://127.0.0.1:{port}/hold"))
                 .unwrap()
@@ -3972,7 +3988,7 @@ mod tests {
         let token = CancellationToken::new();
         let wait_token = token.clone();
         let waiting_client = client.clone();
-        let waiting = may::go!(move || {
+        let waiting = go(move || {
             waiting_client
                 .get(&format!("http://127.0.0.1:{port}/must-not-send"))
                 .unwrap()
@@ -4032,7 +4048,7 @@ mod tests {
             .build()
             .unwrap();
         let blocked_client = client.clone();
-        let blocked = may::go!(move || {
+        let blocked = go(move || {
             blocked_client
                 .get(&format!("http://127.0.0.1:{port}/blocked"))
                 .unwrap()
