@@ -112,6 +112,9 @@ pub struct Response<'a> {
     status_message: StatusMessage,
     body: Body,
     rsp_buf: &'a mut BytesMut,
+    /// Header lines added with [`Response::header_kv`], already encoded (`\r\nName: value` each),
+    /// in a buffer the connection reuses.
+    kv_head: &'a mut BytesMut,
     /// When true, headers/body were already written to the socket (chunked/SSE).
     /// [`encode`] becomes a no-op so the connection loop does not double-write.
     streamed: bool,
@@ -129,7 +132,7 @@ struct StatusMessage {
 }
 
 impl<'a> Response<'a> {
-    pub(crate) fn new(rsp_buf: &'a mut BytesMut) -> Response<'a> {
+    pub(crate) fn new(rsp_buf: &'a mut BytesMut, kv_head: &'a mut BytesMut) -> Response<'a> {
         Response {
             headers: std::array::from_fn(|_| ResponseHeader::Static("")),
             headers_len: 0,
@@ -140,6 +143,7 @@ impl<'a> Response<'a> {
                 msg: "Ok",
             },
             rsp_buf,
+            kv_head,
             streamed: false,
         }
     }
@@ -197,6 +201,30 @@ impl<'a> Response<'a> {
         } else {
             self.more_headers.push(header);
         }
+        self
+    }
+
+    /// Append the header `name: value` without building the line as a string first.
+    ///
+    /// The line is encoded straight into a buffer the connection reuses, so a header whose value
+    /// is computed per response costs no allocation (with [`Response::header`] it costs one: the
+    /// caller's `format!`). These lines are written after the ones added with `header`, in the
+    /// order added.
+    ///
+    /// A name that is not an HTTP token, or a value containing CR, LF or NUL, is dropped and
+    /// logged (it would split the response).
+    pub fn header_kv(&mut self, name: &str, value: &str) -> &mut Self {
+        let name_ok = !name.is_empty() && name.bytes().all(is_token_byte);
+        let value_ok = !value.bytes().any(|b| b == b'\r' || b == b'\n' || b == 0);
+        if !(name_ok && value_ok) {
+            error!("response header dropped: invalid name or a value containing CR, LF or NUL");
+            return self;
+        }
+        self.kv_head.reserve(name.len() + value.len() + 4);
+        self.kv_head.extend_from_slice(b"\r\n");
+        self.kv_head.extend_from_slice(name.as_bytes());
+        self.kv_head.extend_from_slice(b": ");
+        self.kv_head.extend_from_slice(value.as_bytes());
         self
     }
 
@@ -273,14 +301,22 @@ impl<'a> Response<'a> {
     /// public API; gated so downstream crates cannot accidentally rely on it.
     #[doc(hidden)]
     pub fn _test_new(rsp_buf: &'a mut BytesMut) -> Response<'a> {
-        Response::new(rsp_buf)
+        // test-only: the header_kv buffer is leaked (a few bytes per call)
+        Response::new(rsp_buf, Box::leak(Box::new(BytesMut::new())))
     }
 }
 
 impl Drop for Response<'_> {
     fn drop(&mut self) {
         self.rsp_buf.clear();
+        self.kv_head.clear();
     }
+}
+
+/// RFC 9110 `tchar`.
+#[inline]
+fn is_token_byte(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(&b)
 }
 
 /// Writer returned by [`Response::begin_chunked_stream`].
@@ -378,6 +414,7 @@ fn write_status_and_headers(rsp: &Response<'_>, buf: &mut BytesMut, chunked: boo
         buf.extend_from_slice(b"\r\n");
         buf.extend_from_slice(h.as_bytes());
     }
+    buf.extend_from_slice(rsp.kv_head);
 
     buf.extend_from_slice(b"\r\n\r\n");
 }
@@ -428,6 +465,31 @@ pub(crate) fn encode_error(e: io::Error, buf: &mut BytesMut) {
 mod tests {
     use super::*;
     use std::borrow::Cow;
+
+    #[test]
+    fn header_kv_is_written_after_header_lines_and_rejects_splitting() {
+        let mut rsp_buf = BytesMut::new();
+        let mut kv = BytesMut::new();
+        let mut out = BytesMut::new();
+        {
+            let mut res = Response::new(&mut rsp_buf, &mut kv);
+            res.header("Content-Type: application/json");
+            res.header_kv("X-Request-ID", "01J");
+            res.header_kv("Set-Cookie", "a=1; Path=/");
+            res.header_kv("X-Bad", "v\r\nInjected: 1");
+            res.header_kv("Bad Name", "v");
+            res.header_kv("", "v");
+            res.body("ok");
+            encode(res, &mut out);
+        }
+        let text = std::str::from_utf8(&out).unwrap();
+        assert!(text.contains(
+            "\r\nContent-Type: application/json\r\nX-Request-ID: 01J\r\nSet-Cookie: a=1; Path=/\r\n\r\nok"
+        ), "{text}");
+        assert!(!text.contains("Injected"));
+        assert!(!text.contains("Bad Name"));
+        assert!(kv.is_empty(), "the buffer is cleared for the next response");
+    }
 
     #[test]
     fn chunk_size_line_is_lower_hex() {
@@ -482,7 +544,8 @@ mod tests {
         let mut rsp_buf = BytesMut::new();
         let mut out = BytesMut::new();
         {
-            let mut res = Response::new(&mut rsp_buf);
+            let mut kv = BytesMut::new();
+            let mut res = Response::new(&mut rsp_buf, &mut kv);
             res.status_code(200, "OK");
             res.header("Content-Type: application/json");
             res.header(format!("X-Request-ID: {}", "01J"));

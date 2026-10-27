@@ -188,6 +188,8 @@ fn each_connection_loop_with_headers<T: HttpService, const N: usize>(
     let mut req_buf = BytesMut::with_capacity(BUF_LEN);
     let mut rsp_buf = BytesMut::with_capacity(BUF_LEN);
     let mut body_buf = BytesMut::with_capacity(4096);
+    // header lines from `Response::header_kv`, reused across responses
+    let mut kv_buf = BytesMut::with_capacity(512);
     // set by a request whose body could not be delimited or discarded: answer it, then close
     let close = Cell::new(false);
 
@@ -212,7 +214,7 @@ fn each_connection_loop_with_headers<T: HttpService, const N: usize>(
                 }
             };
             reserve_buf(&mut rsp_buf);
-            let mut rsp = Response::new(&mut body_buf);
+            let mut rsp = Response::new(&mut body_buf, &mut kv_buf);
             match service.call(req, &mut rsp) {
                 Ok(()) => response::encode(rsp, &mut rsp_buf),
                 Err(e) => {
@@ -240,6 +242,7 @@ fn each_connection_loop_with_headers<T: HttpService, const N: usize>(
         shrink_if_idle(&mut rsp_buf);
         shrink_if_idle(&mut req_buf);
         shrink_if_idle(&mut body_buf);
+        shrink_if_idle(&mut kv_buf);
 
         if read_blocked {
             stream.wait_io();
@@ -299,6 +302,7 @@ fn each_connection_loop_with_headers<T: HttpService, const N: usize>(
     let mut req_buf = BytesMut::with_capacity(BUF_LEN);
     let mut rsp_buf = BytesMut::with_capacity(BUF_LEN);
     let mut body_buf = BytesMut::with_capacity(BUF_LEN);
+    let mut kv_buf = BytesMut::with_capacity(512);
     let close = Cell::new(false);
     let mut refused = None;
     loop {
@@ -329,7 +333,7 @@ fn each_connection_loop_with_headers<T: HttpService, const N: usize>(
                         break;
                     }
                 };
-                let mut rsp = Response::new(&mut body_buf);
+                let mut rsp = Response::new(&mut body_buf, &mut kv_buf);
                 match service.call(req, &mut rsp) {
                     Ok(()) => response::encode(rsp, &mut rsp_buf),
                     Err(e) => {
