@@ -97,6 +97,37 @@ cancellation interrupts may-aware waits and I/O, discards incomplete connections
 unsafe coroutine cancellation still performs pool cleanup but deliberately invokes no callbacks
 from `Drop`.
 
+#### Per-attempt hooks
+
+`Client<I>` is generic over an `Interceptor`, which defaults to `NoInterceptor` and then compiles
+away. An interceptor's `before_send` runs on every attempt the client makes: the first try, the
+pool's own retry on a fresh connection, and each redirect hop. It can add or change headers for
+that attempt. `after_response` sees the response head with the attempt's timing (time to first
+byte, whether the connection was reused), and `on_error` sees a failed attempt, including one a
+retry then hid from the caller. Headers that are the same for every attempt are simpler to set on
+the request builder.
+
+```rust,no_run
+use may_minihttp::client::{Client, Interceptor, OutgoingRequest};
+use http::{HeaderName, HeaderValue};
+
+#[derive(Clone)]
+struct AttemptId;
+
+impl Interceptor for AttemptId {
+    fn before_send(&self, request: &mut OutgoingRequest<'_, '_>) {
+        let attempt = HeaderValue::from(request.attempt());
+        request
+            .headers_mut()
+            .insert(HeaderName::from_static("x-attempt"), attempt);
+    }
+}
+
+let client = Client::builder().build_with_interceptor(AttemptId)?;
+// or, sharing an existing client's pool: existing.with_interceptor(AttemptId)
+# Ok::<(), Box<dyn std::error::Error>>(())
+```
+
 Multipart filesystem helpers are deliberately named `blocking_*` and must be called outside
 latency-sensitive may coroutines. Automatic stale-socket retry is limited to one attempt for
 idempotent requests with replayable bodies.
