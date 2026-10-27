@@ -1251,25 +1251,37 @@ impl Client {
                 self.inner.config.idle_timeout,
                 self.inner.config.max_connection_lifetime,
             );
-            if let Some(connections) = state.idle.get_mut(key) {
-                if let Some(connection) = connections.pop() {
-                    self.inner
-                        .stats
-                        .connections_reused
-                        .fetch_add(1, Ordering::Relaxed);
-                    let lease = PoolLease::with_connection(
-                        Arc::clone(&self.inner),
-                        key.clone(),
-                        connection,
-                        trace.request_id,
-                    );
-                    drop(state);
-                    self.inner.observe(ClientEvent::ConnectionReused {
-                        request_id: trace.request_id,
-                        origin: observed_key(key),
-                    });
-                    return Ok(lease);
+            let idle = state.idle.get_mut(key).and_then(Vec::pop);
+            if let Some(connection) = idle {
+                drop(state);
+                let lease = PoolLease::with_connection(
+                    Arc::clone(&self.inner),
+                    key.clone(),
+                    connection,
+                    trace.request_id,
+                );
+                // Health on reuse: a connection the server closed while it sat idle (its keep-alive
+                // timeout is often shorter than ours) is dropped here, before a request is written
+                // to it. The stale-retry path only covers idempotent, replayable requests; a POST
+                // on such a connection used to fail outright.
+                if !lease
+                    .connection
+                    .as_ref()
+                    .is_some_and(|connection| connection.client.idle_usable())
+                {
+                    // dropping the lease releases its slot and counts it discarded
+                    drop(lease);
+                    continue;
                 }
+                self.inner
+                    .stats
+                    .connections_reused
+                    .fetch_add(1, Ordering::Relaxed);
+                self.inner.observe(ClientEvent::ConnectionReused {
+                    request_id: trace.request_id,
+                    origin: observed_key(key),
+                });
+                return Ok(lease);
             }
             let per_origin = state.per_origin.get(key).copied().unwrap_or(0);
             if state.total < self.inner.config.max_connections
@@ -2386,6 +2398,59 @@ mod tests {
             .request_timeout(Duration::from_secs(2))
             .build()
             .unwrap()
+    }
+
+    #[test]
+    fn pool_drops_an_idle_connection_the_server_closed_before_reusing_it() {
+        // The server answers one request per connection and closes it, while still saying
+        // keep-alive (as a server whose idle timeout fired would). A POST is not stale-retried,
+        // so before the reuse check the second POST failed on the dead pooled connection.
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = thread::spawn(move || {
+            for _ in 0..2 {
+                let (mut stream, _) = listener.accept().unwrap();
+                let head = read_head(&mut stream);
+                let length: usize = head
+                    .lines()
+                    .find_map(|l| {
+                        l.to_ascii_lowercase()
+                            .strip_prefix("content-length:")
+                            .map(|v| v.trim().parse().unwrap())
+                    })
+                    .unwrap_or(0);
+                let mut body = vec![0_u8; length];
+                stream.read_exact(&mut body).unwrap();
+                stream
+                    .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok")
+                    .unwrap();
+                // drop: the connection closes with no Connection: close
+            }
+        });
+        let client = test_client(RedirectPolicy::None);
+        let url = format!("http://127.0.0.1:{port}/submit");
+        let first = client
+            .post(&url)
+            .unwrap()
+            .body(b"one".to_vec())
+            .send()
+            .unwrap();
+        assert_eq!(first.body(), b"ok");
+        // let the FIN arrive
+        thread::sleep(Duration::from_millis(50));
+        let second = client
+            .post(&url)
+            .unwrap()
+            .body(b"two".to_vec())
+            .send()
+            .unwrap();
+        assert_eq!(second.body(), b"ok");
+        server.join().unwrap();
+        let stats = client.stats();
+        assert_eq!(stats.connections_created, 2);
+        assert_eq!(stats.connections_reused, 0);
+        assert_eq!(stats.connections_discarded, 1);
+        assert_eq!(stats.stale_retries, 0);
     }
 
     #[test]
@@ -3756,6 +3821,9 @@ mod tests {
                 .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok")
                 .unwrap();
             stale.flush().unwrap();
+            // The connection dies after the client wrote its next request on it (the pool's
+            // idle check passed): the server reads that request and closes without answering.
+            let _ = read_head(&mut stale);
             drop(stale);
 
             let (mut replacement, _) = listener.accept().unwrap();
@@ -3809,6 +3877,9 @@ mod tests {
                 .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok")
                 .unwrap();
             stale.flush().unwrap();
+            // The connection dies after the client wrote its next request on it (the pool's
+            // idle check passed): the server reads that request and closes without answering.
+            let _ = read_head(&mut stale);
             drop(stale);
 
             let (mut replacement, _) = listener.accept().unwrap();
@@ -3872,6 +3943,9 @@ mod tests {
                 .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok")
                 .unwrap();
             stale.flush().unwrap();
+            // The connection dies after the client wrote its next request on it (the pool's
+            // idle check passed): the server reads that request and closes without answering.
+            let _ = read_head(&mut stale);
             drop(stale);
 
             thread::sleep(Duration::from_millis(150));
@@ -3903,18 +3977,6 @@ mod tests {
     fn pool_capacity_waits_without_opening_a_second_connection() {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
-        let server = thread::spawn(move || {
-            let (mut stream, _) = listener.accept().unwrap();
-            for _ in 0..2 {
-                let _ = read_head(&mut stream);
-                thread::sleep(Duration::from_millis(25));
-                stream
-                    .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok")
-                    .unwrap();
-                stream.flush().unwrap();
-            }
-        });
-
         let observer = Arc::new(RecordingObserver::default());
         let client = Client::builder()
             .max_connections(1)
@@ -3923,6 +3985,24 @@ mod tests {
             .observer(observer.clone())
             .build()
             .unwrap();
+        let watched = client.clone();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            for request in 0..2 {
+                let _ = read_head(&mut stream);
+                // Hold the first response until the second request is queued behind it. (A fixed
+                // 25 ms sleep raced the scheduler on a loaded host: the second request could start
+                // after the first had finished, and never wait.)
+                let deadline = Instant::now() + Duration::from_secs(1);
+                while request == 0 && watched.stats().pool_waits == 0 && Instant::now() < deadline {
+                    thread::sleep(Duration::from_millis(1));
+                }
+                stream
+                    .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok")
+                    .unwrap();
+                stream.flush().unwrap();
+            }
+        });
         let first = client.clone();
         let second = client.clone();
         let one = go(move || {
