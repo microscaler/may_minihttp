@@ -1,5 +1,6 @@
 //! Replay-aware requests, secure redirects, and bounded connection pooling.
 
+use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::io::{self, Read};
@@ -1107,19 +1108,27 @@ impl Client {
         snapshot
     }
 
-    fn prepare_attempt_headers(
+    fn prepare_attempt_headers<'h>(
         &self,
-        request_headers: &HeaderMap,
+        request_headers: &'h HeaderMap,
         context: RequestMetadataContext<'_>,
         credentials_stripped: bool,
         sensitive_headers: &mut HashSet<HeaderName>,
-    ) -> io::Result<HeaderMap> {
+    ) -> io::Result<Cow<'h, HeaderMap>> {
         validate_request_headers(
             request_headers,
             self.inner.config.max_request_headers,
             self.inner.config.max_request_header_bytes,
             "request",
         )?;
+        // Nothing to merge in (no default headers, no metadata provider, nothing stripped): the
+        // request's own headers are the attempt's, borrowed rather than rebuilt per attempt.
+        if self.inner.config.default_headers.is_empty()
+            && self.inner.metadata_provider.is_none()
+            && !credentials_stripped
+        {
+            return Ok(Cow::Borrowed(request_headers));
+        }
 
         let mut headers = self.inner.config.default_headers.clone();
         if let Some(provider) = &self.inner.metadata_provider {
@@ -1172,7 +1181,7 @@ impl Client {
             self.inner.config.max_request_header_bytes,
             "merged",
         )?;
-        Ok(headers)
+        Ok(Cow::Owned(headers))
     }
 
     fn send_on_lease(
@@ -2104,7 +2113,8 @@ fn origin_form(url: &Url) -> io::Result<http::Uri> {
         target.push('?');
         target.push_str(query);
     }
-    target.parse().map_err(|error| {
+    // `try_from(String)` takes the buffer; `parse()` would copy it.
+    http::Uri::try_from(target).map_err(|error| {
         io::Error::new(
             io::ErrorKind::InvalidInput,
             format!("URL cannot be represented as an HTTP request target: {error}"),
