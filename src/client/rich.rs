@@ -2400,6 +2400,9 @@ mod tests {
             .unwrap()
     }
 
+    // The idle check peeks the socket, which may only allows on unix (where its sockets are
+    // non-blocking); elsewhere the stale-retry path is all there is, and a POST is not retried.
+    #[cfg(unix)]
     #[test]
     fn pool_drops_an_idle_connection_the_server_closed_before_reusing_it() {
         // The server answers one request per connection and closes it, while still saying
