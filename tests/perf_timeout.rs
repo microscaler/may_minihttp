@@ -53,8 +53,11 @@ impl HttpService for DelayService {
         self.state.request_count.fetch_add(1, Ordering::Relaxed);
 
         if self.state.delay_enabled.load(Ordering::Relaxed) {
-            // Delay long enough to exceed the 100ms client timeout
-            thread::sleep(Duration::from_millis(500));
+            // Delay long enough to exceed the 100ms client timeout. A coroutine sleep: a thread
+            // sleep blocked the may worker thread, and when that worker also polled the client
+            // socket's timer the client's 100 ms timeout could not fire until the 500 ms were up
+            // (test_write_timeout then saw its POST succeed, about 1 run in 5 on a busy host).
+            may::coroutine::sleep(Duration::from_millis(500));
         }
 
         res.body("delayed ok");
