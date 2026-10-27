@@ -140,6 +140,7 @@ fn nonblock_write(stream: &mut impl Write, rsp_buf: &mut BytesMut) -> io::Result
 const BUF_LEN: usize = 4096 * 8;
 
 /// Most buffer capacity a connection keeps between requests.
+#[cfg(unix)]
 const MAX_RETAINED_BUF: usize = 256 * 1024;
 
 #[cfg(unix)]

@@ -173,23 +173,27 @@ jobs:
       # Download all nextest artifact groups
       - name: Download nextest reports (default, ubuntu)
         uses: actions/download-artifact@v4
+        continue-on-error: true
         with:
           name: reports-default-ubuntu-latest
           path: reports/default-ubuntu/
       - name: Download nextest reports (client, ubuntu)
         uses: actions/download-artifact@v4
+        continue-on-error: true
         if: always()
         with:
           name: reports-client-ubuntu-latest
           path: reports/client-ubuntu/
       - name: Download nextest reports (default, windows)
         uses: actions/download-artifact@v4
+        continue-on-error: true
         if: always()
         with:
           name: reports-default-windows-latest
           path: reports/default-windows/
       - name: Download nextest reports (client, windows)
         uses: actions/download-artifact@v4
+        continue-on-error: true
         if: always()
         with:
           name: reports-client-windows-latest
