@@ -1,5 +1,6 @@
 //! http server implementation on top of `MAY`
 
+use std::cell::Cell;
 use std::io::{self, Read, Write};
 use std::mem::MaybeUninit;
 use std::net::ToSocketAddrs;
@@ -175,16 +176,28 @@ fn each_connection_loop_with_headers<T: HttpService, const N: usize>(
     let mut req_buf = BytesMut::with_capacity(BUF_LEN);
     let mut rsp_buf = BytesMut::with_capacity(BUF_LEN);
     let mut body_buf = BytesMut::with_capacity(4096);
+    // set by a request whose body could not be delimited or discarded: answer it, then close
+    let close = Cell::new(false);
 
     loop {
         let read_blocked = nonblock_read(stream.inner_mut(), &mut req_buf)?;
+        let mut refused = None;
 
         // prepare the requests, we should make sure the request is fully read
         loop {
             let mut headers = [MaybeUninit::uninit(); N];
-            let req = match request::decode(&mut headers, &mut req_buf, stream)? {
-                Some(req) => req,
-                None => break,
+            let req = match request::decode_with_close(
+                &mut headers,
+                &mut req_buf,
+                stream,
+                Some(&close),
+            ) {
+                Ok(Some(req)) => req,
+                Ok(None) => break,
+                Err(e) => {
+                    refused = Some(e);
+                    break;
+                }
             };
             reserve_buf(&mut rsp_buf);
             let mut rsp = Response::new(&mut body_buf);
@@ -195,8 +208,16 @@ fn each_connection_loop_with_headers<T: HttpService, const N: usize>(
                     response::encode_error(e, &mut rsp_buf);
                 }
             }
-            // here need to use no_delay tcp option
-            // nonblock_write(stream.inner_mut(), &mut rsp_buf)?;
+            if close.get() {
+                break;
+            }
+        }
+
+        if let Some(e) = refused {
+            return refuse(stream, &mut rsp_buf, e);
+        }
+        if close.get() {
+            return close_after(stream, &rsp_buf);
         }
 
         // write out the responses
@@ -206,6 +227,45 @@ fn each_connection_loop_with_headers<T: HttpService, const N: usize>(
             stream.wait_io();
         }
     }
+}
+
+/// Answer a request the decoder refused (after any responses still queued for earlier pipelined
+/// requests) and close the connection. Not an error worth logging: scanners and broken clients
+/// send these all day.
+fn refuse(stream: &mut TcpStream, rsp_buf: &mut BytesMut, error: io::Error) -> io::Result<()> {
+    match request::rejected_request(&error) {
+        Some(rejected) => {
+            debug!("{rejected}");
+            response::encode_rejection(rejected.status, rsp_buf);
+            close_after(stream, rsp_buf)
+        }
+        None => Err(error),
+    }
+}
+
+/// Write everything queued, then end the connection: no further request on it is read.
+///
+/// Closing a socket that still has unread input makes the kernel send RST, which can destroy the
+/// response before the client reads it (a 431 for a head still being sent, a 413 for a body still
+/// uploading). So after the response and a FIN, what the client is still sending is read and
+/// discarded for a short, bounded time first (a "lingering close").
+fn close_after(stream: &mut TcpStream, rsp_buf: &[u8]) -> io::Result<()> {
+    const LINGER: std::time::Duration = std::time::Duration::from_secs(1);
+    const LINGER_READ: std::time::Duration = std::time::Duration::from_millis(100);
+    const LINGER_BYTES: usize = 1024 * 1024;
+    stream.write_all(rsp_buf)?;
+    stream.shutdown(std::net::Shutdown::Write)?;
+    let _ = stream.set_read_timeout(Some(LINGER_READ));
+    let started = std::time::Instant::now();
+    let mut scratch = [0_u8; 1024];
+    let mut discarded = 0;
+    while discarded < LINGER_BYTES && started.elapsed() < LINGER {
+        match stream.read(&mut scratch) {
+            Ok(0) | Err(_) => break,
+            Ok(n) => discarded += n,
+        }
+    }
+    Ok(())
 }
 
 #[cfg(not(unix))]
@@ -221,6 +281,8 @@ fn each_connection_loop_with_headers<T: HttpService, const N: usize>(
     let mut req_buf = BytesMut::with_capacity(BUF_LEN);
     let mut rsp_buf = BytesMut::with_capacity(BUF_LEN);
     let mut body_buf = BytesMut::with_capacity(BUF_LEN);
+    let close = Cell::new(false);
+    let mut refused = None;
     loop {
         // read the socket for requests
         reserve_buf(&mut req_buf);
@@ -236,9 +298,18 @@ fn each_connection_loop_with_headers<T: HttpService, const N: usize>(
         if read_cnt > 0 {
             loop {
                 let mut headers = [MaybeUninit::uninit(); N];
-                let req = match request::decode(&mut headers, &mut req_buf, stream)? {
-                    Some(req) => req,
-                    None => break,
+                let req = match request::decode_with_close(
+                    &mut headers,
+                    &mut req_buf,
+                    stream,
+                    Some(&close),
+                ) {
+                    Ok(Some(req)) => req,
+                    Ok(None) => break,
+                    Err(e) => {
+                        refused = Some(e);
+                        break;
+                    }
                 };
                 let mut rsp = Response::new(&mut body_buf);
                 match service.call(req, &mut rsp) {
@@ -248,7 +319,16 @@ fn each_connection_loop_with_headers<T: HttpService, const N: usize>(
                         response::encode_error(e, &mut rsp_buf);
                     }
                 }
+                if close.get() {
+                    break;
+                }
             }
+        }
+        if let Some(e) = refused.take() {
+            return refuse(stream, &mut rsp_buf, e);
+        }
+        if close.get() {
+            return close_after(stream, &rsp_buf);
         }
 
         // send the result back to client

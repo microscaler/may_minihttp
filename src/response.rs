@@ -107,6 +107,8 @@ impl IntoResponseHeader for ResponseHeader {
 pub struct Response<'a> {
     headers: [ResponseHeader; MAX_HEADERS],
     headers_len: usize,
+    // header lines past the first MAX_HEADERS; allocated only when a response has that many
+    more_headers: Vec<ResponseHeader>,
     status_message: StatusMessage,
     body: Body,
     rsp_buf: &'a mut BytesMut,
@@ -131,6 +133,7 @@ impl<'a> Response<'a> {
         Response {
             headers: std::array::from_fn(|_| ResponseHeader::Static("")),
             headers_len: 0,
+            more_headers: Vec::new(),
             body: Body::Dummy,
             status_message: StatusMessage {
                 code: 200,
@@ -172,10 +175,28 @@ impl<'a> Response<'a> {
     /// let request_id = format!("X-Request-ID: {}", "01J…");
     /// res.header(request_id);
     /// ```
+    ///
+    /// Any number of headers may be added; the first 16 are stored inline. (There used to be a
+    /// hard limit of 16: the 17th header panicked the connection.)
+    ///
+    /// An owned header line containing CR or LF is dropped and logged: written out, it would end
+    /// the header line early and let the rest of the value inject headers or a body (response
+    /// splitting). Static lines are trusted.
     #[inline]
     pub fn header<H: IntoResponseHeader>(&mut self, header: H) -> &mut Self {
-        self.headers[self.headers_len] = header.into_response_header();
-        self.headers_len += 1;
+        let header = header.into_response_header();
+        if let ResponseHeader::Owned(line) = &header {
+            if line.bytes().any(|b| b == b'\r' || b == b'\n') {
+                error!("response header dropped: it contains CR or LF");
+                return self;
+            }
+        }
+        if self.headers_len < MAX_HEADERS {
+            self.headers[self.headers_len] = header;
+            self.headers_len += 1;
+        } else {
+            self.more_headers.push(header);
+        }
         self
     }
 
@@ -326,7 +347,7 @@ fn write_status_and_headers(rsp: &Response<'_>, buf: &mut BytesMut, chunked: boo
 
     // SAFETY: we already have bound check when insert headers
     let headers = unsafe { rsp.headers.get_unchecked(..rsp.headers_len) };
-    for h in headers {
+    for h in headers.iter().chain(rsp.more_headers.iter()) {
         buf.extend_from_slice(b"\r\n");
         buf.extend_from_slice(h.as_bytes());
     }
@@ -342,11 +363,29 @@ pub(crate) fn encode(mut rsp: Response, buf: &mut BytesMut) {
     buf.extend_from_slice(rsp.get_body());
 }
 
+/// The response to a request refused before the service saw it; the connection closes after it.
+#[cold]
+pub(crate) fn encode_rejection(status: u16, buf: &mut BytesMut) {
+    let line: &[u8] = match status {
+        400 => b"HTTP/1.1 400 Bad Request",
+        413 => b"HTTP/1.1 413 Content Too Large",
+        431 => b"HTTP/1.1 431 Request Header Fields Too Large",
+        501 => b"HTTP/1.1 501 Not Implemented",
+        _ => b"HTTP/1.1 400 Bad Request",
+    };
+    buf.extend_from_slice(line);
+    buf.extend_from_slice(b"\r\nServer: M\r\nDate: ");
+    crate::date::append_date(buf);
+    buf.extend_from_slice(b"\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+}
+
+/// A service error becomes a 500 whose body is a fixed phrase. The error itself is logged, not sent:
+/// its text (paths, upstream addresses, driver messages) is for operators, not for whoever is on
+/// the other end of an internet-facing socket.
 #[cold]
 pub(crate) fn encode_error(e: io::Error, buf: &mut BytesMut) {
     error!("error in service: err = {e:?}");
-    let msg_string = e.to_string();
-    let msg = msg_string.as_bytes();
+    let msg: &[u8] = b"Internal Server Error";
 
     buf.extend_from_slice(b"HTTP/1.1 500 Internal Server Error\r\nServer: M\r\nDate: ");
     crate::date::append_date(buf);
