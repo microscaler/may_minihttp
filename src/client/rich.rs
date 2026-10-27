@@ -577,7 +577,9 @@ impl Client {
         let mut hops = 0_usize;
         let mut attempt = 0_u32;
         let mut credentials_stripped = false;
-        let mut sensitive_headers = self.inner.config.sensitive_headers.clone();
+        // Only the sensitive headers a metadata provider adds for this request; the configured set
+        // is read in place (cloning it cost an allocation per request).
+        let mut sensitive_headers = HashSet::new();
         let mut tls_snapshot = None;
 
         loop {
@@ -650,7 +652,13 @@ impl Client {
 
             if !same_origin(&url, &target) {
                 credentials_stripped = true;
-                for header in &sensitive_headers {
+                for header in self
+                    .inner
+                    .config
+                    .sensitive_headers
+                    .iter()
+                    .chain(&sensitive_headers)
+                {
                     headers.remove(header);
                 }
             }
@@ -708,7 +716,9 @@ impl Client {
         let cancellation = request.cancellation.clone();
         let mut body = request.body;
         let mut attempt = 0_u32;
-        let mut sensitive_headers = self.inner.config.sensitive_headers.clone();
+        // Only the sensitive headers a metadata provider adds for this request; the configured set
+        // is read in place (cloning it cost an allocation per request).
+        let mut sensitive_headers = HashSet::new();
         let mut tls_snapshot = None;
         self.execute_streaming_once(
             &request.method,
@@ -1140,7 +1150,13 @@ impl Client {
         overlay_headers(&mut headers, request_headers);
 
         if credentials_stripped {
-            for name in sensitive_headers.iter() {
+            for name in self
+                .inner
+                .config
+                .sensitive_headers
+                .iter()
+                .chain(sensitive_headers.iter())
+            {
                 headers.remove(name);
             }
         }
@@ -1608,6 +1624,12 @@ impl StreamingResponse {
         &self.headers
     }
 
+    /// The response headers, mutably: a caller that forwards them can `std::mem::take` the map
+    /// instead of cloning it. The body reader does not use them.
+    pub fn headers_mut(&mut self) -> &mut HeaderMap {
+        &mut self.headers
+    }
+
     pub fn final_url(&self) -> &Url {
         &self.final_url
     }
@@ -1807,10 +1829,12 @@ struct ClientConfigValues {
     default_headers: HeaderMap,
 }
 
+/// Pool key. Cloned on every checkout and checkin, so the host is shared (`Arc<str>`) and the
+/// scheme static: a clone is a reference-count bump, not two string copies.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct OriginKey {
-    scheme: String,
-    host: String,
+    scheme: &'static str,
+    host: Arc<str>,
     port: u16,
     tls_generation: u64,
 }
@@ -1823,9 +1847,20 @@ impl OriginKey {
         let port = url.port_or_known_default().ok_or_else(|| {
             io::Error::new(io::ErrorKind::InvalidInput, "URL scheme has no known port")
         })?;
+        // `parse_url` admits only http and https; the url crate lower-cases both and their hosts.
+        let scheme = if url.scheme() == "https" {
+            "https"
+        } else {
+            "http"
+        };
+        let host: Arc<str> = if host.bytes().any(|b| b.is_ascii_uppercase()) {
+            Arc::from(host.to_ascii_lowercase())
+        } else {
+            Arc::from(host)
+        };
         Ok(Self {
-            scheme: url.scheme().to_ascii_lowercase(),
-            host: host.to_ascii_lowercase(),
+            scheme,
+            host,
             port,
             tls_generation: if url.scheme() == "https" {
                 tls_generation
@@ -1839,7 +1874,7 @@ impl OriginKey {
         let host = if self.host.contains(':') {
             format!("[{}]", self.host)
         } else {
-            self.host.clone()
+            self.host.to_string()
         };
         format!("{}://{}:{}/", self.scheme, host, self.port)
     }
@@ -2077,7 +2112,7 @@ fn observed_url(url: &Url) -> ObservedOrigin<'_> {
 
 fn observed_key(key: &OriginKey) -> ObservedOrigin<'_> {
     ObservedOrigin {
-        scheme: &key.scheme,
+        scheme: key.scheme,
         host: &key.host,
         port: key.port,
     }
