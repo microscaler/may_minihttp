@@ -9,6 +9,9 @@ use crate::client::MultipartForm;
 use http::header::{CONTENT_LENGTH, CONTENT_TYPE, TRANSFER_ENCODING};
 use http::{self, HeaderValue, Method};
 
+/// A body up to this size is written with the request head, in one write.
+const SINGLE_WRITE_BODY_MAX: usize = 64 * 1024;
+
 /// Outgoing request for [`super::HttpClient`].
 ///
 /// Derefs to `http::Request<BodyWriter>`. For compatibility, dropping a request that has never
@@ -43,7 +46,10 @@ impl Request {
         }
     }
 
-    fn write_head_impl(&mut self) -> io::Result<()> {
+    /// The request head, rendered into one buffer so that it goes out in one write (27 Oct 2026: written piecemeal
+    /// through the 4 KiB stream buffer, a head over 4 KiB - a bearer JWT with claims - went out as two writes, and with
+    /// Nagle the second waited ~40 ms on the peer's delayed ACK; see tests/tcp_nodelay_stall.rs).
+    fn write_head_impl(&mut self) -> io::Result<Vec<u8>> {
         self.writer.ensure_request_ready()?;
         if self.headers().contains_key(TRANSFER_ENCODING)
             && (self.body_size.is_some() || self.headers().contains_key(CONTENT_LENGTH))
@@ -53,8 +59,12 @@ impl Request {
                 "request must not contain both Transfer-Encoding and Content-Length",
             ));
         }
-        let mut writer = self.writer.clone();
-
+        let header_bytes: usize = self
+            .headers()
+            .iter()
+            .map(|(k, v)| k.as_str().len() + v.len() + 4)
+            .sum();
+        let mut writer: Vec<u8> = Vec::with_capacity(256 + header_bytes);
         write!(
             writer,
             "{} {} {:?}\r\n",
@@ -89,10 +99,16 @@ impl Request {
         }
 
         write!(writer, "\r\n")?;
-        Ok(())
+        Ok(writer)
     }
 
     fn write_head(&mut self) -> io::Result<BodyWriter> {
+        self.write_head_with(None)
+    }
+
+    /// Write the head and, when `body` is given and the request has a sized body, the body with it: one write, one
+    /// flush, so a small request is never split into a head and a body that Nagle holds apart.
+    fn write_head_with(&mut self, body_prefix: Option<&[u8]>) -> io::Result<BodyWriter> {
         let chunked = parse_transfer_encoding(self.headers())?;
         if self.body_size.is_none() {
             self.body_size = parse_content_length(self.headers())?;
@@ -119,11 +135,29 @@ impl Request {
                 None => BodyWriter::EmptyWriter(self.writer.clone()),
             },
         };
-        self.write_head_impl()?;
-        // Flush headers immediately so pipelined requests don't overwrite
+        let mut head = self.write_head_impl()?;
+        let mut body = body;
+        if let Some(prefix) = body_prefix {
+            match &mut body {
+                BodyWriter::SizedWriter(_, size) if prefix.len() <= *size => {
+                    head.extend_from_slice(prefix);
+                    *size -= prefix.len();
+                }
+                _ => {
+                    // not a sized body: the head now, the body through its writer
+                    let mut writer = self.writer.clone();
+                    writer.write_all(&head)?;
+                    body.write_all(prefix)?;
+                    body.flush()?;
+                    return Ok(body);
+                }
+            }
+        }
+        // Flush the head immediately so pipelined requests don't overwrite
         // the buffer before the server receives them. (BufferIo batches
         // writes to its internal Vec and only flushes on buffer fill-up.)
         let mut writer = self.writer.clone();
+        writer.write_all(&head)?;
         writer.flush()?;
         Ok(body)
     }
@@ -132,7 +166,17 @@ impl Request {
     #[inline]
     pub fn send(&mut self, body: &[u8]) -> io::Result<()> {
         self.body_size = Some(body.len());
-        let result = self.write_all(body);
+        // a body that fits goes out in the same write as the head (see `write_head_with`)
+        let result = if !self.completed
+            && body.len() <= SINGLE_WRITE_BODY_MAX
+            && matches!(*self.body(), BodyWriter::InvalidWriter)
+        {
+            self.write_head_with(Some(body)).map(|w| {
+                *self.body_mut() = w;
+            })
+        } else {
+            self.write_all(body)
+        };
         if result.is_err() {
             self.abort();
         }
