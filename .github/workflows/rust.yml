@@ -73,6 +73,7 @@ jobs:
               --test max_headers_enum \
               --test request_parsing \
               --test simple_header_test \
+              --test http_hardening \
               --message-format libtest-json \
               2>&1 \
             > target/nextest/unit-${{ matrix.name }}-${{ matrix.os }}.json
