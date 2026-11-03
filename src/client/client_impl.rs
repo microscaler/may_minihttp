@@ -149,6 +149,41 @@ impl HttpClient {
         Self::from_uri(uri, tls, Some(connect_timeout), Some(addresses))
     }
 
+    /// Connect to an absolute URL using addresses the caller has already resolved.
+    ///
+    /// Name resolution through the operating system (`getaddrinfo`) is a blocking call that
+    /// parks the whole worker thread, not just the calling coroutine. Callers that resolve names
+    /// off the worker threads (or from a cache) pass the result here, so connecting never touches
+    /// the system resolver. The URL's host still becomes the `Host` header and the TLS server
+    /// name. `tls_config` is used for `https` URLs; `None` falls back to the platform verifier.
+    /// Each address is tried in turn within `connect_timeout` overall.
+    pub fn from_url_with_addresses(
+        url: &str,
+        tls_config: Option<Arc<ClientConfig>>,
+        connect_timeout: Duration,
+        addresses: &[SocketAddr],
+    ) -> io::Result<Self> {
+        if addresses.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "from_url_with_addresses needs at least one address",
+            ));
+        }
+        let uri = Self::parse_absolute_url(url)?;
+        let tls = if uri
+            .scheme_str()
+            .is_some_and(|scheme| scheme.eq_ignore_ascii_case("https"))
+        {
+            Some(match tls_config {
+                Some(config) => config,
+                None => Self::platform_tls_config()?,
+            })
+        } else {
+            None
+        };
+        Self::from_uri(uri, tls, Some(connect_timeout), Some(addresses))
+    }
+
     fn parse_absolute_url(url: &str) -> io::Result<Uri> {
         let uri: Uri = url.parse().map_err(|error| {
             io::Error::new(io::ErrorKind::InvalidInput, format!("invalid URL: {error}"))
@@ -549,6 +584,55 @@ mod tests {
         response.read_to_string(&mut body).unwrap();
         assert_eq!(body, "ok");
         server.join().unwrap();
+    }
+
+    #[test]
+    fn from_url_with_addresses_connects_without_resolving_the_host() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind HTTP server");
+        let address = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+            let mut request = Vec::new();
+            let mut byte = [0_u8; 1];
+            while !request.ends_with(b"\r\n\r\n") {
+                socket.read_exact(&mut byte).unwrap();
+                request.push(byte[0]);
+            }
+            socket
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok")
+                .unwrap();
+            String::from_utf8(request).unwrap()
+        });
+
+        // `.invalid` never resolves (RFC 6761): success proves the supplied address was used.
+        let url = format!("http://service.invalid:{}/", address.port());
+        let mut client =
+            HttpClient::from_url_with_addresses(&url, None, Duration::from_secs(2), &[address])
+                .unwrap();
+        let mut response = client.get("/x".parse().unwrap()).unwrap();
+        let mut body = String::new();
+        response.read_to_string(&mut body).unwrap();
+        assert_eq!(body, "ok");
+        let request = server.join().unwrap();
+        assert!(
+            request
+                .to_ascii_lowercase()
+                .contains(&format!("host: service.invalid:{}", address.port())),
+            "{request}"
+        );
+    }
+
+    #[test]
+    fn from_url_with_addresses_rejects_an_empty_address_list() {
+        let error = HttpClient::from_url_with_addresses(
+            "http://a.invalid/",
+            None,
+            Duration::from_secs(1),
+            &[],
+        )
+        .err()
+        .unwrap();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
     }
 
     #[test]
