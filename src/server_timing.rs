@@ -17,6 +17,9 @@
 //! Without the feature every call here is an empty inline function. With it, recording is a few
 //! atomic adds and an `Instant::now()`: nothing blocks the coroutine.
 
+// The connection loop that uses ConnTiming is unix-only; elsewhere only listening() is called.
+#![cfg_attr(not(unix), allow(dead_code, unused_imports))]
+
 #[cfg(feature = "op-timing")]
 mod imp {
     use std::time::Instant;
