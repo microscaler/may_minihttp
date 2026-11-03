@@ -80,6 +80,39 @@ pub enum ClientEvent<'a> {
         request_id: u64,
         origin: ObservedOrigin<'a>,
     },
+    /// The pool handed out a connection: reused, newly connected (DNS and connect included), or
+    /// after waiting for one. One per attempt.
+    CheckoutCompleted {
+        request_id: u64,
+        origin: ObservedOrigin<'a>,
+        duration: Duration,
+        reused: bool,
+        error: Option<ClientErrorKind>,
+    },
+    /// The request head and body were written to the connection.
+    RequestWritten {
+        request_id: u64,
+        origin: ObservedOrigin<'a>,
+        duration: Duration,
+        error: Option<ClientErrorKind>,
+    },
+    /// From the request being written to the response head being read: the server's time plus
+    /// the network, as the client sees it.
+    ResponseHeadersReceived {
+        request_id: u64,
+        origin: ObservedOrigin<'a>,
+        duration: Duration,
+        error: Option<ClientErrorKind>,
+    },
+    /// The response body was read in full by the buffered client (`send`). Streaming responses
+    /// are read by the caller, which times them itself.
+    ResponseBodyRead {
+        request_id: u64,
+        origin: ObservedOrigin<'a>,
+        duration: Duration,
+        bytes: usize,
+        error: Option<ClientErrorKind>,
+    },
     ResponseHeaders {
         request_id: u64,
         origin: ObservedOrigin<'a>,

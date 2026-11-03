@@ -889,6 +889,7 @@ impl<I: Interceptor> Client<I> {
                     body,
                     deadline,
                     &trace.span,
+                    trace.request_id,
                 )?;
 
                 let status = response.status();
@@ -938,31 +939,44 @@ impl<I: Interceptor> Client<I> {
                     "http_client_body",
                     "http.response.body.size" = tracing::field::Empty
                 );
-                loop {
-                    if response.body_complete() {
-                        break;
+                let body_started = Instant::now();
+                let body_read = (|| -> io::Result<()> {
+                    loop {
+                        if response.body_complete() {
+                            break;
+                        }
+                        let remaining = remaining(deadline)?;
+                        response.set_timeout(Some(self.inner.config.io_timeout.min(remaining)))?;
+                        if bytes.len() == bytes.capacity() {
+                            bytes.reserve(8 * 1024);
+                        }
+                        let filled = bytes.len();
+                        let allowed =
+                            (bytes.capacity() - filled).min(limit - filled.min(limit) + 1);
+                        bytes.resize(filled + allowed, 0);
+                        let read = response.read(&mut bytes[filled..])?;
+                        bytes.truncate(filled + read);
+                        if read == 0 {
+                            break;
+                        }
+                        if bytes.len() > limit {
+                            response.abandon_body();
+                            return Err(io::Error::new(
+                                io::ErrorKind::InvalidData,
+                                format!("HTTP response body exceeds configured {limit}-byte limit"),
+                            ));
+                        }
                     }
-                    let remaining = remaining(deadline)?;
-                    response.set_timeout(Some(self.inner.config.io_timeout.min(remaining)))?;
-                    if bytes.len() == bytes.capacity() {
-                        bytes.reserve(8 * 1024);
-                    }
-                    let filled = bytes.len();
-                    let allowed = (bytes.capacity() - filled).min(limit - filled.min(limit) + 1);
-                    bytes.resize(filled + allowed, 0);
-                    let read = response.read(&mut bytes[filled..])?;
-                    bytes.truncate(filled + read);
-                    if read == 0 {
-                        break;
-                    }
-                    if bytes.len() > limit {
-                        response.abandon_body();
-                        return Err(io::Error::new(
-                            io::ErrorKind::InvalidData,
-                            format!("HTTP response body exceeds configured {limit}-byte limit"),
-                        ));
-                    }
-                }
+                    Ok(())
+                })();
+                self.inner.observe(ClientEvent::ResponseBodyRead {
+                    request_id: trace.request_id,
+                    origin: observed_url(url),
+                    duration: body_started.elapsed(),
+                    bytes: bytes.len(),
+                    error: body_read.as_ref().err().map(ClientErrorKind::classify),
+                });
+                body_read?;
                 span_record!(body_span, "http.response.body.size", bytes.len() as u64);
                 drop(body_span);
                 drop(response);
@@ -1090,6 +1104,7 @@ impl<I: Interceptor> Client<I> {
                 body,
                 deadline,
                 &trace.span,
+                trace.request_id,
             );
             if I::ENABLED {
                 if let Some(timing) = &timing {
@@ -1398,8 +1413,10 @@ impl<I: Interceptor> Client<I> {
         body: &mut RequestBody,
         deadline: Instant,
         span: &trace::Span,
+        request_id: u64,
     ) -> io::Result<super::Response> {
         let _ = span;
+        let write_started = Instant::now();
         if headers.contains_key(HOST) {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -1454,15 +1471,30 @@ impl<I: Interceptor> Client<I> {
             }
         }
         let client = &mut lease.connection_mut().client;
-        client.write_request(request)?;
+        let written = client.write_request(request);
         drop(write_span);
+        self.inner.observe(ClientEvent::RequestWritten {
+            request_id,
+            origin: observed_url(url),
+            duration: write_started.elapsed(),
+            error: written.as_ref().err().map(ClientErrorKind::classify),
+        });
+        written?;
+        let wait_started = Instant::now();
         let wait_span = phase_span!(
             DEBUG,
             parent: span,
             "http_client_wait",
             "http.response.status_code" = tracing::field::Empty
         );
-        let response = client.read_response()?;
+        let response = client.read_response();
+        self.inner.observe(ClientEvent::ResponseHeadersReceived {
+            request_id,
+            origin: observed_url(url),
+            duration: wait_started.elapsed(),
+            error: response.as_ref().err().map(ClientErrorKind::classify),
+        });
+        let response = response?;
         span_record!(
             wait_span,
             "http.response.status_code",
@@ -1530,7 +1562,29 @@ impl<I: Interceptor> Client<I> {
         }
     }
 
+    /// Take a connection for `key` (reused, new, or after waiting), reporting how long that took.
     fn checkout(
+        &self,
+        key: &OriginKey,
+        tls_config: Arc<ClientConfig>,
+        deadline: Instant,
+        trace: &RequestTrace,
+    ) -> io::Result<PoolLease> {
+        let started = Instant::now();
+        let lease = self.checkout_connection(key, tls_config, deadline, trace);
+        self.inner.observe(ClientEvent::CheckoutCompleted {
+            request_id: trace.request_id,
+            origin: observed_key(key),
+            duration: started.elapsed(),
+            reused: lease
+                .as_ref()
+                .is_ok_and(|lease| lease.reused_idle_connection),
+            error: lease.as_ref().err().map(ClientErrorKind::classify),
+        });
+        lease
+    }
+
+    fn checkout_connection(
         &self,
         key: &OriginKey,
         tls_config: Arc<ClientConfig>,
@@ -2780,6 +2834,11 @@ mod tests {
                 ClientEvent::RequestAbandoned {
                     request_id, status, ..
                 } => format!("abandoned:{request_id}:{}", status.as_u16()),
+                // Phase timings: asserted by `observer_reports_request_phase_timings`.
+                ClientEvent::CheckoutCompleted { .. }
+                | ClientEvent::RequestWritten { .. }
+                | ClientEvent::ResponseHeadersReceived { .. }
+                | ClientEvent::ResponseBodyRead { .. } => return,
             };
             self.0.lock().unwrap().push(value);
         }
@@ -3687,6 +3746,100 @@ mod tests {
         assert!(!joined.contains("do-not-observe"));
         assert!(!joined.contains("Bearer"));
         assert!(!joined.contains("secret"));
+    }
+
+    #[derive(Default)]
+    struct PhaseObserver(StdMutex<Vec<(String, Duration)>>);
+
+    impl ClientObserver for PhaseObserver {
+        fn observe(&self, event: ClientEvent<'_>) {
+            let entry = match event {
+                ClientEvent::CheckoutCompleted {
+                    request_id,
+                    duration,
+                    reused,
+                    error,
+                    ..
+                } => (
+                    format!("checkout:{request_id}:{reused}:{error:?}"),
+                    duration,
+                ),
+                ClientEvent::RequestWritten {
+                    request_id,
+                    duration,
+                    error,
+                    ..
+                } => (format!("written:{request_id}:{error:?}"), duration),
+                ClientEvent::ResponseHeadersReceived {
+                    request_id,
+                    duration,
+                    error,
+                    ..
+                } => (format!("headers:{request_id}:{error:?}"), duration),
+                ClientEvent::ResponseBodyRead {
+                    request_id,
+                    duration,
+                    bytes,
+                    error,
+                    ..
+                } => (format!("body:{request_id}:{bytes}:{error:?}"), duration),
+                _ => return,
+            };
+            self.0.lock().unwrap().push(entry);
+        }
+    }
+
+    #[test]
+    fn observer_reports_request_phase_timings() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            for _ in 0..2 {
+                let _ = read_head(&mut stream);
+                // the server "thinks" before answering: that is header wait, not write or body
+                thread::sleep(Duration::from_millis(60));
+                stream
+                    .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok")
+                    .unwrap();
+                stream.flush().unwrap();
+            }
+        });
+        let observer = Arc::new(PhaseObserver::default());
+        let client = Client::builder()
+            .observer(observer.clone())
+            .build()
+            .unwrap();
+        for _ in 0..2 {
+            let response = client
+                .get(&format!("http://127.0.0.1:{port}/phases"))
+                .unwrap()
+                .send()
+                .unwrap();
+            assert_eq!(response.body(), b"ok");
+        }
+        server.join().unwrap();
+
+        let events = observer.0.lock().unwrap().clone();
+        let names: Vec<&str> = events.iter().map(|(name, _)| name.as_str()).collect();
+        assert_eq!(
+            names,
+            [
+                "checkout:1:false:None",
+                "written:1:None",
+                "headers:1:None",
+                "body:1:2:None",
+                "checkout:2:true:None",
+                "written:2:None",
+                "headers:2:None",
+                "body:2:2:None",
+            ]
+        );
+        let duration = |name: &str| events.iter().find(|(n, _)| n == name).unwrap().1;
+        assert!(duration("headers:1:None") >= Duration::from_millis(60));
+        assert!(duration("headers:2:None") >= Duration::from_millis(60));
+        assert!(duration("written:2:None") < Duration::from_millis(60));
+        assert!(duration("body:2:2:None") < Duration::from_millis(60));
     }
 
     #[test]
