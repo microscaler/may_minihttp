@@ -12,6 +12,8 @@ categories = ["web-programming::http-server"]
 license = "MIT/Apache-2.0"
 
 [dependencies]
+# Feature `op-timing`. Zero dependencies; branch main, as every other crate in a binary names it (one registry).
+microscaler-timing = { git = "https://github.com/microscaler/microscaler-observability.git", branch = "main", optional = true }
 log = "0.4"
 itoa = "1"
 bytes = "1"
@@ -54,11 +56,18 @@ flate2 = "1.1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", default-features = false, features = ["registry", "std"] }
 
+[target.'cfg(target_os = "linux")'.dependencies]
+# Feature `op-timing`: TCP_INFO on the listening socket (accept backlog).
+libc = { version = "0.2", optional = true }
+
 [target.'cfg(unix)'.dev-dependencies]
 may_postgres = { git = "https://github.com/Xudong-Huang/may_postgres.git", default-features = false }
 
 [features]
 default = ["may/default"]
+# Server phase timings and connection levels in op_duration_seconds / op_gauge (microscaler-timing, see
+# src/server_timing.rs). Off by default; BRRTRouter turns it on.
+op-timing = ["dep:microscaler-timing", "dep:libc"]
 # Native HTTP/1.1 client (drop-in for may_http::client). Opt-in for backwards compatibility.
 client = ["http", "may/io_timeout", "dep:generator", "dep:rustls", "dep:rustls-platform-verifier", "dep:url"]
 # Typed JSON request/response helpers. Kept optional so the core HTTP transport stays lean.

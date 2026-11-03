@@ -57,6 +57,7 @@ pub trait HttpServiceFactory: Send + Sized + 'static {
     /// return a coroutine that you can cancel it when need to stop the service
     fn start<L: ToSocketAddrs>(self, addr: L) -> io::Result<coroutine::JoinHandle<()>> {
         let listener = TcpListener::bind(addr)?;
+        crate::server_timing::listening(&listener);
         go!(
             coroutine::Builder::new().name("TcpServerFac".to_owned()),
             move || {
@@ -66,6 +67,7 @@ pub trait HttpServiceFactory: Send + Sized + 'static {
                 use std::os::windows::io::AsRawSocket;
                 for stream in listener.incoming() {
                     let mut stream = t_c!(stream);
+                    let accepted = std::time::Instant::now();
                     #[cfg(unix)]
                     let id = stream.as_raw_fd() as usize;
                     #[cfg(windows)]
@@ -75,16 +77,15 @@ pub trait HttpServiceFactory: Send + Sized + 'static {
                     let _ = stream.set_nodelay(true);
                     let service = self.new_service(id);
                     let builder = may::coroutine::Builder::new().id(id);
-                    go!(
-                        builder,
-                        move || if let Err(e) = each_connection_loop(&mut stream, service) {
-                            // Only log actual errors, not normal client disconnects
-                            if !is_client_disconnect(&e) {
-                                error!("service err = {e:?}");
-                            }
-                            stream.shutdown(std::net::Shutdown::Both).ok();
+                    go!(builder, move || if let Err(e) =
+                        each_connection_loop(&mut stream, service, accepted)
+                    {
+                        // Only log actual errors, not normal client disconnects
+                        if !is_client_disconnect(&e) {
+                            error!("service err = {e:?}");
                         }
-                    )
+                        stream.shutdown(std::net::Shutdown::Both).ok();
+                    })
                     .unwrap();
                 }
             }
@@ -176,15 +177,22 @@ pub struct HttpServer<T>(pub T);
 pub struct HttpServerWithHeaders<T, const N: usize>(pub T);
 
 #[cfg(unix)]
-fn each_connection_loop<T: HttpService>(stream: &mut TcpStream, service: T) -> io::Result<()> {
-    each_connection_loop_with_headers::<T, { request::MAX_HEADERS }>(stream, service)
+fn each_connection_loop<T: HttpService>(
+    stream: &mut TcpStream,
+    service: T,
+    accepted: std::time::Instant,
+) -> io::Result<()> {
+    each_connection_loop_with_headers::<T, { request::MAX_HEADERS }>(stream, service, accepted)
 }
 
 #[cfg(unix)]
 fn each_connection_loop_with_headers<T: HttpService, const N: usize>(
     stream: &mut TcpStream,
     mut service: T,
+    accepted: std::time::Instant,
 ) -> io::Result<()> {
+    // op_duration_seconds / op_gauge with the `op-timing` feature; nothing without it.
+    let mut timing = crate::server_timing::ConnTiming::new(accepted);
     let mut req_buf = BytesMut::with_capacity(BUF_LEN);
     let mut rsp_buf = BytesMut::with_capacity(BUF_LEN);
     let mut body_buf = BytesMut::with_capacity(4096);
@@ -194,7 +202,9 @@ fn each_connection_loop_with_headers<T: HttpService, const N: usize>(
     let close = Cell::new(false);
 
     loop {
+        let buffered = req_buf.len();
         let read_blocked = nonblock_read(stream.inner_mut(), &mut req_buf)?;
+        timing.read(buffered, req_buf.len());
         let mut refused = None;
 
         // prepare the requests, we should make sure the request is fully read
@@ -213,9 +223,12 @@ fn each_connection_loop_with_headers<T: HttpService, const N: usize>(
                     break;
                 }
             };
+            timing.parsed();
             reserve_buf(&mut rsp_buf);
             let mut rsp = Response::new(&mut body_buf, &mut kv_buf);
-            match service.call(req, &mut rsp) {
+            let called = service.call(req, &mut rsp);
+            timing.served(called.is_ok());
+            match called {
                 Ok(()) => response::encode(rsp, &mut rsp_buf),
                 Err(e) => {
                     eprintln!("service err = {e:?}");
@@ -227,6 +240,7 @@ fn each_connection_loop_with_headers<T: HttpService, const N: usize>(
             }
         }
 
+        timing.incomplete(req_buf.len());
         if let Some(e) = refused {
             return refuse(stream, &mut rsp_buf, e);
         }
@@ -236,6 +250,7 @@ fn each_connection_loop_with_headers<T: HttpService, const N: usize>(
 
         // write out the responses
         nonblock_write(stream.inner_mut(), &mut rsp_buf)?;
+        timing.written(rsp_buf.is_empty());
 
         // A large response or upload grows these buffers; a keep-alive connection would otherwise
         // hold that memory until it closes, however small its later requests are.
@@ -290,14 +305,19 @@ fn close_after(stream: &mut TcpStream, rsp_buf: &[u8]) -> io::Result<()> {
 }
 
 #[cfg(not(unix))]
-fn each_connection_loop<T: HttpService>(stream: &mut TcpStream, service: T) -> io::Result<()> {
-    each_connection_loop_with_headers::<T, { request::MAX_HEADERS }>(stream, service)
+fn each_connection_loop<T: HttpService>(
+    stream: &mut TcpStream,
+    service: T,
+    accepted: std::time::Instant,
+) -> io::Result<()> {
+    each_connection_loop_with_headers::<T, { request::MAX_HEADERS }>(stream, service, accepted)
 }
 
 #[cfg(not(unix))]
 fn each_connection_loop_with_headers<T: HttpService, const N: usize>(
     stream: &mut TcpStream,
     mut service: T,
+    _accepted: std::time::Instant,
 ) -> io::Result<()> {
     let mut req_buf = BytesMut::with_capacity(BUF_LEN);
     let mut rsp_buf = BytesMut::with_capacity(BUF_LEN);
@@ -364,18 +384,21 @@ impl<T: HttpService + Clone + Send + Sync + 'static> HttpServer<T> {
     /// return a coroutine that you can cancel it when need to stop the service
     pub fn start<L: ToSocketAddrs>(self, addr: L) -> io::Result<coroutine::JoinHandle<()>> {
         let listener = TcpListener::bind(addr)?;
+        crate::server_timing::listening(&listener);
         let service = self.0;
         go!(
             coroutine::Builder::new().name("TcpServer".to_owned()),
             move || {
                 for stream in listener.incoming() {
                     let mut stream = t_c!(stream);
+                    let accepted = std::time::Instant::now();
                     // Responses are written whole; Nagle would only hold a second write (a streamed
                     // chunk) for the client's delayed ACK. Not fatal if it cannot be set.
                     let _ = stream.set_nodelay(true);
                     let service = service.clone();
                     go!(
-                        move || if let Err(e) = each_connection_loop(&mut stream, service) {
+                        move || if let Err(e) = each_connection_loop(&mut stream, service, accepted)
+                        {
                             // Only log actual errors, not normal client disconnects
                             if !is_client_disconnect(&e) {
                                 error!("service err = {e:?}");
@@ -394,18 +417,20 @@ impl<T: HttpService + Clone + Send + Sync + 'static, const N: usize> HttpServerW
     /// return a coroutine that you can cancel it when need to stop the service
     pub fn start<L: ToSocketAddrs>(self, addr: L) -> io::Result<coroutine::JoinHandle<()>> {
         let listener = TcpListener::bind(addr)?;
+        crate::server_timing::listening(&listener);
         let service = self.0;
         go!(
             coroutine::Builder::new().name("TcpServer".to_owned()),
             move || {
                 for stream in listener.incoming() {
                     let mut stream = t_c!(stream);
+                    let accepted = std::time::Instant::now();
                     // Responses are written whole; Nagle would only hold a second write (a streamed
                     // chunk) for the client's delayed ACK. Not fatal if it cannot be set.
                     let _ = stream.set_nodelay(true);
                     let service = service.clone();
                     go!(move || if let Err(e) =
-                        each_connection_loop_with_headers::<T, N>(&mut stream, service)
+                        each_connection_loop_with_headers::<T, N>(&mut stream, service, accepted)
                     {
                         // Only log actual errors, not normal client disconnects
                         if !is_client_disconnect(&e) {

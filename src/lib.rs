@@ -5,6 +5,7 @@ mod date;
 mod http_server;
 mod request;
 mod response;
+mod server_timing;
 
 #[cfg(feature = "client")]
 pub mod client;
