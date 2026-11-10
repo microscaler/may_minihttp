@@ -204,6 +204,8 @@ fn each_connection_loop_with_headers<T: HttpService, const N: usize>(
     loop {
         let buffered = req_buf.len();
         let read_blocked = nonblock_read(stream.inner_mut(), &mut req_buf)?;
+        // set when a response in this batch was streamed (chunked / SSE) inside `call`
+        let mut streamed = false;
         timing.read(buffered, req_buf.len());
         let mut refused = None;
 
@@ -227,6 +229,7 @@ fn each_connection_loop_with_headers<T: HttpService, const N: usize>(
             reserve_buf(&mut rsp_buf);
             let mut rsp = Response::new(&mut body_buf, &mut kv_buf);
             let called = service.call(req, &mut rsp);
+            streamed |= rsp.is_streamed();
             timing.served(called.is_ok());
             match called {
                 Ok(()) => response::encode(rsp, &mut rsp_buf),
@@ -259,7 +262,10 @@ fn each_connection_loop_with_headers<T: HttpService, const N: usize>(
         shrink_if_idle(&mut body_buf);
         shrink_if_idle(&mut kv_buf);
 
-        if read_blocked {
+        // `read_blocked` was observed before the service ran. A streamed response can run for minutes, and a
+        // client that closed (or sent more) during it has already signalled: waiting now would wait for an
+        // event that never comes and keep this connection, its buffers and its stack forever. Read again first.
+        if read_blocked && !streamed {
             stream.wait_io();
         }
     }
