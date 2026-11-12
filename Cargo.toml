@@ -12,6 +12,8 @@ categories = ["web-programming::http-server"]
 license = "MIT/Apache-2.0"
 
 [dependencies]
+# Feature `op-timing`. Zero dependencies; branch main, as every other crate in a binary names it (one registry).
+microscaler-timing = { git = "https://github.com/microscaler/microscaler-observability.git", branch = "main", optional = true }
 log = "0.4"
 itoa = "1"
 bytes = "1"
@@ -20,6 +22,15 @@ httparse = "1"
 once_cell = "1"
 
 may = { version = "0.3.46", default-features = false }
+# Only to recognise may's coroutine-cancel unwind (`generator::Error::Cancel`); same major as may's.
+generator = { version = "0.8", optional = true }
+http = { version = "0.2", optional = true }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"], optional = true }
+rustls-platform-verifier = { version = "0.7", optional = true }
+url = { version = "2", optional = true }
+serde = { version = "1", optional = true }
+serde_json = { version = "1", optional = true }
+tracing = { version = "0.1", default-features = false, features = ["std"], optional = true }
 
 [dev-dependencies]
 atoi = "3"
@@ -37,14 +48,127 @@ nanorand = { version = "0.8", default-features = false, features = ["std", "wyra
 
 # Load testing and integration testing
 goose = "0.18.1"
+gumdrop = "0.8"
 testcontainers = "0.28"
 tokio = { version = "1", features = ["full"] }
+rcgen = "0.14"
+flate2 = "1.1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", default-features = false, features = ["registry", "std"] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+# Feature `op-timing`: TCP_INFO on the listening socket (accept backlog).
+libc = { version = "0.2", optional = true }
 
 [target.'cfg(unix)'.dev-dependencies]
 may_postgres = { git = "https://github.com/Xudong-Huang/may_postgres.git", default-features = false }
 
 [features]
 default = ["may/default"]
+# Server phase timings and connection levels in op_duration_seconds / op_gauge (microscaler-timing, see
+# src/server_timing.rs). Off by default; BRRTRouter turns it on.
+op-timing = ["dep:microscaler-timing", "dep:libc"]
+# Native HTTP/1.1 client (drop-in for may_http::client). Opt-in for backwards compatibility.
+client = ["http", "may/io_timeout", "dep:generator", "dep:rustls", "dep:rustls-platform-verifier", "dep:url"]
+# Typed JSON request/response helpers. Kept optional so the core HTTP transport stays lean.
+json = ["client", "dep:serde", "dep:serde_json"]
+# `tracing` spans and events in the client (see `client::trace`). Off: nothing is compiled in.
+tracing = ["client", "dep:tracing"]
+
+# Examples that use the client module — automatically enable the `client` feature.
+[[example]]
+name = "client_get"
+required-features = ["client"]
+
+[[example]]
+name = "client_post"
+required-features = ["client"]
+
+[[example]]
+name = "client_head"
+required-features = ["client"]
+
+[[example]]
+name = "client_stream"
+required-features = ["client"]
+
+[[example]]
+name = "client_errors"
+required-features = ["client"]
+
+[[example]]
+name = "client_full"
+required-features = ["client"]
+
+[[example]]
+name = "client_pool_audit"
+required-features = ["client"]
+
+[[example]]
+name = "bench_client"
+required-features = ["client"]
+
+# Integration tests that drive the server with the native client. Without `required-features`
+# a plain `cargo test` (default features) failed to compile them.
+[[test]]
+name = "client_integration"
+required-features = ["client"]
+
+[[test]]
+name = "perf_all_verbs"
+required-features = ["client"]
+
+[[test]]
+name = "perf_body_throughput"
+required-features = ["client"]
+
+[[test]]
+name = "perf_chunked_e2e"
+required-features = ["client"]
+
+[[test]]
+name = "perf_concurrency"
+required-features = ["client"]
+
+[[test]]
+name = "perf_concurrent_multi"
+required-features = ["client"]
+
+[[test]]
+name = "perf_keepalive"
+required-features = ["client"]
+
+[[test]]
+name = "perf_large_response"
+required-features = ["client"]
+
+[[test]]
+name = "perf_malformed"
+required-features = ["client"]
+
+[[test]]
+name = "perf_memory"
+required-features = ["client"]
+
+[[test]]
+name = "perf_pipelining"
+required-features = ["client"]
+
+[[test]]
+name = "perf_slow_client"
+required-features = ["client"]
+
+[[test]]
+name = "perf_timeout"
+required-features = ["client"]
+
+[[test]]
+name = "tcp_nodelay_stall"
+required-features = ["client"]
+
+[[test]]
+name = "client_tracing"
+required-features = ["tracing"]
 
 [profile.release]
 opt-level = 3

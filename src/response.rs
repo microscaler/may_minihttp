@@ -1,9 +1,10 @@
 use std::borrow::Cow;
-use std::io;
+use std::io::{self, Write};
 
 use crate::request::MAX_HEADERS;
 
 use bytes::BytesMut;
+use may::net::TcpStream;
 
 /// A single HTTP response header value.
 ///
@@ -106,9 +107,17 @@ impl IntoResponseHeader for ResponseHeader {
 pub struct Response<'a> {
     headers: [ResponseHeader; MAX_HEADERS],
     headers_len: usize,
+    // header lines past the first MAX_HEADERS; allocated only when a response has that many
+    more_headers: Vec<ResponseHeader>,
     status_message: StatusMessage,
     body: Body,
     rsp_buf: &'a mut BytesMut,
+    /// Header lines added with [`Response::header_kv`], already encoded (`\r\nName: value` each),
+    /// in a buffer the connection reuses.
+    kv_head: &'a mut BytesMut,
+    /// When true, headers/body were already written to the socket (chunked/SSE).
+    /// [`encode`] becomes a no-op so the connection loop does not double-write.
+    streamed: bool,
 }
 
 enum Body {
@@ -123,17 +132,26 @@ struct StatusMessage {
 }
 
 impl<'a> Response<'a> {
-    pub(crate) fn new(rsp_buf: &'a mut BytesMut) -> Response<'a> {
+    pub(crate) fn new(rsp_buf: &'a mut BytesMut, kv_head: &'a mut BytesMut) -> Response<'a> {
         Response {
             headers: std::array::from_fn(|_| ResponseHeader::Static("")),
             headers_len: 0,
+            more_headers: Vec::new(),
             body: Body::Dummy,
             status_message: StatusMessage {
                 code: 200,
                 msg: "Ok",
             },
             rsp_buf,
+            kv_head,
+            streamed: false,
         }
+    }
+
+    /// `true` when [`Self::begin_chunked_stream`] already wrote this response.
+    #[inline]
+    pub fn is_streamed(&self) -> bool {
+        self.streamed
     }
 
     #[inline]
@@ -161,10 +179,52 @@ impl<'a> Response<'a> {
     /// let request_id = format!("X-Request-ID: {}", "01J…");
     /// res.header(request_id);
     /// ```
+    ///
+    /// Any number of headers may be added; the first 16 are stored inline. (There used to be a
+    /// hard limit of 16: the 17th header panicked the connection.)
+    ///
+    /// An owned header line containing CR or LF is dropped and logged: written out, it would end
+    /// the header line early and let the rest of the value inject headers or a body (response
+    /// splitting). Static lines are trusted.
     #[inline]
     pub fn header<H: IntoResponseHeader>(&mut self, header: H) -> &mut Self {
-        self.headers[self.headers_len] = header.into_response_header();
-        self.headers_len += 1;
+        let header = header.into_response_header();
+        if let ResponseHeader::Owned(line) = &header {
+            if line.bytes().any(|b| b == b'\r' || b == b'\n') {
+                error!("response header dropped: it contains CR or LF");
+                return self;
+            }
+        }
+        if self.headers_len < MAX_HEADERS {
+            self.headers[self.headers_len] = header;
+            self.headers_len += 1;
+        } else {
+            self.more_headers.push(header);
+        }
+        self
+    }
+
+    /// Append the header `name: value` without building the line as a string first.
+    ///
+    /// The line is encoded straight into a buffer the connection reuses, so a header whose value
+    /// is computed per response costs no allocation (with [`Response::header`] it costs one: the
+    /// caller's `format!`). These lines are written after the ones added with `header`, in the
+    /// order added.
+    ///
+    /// A name that is not an HTTP token, or a value containing CR, LF or NUL, is dropped and
+    /// logged (it would split the response).
+    pub fn header_kv(&mut self, name: &str, value: &str) -> &mut Self {
+        let name_ok = !name.is_empty() && name.bytes().all(is_token_byte);
+        let value_ok = !value.bytes().any(|b| b == b'\r' || b == b'\n' || b == 0);
+        if !(name_ok && value_ok) {
+            error!("response header dropped: invalid name or a value containing CR, LF or NUL");
+            return self;
+        }
+        self.kv_head.reserve(name.len() + value.len() + 4);
+        self.kv_head.extend_from_slice(b"\r\n");
+        self.kv_head.extend_from_slice(name.as_bytes());
+        self.kv_head.extend_from_slice(b": ");
+        self.kv_head.extend_from_slice(value.as_bytes());
         self
     }
 
@@ -176,6 +236,31 @@ impl<'a> Response<'a> {
     #[inline]
     pub fn body_vec(&mut self, v: Vec<u8>) {
         self.body = Body::Vec(v);
+    }
+
+    /// Write status + headers with `Transfer-Encoding: chunked`, then return a
+    /// writer for incremental body chunks (SSE / live flush). Marks this
+    /// response as streamed so the server loop skips [`encode`].
+    pub fn begin_chunked_stream<'s>(
+        &mut self,
+        stream: &'s mut TcpStream,
+    ) -> io::Result<ChunkedBodyWriter<'s>> {
+        if self.streamed {
+            return Err(io::Error::other("response already streamed"));
+        }
+        let mut head = BytesMut::with_capacity(256);
+        write_status_and_headers(self, &mut head, /*chunked=*/ true);
+        stream.write_all(&head)?;
+        stream.flush()?;
+        self.streamed = true;
+        // Clear buffered body — wire path owns the payload now.
+        self.body = Body::Dummy;
+        self.rsp_buf.clear();
+        Ok(ChunkedBodyWriter {
+            stream,
+            finished: false,
+            frame: Vec::new(),
+        })
     }
 
     #[inline]
@@ -216,17 +301,94 @@ impl<'a> Response<'a> {
     /// public API; gated so downstream crates cannot accidentally rely on it.
     #[doc(hidden)]
     pub fn _test_new(rsp_buf: &'a mut BytesMut) -> Response<'a> {
-        Response::new(rsp_buf)
+        // test-only: the header_kv buffer is leaked (a few bytes per call)
+        Response::new(rsp_buf, Box::leak(Box::new(BytesMut::new())))
     }
 }
 
 impl Drop for Response<'_> {
     fn drop(&mut self) {
         self.rsp_buf.clear();
+        self.kv_head.clear();
     }
 }
 
-pub(crate) fn encode(mut rsp: Response, buf: &mut BytesMut) {
+/// RFC 9110 `tchar`.
+#[inline]
+fn is_token_byte(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(&b)
+}
+
+/// Writer returned by [`Response::begin_chunked_stream`].
+pub struct ChunkedBodyWriter<'s> {
+    stream: &'s mut TcpStream,
+    finished: bool,
+    // one chunk (size line, data, CRLF) assembled here, reused across chunks
+    frame: Vec<u8>,
+}
+
+/// Lower-case hex digits of `n`, most significant first, into the end of `out`; returns the
+/// start index.
+fn hex_digits(mut n: usize, out: &mut [u8; 2 * std::mem::size_of::<usize>()]) -> usize {
+    let mut at = out.len();
+    loop {
+        at -= 1;
+        out[at] = b"0123456789abcdef"[n & 0xf];
+        n >>= 4;
+        if n == 0 {
+            return at;
+        }
+    }
+}
+
+impl ChunkedBodyWriter<'_> {
+    /// Write one chunk and flush (clients observe data immediately).
+    ///
+    /// The size line, the data and the trailing CRLF go out in one write: with `TCP_NODELAY` each
+    /// write is its own segment, and the formatted size line alone could be more than one, so one
+    /// SSE event cost 3-4 syscalls and packets.
+    pub fn write_chunk(&mut self, data: &[u8]) -> io::Result<()> {
+        if self.finished {
+            return Err(io::Error::other("chunked stream already finished"));
+        }
+        if data.is_empty() {
+            return Ok(());
+        }
+        let mut size = [0_u8; 2 * std::mem::size_of::<usize>()];
+        let at = hex_digits(data.len(), &mut size);
+        self.frame.clear();
+        self.frame.reserve(size.len() - at + data.len() + 4);
+        self.frame.extend_from_slice(&size[at..]);
+        self.frame.extend_from_slice(b"\r\n");
+        self.frame.extend_from_slice(data);
+        self.frame.extend_from_slice(b"\r\n");
+        self.stream.write_all(&self.frame)?;
+        self.stream.flush()?;
+        Ok(())
+    }
+
+    /// Terminate the chunked body (`0\r\n\r\n`).
+    pub fn finish(mut self) -> io::Result<()> {
+        if !self.finished {
+            self.stream.write_all(b"0\r\n\r\n")?;
+            self.stream.flush()?;
+            self.finished = true;
+        }
+        Ok(())
+    }
+}
+
+impl Drop for ChunkedBodyWriter<'_> {
+    fn drop(&mut self) {
+        if !self.finished {
+            let _ = self.stream.write_all(b"0\r\n\r\n");
+            let _ = self.stream.flush();
+            self.finished = true;
+        }
+    }
+}
+
+fn write_status_and_headers(rsp: &Response<'_>, buf: &mut BytesMut, chunked: bool) {
     if rsp.status_message.code == 200 {
         buf.extend_from_slice(b"HTTP/1.1 200 Ok\r\nServer: M\r\nDate: ");
     } else {
@@ -238,26 +400,56 @@ pub(crate) fn encode(mut rsp: Response, buf: &mut BytesMut) {
         buf.extend_from_slice(b"\r\nServer: M\r\nDate: ");
     }
     crate::date::append_date(buf);
-    buf.extend_from_slice(b"\r\nContent-Length: ");
-    let mut length = itoa::Buffer::new();
-    buf.extend_from_slice(length.format(rsp.body_len()).as_bytes());
+    if chunked {
+        buf.extend_from_slice(b"\r\nTransfer-Encoding: chunked");
+    } else {
+        buf.extend_from_slice(b"\r\nContent-Length: ");
+        let mut length = itoa::Buffer::new();
+        buf.extend_from_slice(length.format(rsp.body_len()).as_bytes());
+    }
 
     // SAFETY: we already have bound check when insert headers
     let headers = unsafe { rsp.headers.get_unchecked(..rsp.headers_len) };
-    for h in headers {
+    for h in headers.iter().chain(rsp.more_headers.iter()) {
         buf.extend_from_slice(b"\r\n");
         buf.extend_from_slice(h.as_bytes());
     }
+    buf.extend_from_slice(rsp.kv_head);
 
     buf.extend_from_slice(b"\r\n\r\n");
+}
+
+pub(crate) fn encode(mut rsp: Response, buf: &mut BytesMut) {
+    if rsp.streamed {
+        return;
+    }
+    write_status_and_headers(&rsp, buf, /*chunked=*/ false);
     buf.extend_from_slice(rsp.get_body());
 }
 
+/// The response to a request refused before the service saw it; the connection closes after it.
+#[cold]
+pub(crate) fn encode_rejection(status: u16, buf: &mut BytesMut) {
+    let line: &[u8] = match status {
+        400 => b"HTTP/1.1 400 Bad Request",
+        413 => b"HTTP/1.1 413 Content Too Large",
+        431 => b"HTTP/1.1 431 Request Header Fields Too Large",
+        501 => b"HTTP/1.1 501 Not Implemented",
+        _ => b"HTTP/1.1 400 Bad Request",
+    };
+    buf.extend_from_slice(line);
+    buf.extend_from_slice(b"\r\nServer: M\r\nDate: ");
+    crate::date::append_date(buf);
+    buf.extend_from_slice(b"\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+}
+
+/// A service error becomes a 500 whose body is a fixed phrase. The error itself is logged, not sent:
+/// its text (paths, upstream addresses, driver messages) is for operators, not for whoever is on
+/// the other end of an internet-facing socket.
 #[cold]
 pub(crate) fn encode_error(e: io::Error, buf: &mut BytesMut) {
     error!("error in service: err = {e:?}");
-    let msg_string = e.to_string();
-    let msg = msg_string.as_bytes();
+    let msg: &[u8] = b"Internal Server Error";
 
     buf.extend_from_slice(b"HTTP/1.1 500 Internal Server Error\r\nServer: M\r\nDate: ");
     crate::date::append_date(buf);
@@ -273,6 +465,47 @@ pub(crate) fn encode_error(e: io::Error, buf: &mut BytesMut) {
 mod tests {
     use super::*;
     use std::borrow::Cow;
+
+    #[test]
+    fn header_kv_is_written_after_header_lines_and_rejects_splitting() {
+        let mut rsp_buf = BytesMut::new();
+        let mut kv = BytesMut::new();
+        let mut out = BytesMut::new();
+        {
+            let mut res = Response::new(&mut rsp_buf, &mut kv);
+            res.header("Content-Type: application/json");
+            res.header_kv("X-Request-ID", "01J");
+            res.header_kv("Set-Cookie", "a=1; Path=/");
+            res.header_kv("X-Bad", "v\r\nInjected: 1");
+            res.header_kv("Bad Name", "v");
+            res.header_kv("", "v");
+            res.body("ok");
+            encode(res, &mut out);
+        }
+        let text = std::str::from_utf8(&out).unwrap();
+        assert!(text.contains(
+            "\r\nContent-Type: application/json\r\nX-Request-ID: 01J\r\nSet-Cookie: a=1; Path=/\r\n\r\nok"
+        ), "{text}");
+        assert!(!text.contains("Injected"));
+        assert!(!text.contains("Bad Name"));
+        assert!(kv.is_empty(), "the buffer is cleared for the next response");
+    }
+
+    #[test]
+    fn chunk_size_line_is_lower_hex() {
+        for (len, hex) in [
+            (1_usize, "1"),
+            (15, "f"),
+            (16, "10"),
+            (255, "ff"),
+            (4096, "1000"),
+            (usize::MAX, "ffffffffffffffff"),
+        ] {
+            let mut size = [0_u8; 2 * std::mem::size_of::<usize>()];
+            let at = hex_digits(len, &mut size);
+            assert_eq!(&size[at..], hex.as_bytes());
+        }
+    }
 
     /// A `&'static str` header takes the Static fast path and stores the
     /// exact same slice. No allocation.
@@ -311,7 +544,8 @@ mod tests {
         let mut rsp_buf = BytesMut::new();
         let mut out = BytesMut::new();
         {
-            let mut res = Response::new(&mut rsp_buf);
+            let mut kv = BytesMut::new();
+            let mut res = Response::new(&mut rsp_buf, &mut kv);
             res.status_code(200, "OK");
             res.header("Content-Type: application/json");
             res.header(format!("X-Request-ID: {}", "01J"));

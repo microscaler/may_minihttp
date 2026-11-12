@@ -1,5 +1,6 @@
 //! http server implementation on top of `MAY`
 
+use std::cell::Cell;
 use std::io::{self, Read, Write};
 use std::mem::MaybeUninit;
 use std::net::ToSocketAddrs;
@@ -56,6 +57,7 @@ pub trait HttpServiceFactory: Send + Sized + 'static {
     /// return a coroutine that you can cancel it when need to stop the service
     fn start<L: ToSocketAddrs>(self, addr: L) -> io::Result<coroutine::JoinHandle<()>> {
         let listener = TcpListener::bind(addr)?;
+        crate::server_timing::listening(&listener);
         go!(
             coroutine::Builder::new().name("TcpServerFac".to_owned()),
             move || {
@@ -65,23 +67,25 @@ pub trait HttpServiceFactory: Send + Sized + 'static {
                 use std::os::windows::io::AsRawSocket;
                 for stream in listener.incoming() {
                     let mut stream = t_c!(stream);
+                    let accepted = std::time::Instant::now();
                     #[cfg(unix)]
                     let id = stream.as_raw_fd() as usize;
                     #[cfg(windows)]
                     let id = stream.as_raw_socket() as usize;
-                    // t_c!(stream.set_nodelay(true));
+                    // Responses are written whole; Nagle would only hold a second write (a streamed
+                    // chunk) for the client's delayed ACK. Not fatal if it cannot be set.
+                    let _ = stream.set_nodelay(true);
                     let service = self.new_service(id);
                     let builder = may::coroutine::Builder::new().id(id);
-                    go!(
-                        builder,
-                        move || if let Err(e) = each_connection_loop(&mut stream, service) {
-                            // Only log actual errors, not normal client disconnects
-                            if !is_client_disconnect(&e) {
-                                error!("service err = {e:?}");
-                            }
-                            stream.shutdown(std::net::Shutdown::Both).ok();
+                    go!(builder, move || if let Err(e) =
+                        each_connection_loop(&mut stream, service, accepted)
+                    {
+                        // Only log actual errors, not normal client disconnects
+                        if !is_client_disconnect(&e) {
+                            error!("service err = {e:?}");
                         }
-                    )
+                        stream.shutdown(std::net::Shutdown::Both).ok();
+                    })
                     .unwrap();
                 }
             }
@@ -135,6 +139,18 @@ fn nonblock_write(stream: &mut impl Write, rsp_buf: &mut BytesMut) -> io::Result
 }
 
 const BUF_LEN: usize = 4096 * 8;
+
+/// Most buffer capacity a connection keeps between requests.
+#[cfg(unix)]
+const MAX_RETAINED_BUF: usize = 256 * 1024;
+
+#[cfg(unix)]
+#[inline]
+fn shrink_if_idle(buf: &mut BytesMut) {
+    if buf.is_empty() && buf.capacity() > MAX_RETAINED_BUF {
+        *buf = BytesMut::with_capacity(BUF_LEN);
+    }
+}
 #[inline]
 pub(crate) fn reserve_buf(buf: &mut BytesMut) {
     let rem = buf.capacity() - buf.len();
@@ -161,64 +177,160 @@ pub struct HttpServer<T>(pub T);
 pub struct HttpServerWithHeaders<T, const N: usize>(pub T);
 
 #[cfg(unix)]
-fn each_connection_loop<T: HttpService>(stream: &mut TcpStream, service: T) -> io::Result<()> {
-    each_connection_loop_with_headers::<T, { request::MAX_HEADERS }>(stream, service)
+fn each_connection_loop<T: HttpService>(
+    stream: &mut TcpStream,
+    service: T,
+    accepted: std::time::Instant,
+) -> io::Result<()> {
+    each_connection_loop_with_headers::<T, { request::MAX_HEADERS }>(stream, service, accepted)
 }
 
 #[cfg(unix)]
 fn each_connection_loop_with_headers<T: HttpService, const N: usize>(
     stream: &mut TcpStream,
     mut service: T,
+    accepted: std::time::Instant,
 ) -> io::Result<()> {
+    // op_duration_seconds / op_gauge with the `op-timing` feature; nothing without it.
+    let mut timing = crate::server_timing::ConnTiming::new(accepted);
     let mut req_buf = BytesMut::with_capacity(BUF_LEN);
     let mut rsp_buf = BytesMut::with_capacity(BUF_LEN);
     let mut body_buf = BytesMut::with_capacity(4096);
+    // header lines from `Response::header_kv`, reused across responses
+    let mut kv_buf = BytesMut::with_capacity(512);
+    // set by a request whose body could not be delimited or discarded: answer it, then close
+    let close = Cell::new(false);
 
     loop {
+        let buffered = req_buf.len();
         let read_blocked = nonblock_read(stream.inner_mut(), &mut req_buf)?;
+        // set when a response in this batch was streamed (chunked / SSE) inside `call`
+        let mut streamed = false;
+        timing.read(buffered, req_buf.len());
+        let mut refused = None;
 
         // prepare the requests, we should make sure the request is fully read
         loop {
             let mut headers = [MaybeUninit::uninit(); N];
-            let req = match request::decode(&mut headers, &mut req_buf, stream)? {
-                Some(req) => req,
-                None => break,
+            let req = match request::decode_with_close(
+                &mut headers,
+                &mut req_buf,
+                stream,
+                Some(&close),
+            ) {
+                Ok(Some(req)) => req,
+                Ok(None) => break,
+                Err(e) => {
+                    refused = Some(e);
+                    break;
+                }
             };
+            timing.parsed();
             reserve_buf(&mut rsp_buf);
-            let mut rsp = Response::new(&mut body_buf);
-            match service.call(req, &mut rsp) {
+            let mut rsp = Response::new(&mut body_buf, &mut kv_buf);
+            let called = service.call(req, &mut rsp);
+            streamed |= rsp.is_streamed();
+            timing.served(called.is_ok());
+            match called {
                 Ok(()) => response::encode(rsp, &mut rsp_buf),
                 Err(e) => {
                     eprintln!("service err = {e:?}");
                     response::encode_error(e, &mut rsp_buf);
                 }
             }
-            // here need to use no_delay tcp option
-            // nonblock_write(stream.inner_mut(), &mut rsp_buf)?;
+            if close.get() {
+                break;
+            }
+        }
+
+        timing.incomplete(req_buf.len());
+        if let Some(e) = refused {
+            return refuse(stream, &mut rsp_buf, e);
+        }
+        if close.get() {
+            return close_after(stream, &rsp_buf);
         }
 
         // write out the responses
         nonblock_write(stream.inner_mut(), &mut rsp_buf)?;
+        timing.written(rsp_buf.is_empty());
 
-        if read_blocked {
+        // A large response or upload grows these buffers; a keep-alive connection would otherwise
+        // hold that memory until it closes, however small its later requests are.
+        shrink_if_idle(&mut rsp_buf);
+        shrink_if_idle(&mut req_buf);
+        shrink_if_idle(&mut body_buf);
+        shrink_if_idle(&mut kv_buf);
+
+        // `read_blocked` was observed before the service ran. A streamed response can run for minutes, and a
+        // client that closed (or sent more) during it has already signalled: waiting now would wait for an
+        // event that never comes and keep this connection, its buffers and its stack forever. Read again first.
+        if read_blocked && !streamed {
             stream.wait_io();
         }
     }
 }
 
+/// Answer a request the decoder refused (after any responses still queued for earlier pipelined
+/// requests) and close the connection. Not an error worth logging: scanners and broken clients
+/// send these all day.
+fn refuse(stream: &mut TcpStream, rsp_buf: &mut BytesMut, error: io::Error) -> io::Result<()> {
+    match request::rejected_request(&error) {
+        Some(rejected) => {
+            debug!("{rejected}");
+            response::encode_rejection(rejected.status, rsp_buf);
+            close_after(stream, rsp_buf)
+        }
+        None => Err(error),
+    }
+}
+
+/// Write everything queued, then end the connection: no further request on it is read.
+///
+/// Closing a socket that still has unread input makes the kernel send RST, which can destroy the
+/// response before the client reads it (a 431 for a head still being sent, a 413 for a body still
+/// uploading). So after the response and a FIN, what the client is still sending is read and
+/// discarded for a short, bounded time first (a "lingering close").
+fn close_after(stream: &mut TcpStream, rsp_buf: &[u8]) -> io::Result<()> {
+    const LINGER: std::time::Duration = std::time::Duration::from_secs(1);
+    const LINGER_READ: std::time::Duration = std::time::Duration::from_millis(100);
+    const LINGER_BYTES: usize = 1024 * 1024;
+    stream.write_all(rsp_buf)?;
+    stream.shutdown(std::net::Shutdown::Write)?;
+    let _ = stream.set_read_timeout(Some(LINGER_READ));
+    let started = std::time::Instant::now();
+    let mut scratch = [0_u8; 1024];
+    let mut discarded = 0;
+    while discarded < LINGER_BYTES && started.elapsed() < LINGER {
+        match stream.read(&mut scratch) {
+            Ok(0) | Err(_) => break,
+            Ok(n) => discarded += n,
+        }
+    }
+    Ok(())
+}
+
 #[cfg(not(unix))]
-fn each_connection_loop<T: HttpService>(stream: &mut TcpStream, service: T) -> io::Result<()> {
-    each_connection_loop_with_headers::<T, { request::MAX_HEADERS }>(stream, service)
+fn each_connection_loop<T: HttpService>(
+    stream: &mut TcpStream,
+    service: T,
+    accepted: std::time::Instant,
+) -> io::Result<()> {
+    each_connection_loop_with_headers::<T, { request::MAX_HEADERS }>(stream, service, accepted)
 }
 
 #[cfg(not(unix))]
 fn each_connection_loop_with_headers<T: HttpService, const N: usize>(
     stream: &mut TcpStream,
     mut service: T,
+    _accepted: std::time::Instant,
 ) -> io::Result<()> {
     let mut req_buf = BytesMut::with_capacity(BUF_LEN);
     let mut rsp_buf = BytesMut::with_capacity(BUF_LEN);
     let mut body_buf = BytesMut::with_capacity(BUF_LEN);
+    let mut kv_buf = BytesMut::with_capacity(512);
+    let close = Cell::new(false);
+    let mut refused = None;
     loop {
         // read the socket for requests
         reserve_buf(&mut req_buf);
@@ -234,11 +346,20 @@ fn each_connection_loop_with_headers<T: HttpService, const N: usize>(
         if read_cnt > 0 {
             loop {
                 let mut headers = [MaybeUninit::uninit(); N];
-                let req = match request::decode(&mut headers, &mut req_buf, stream)? {
-                    Some(req) => req,
-                    None => break,
+                let req = match request::decode_with_close(
+                    &mut headers,
+                    &mut req_buf,
+                    stream,
+                    Some(&close),
+                ) {
+                    Ok(Some(req)) => req,
+                    Ok(None) => break,
+                    Err(e) => {
+                        refused = Some(e);
+                        break;
+                    }
                 };
-                let mut rsp = Response::new(&mut body_buf);
+                let mut rsp = Response::new(&mut body_buf, &mut kv_buf);
                 match service.call(req, &mut rsp) {
                     Ok(()) => response::encode(rsp, &mut rsp_buf),
                     Err(e) => {
@@ -246,11 +367,21 @@ fn each_connection_loop_with_headers<T: HttpService, const N: usize>(
                         response::encode_error(e, &mut rsp_buf);
                     }
                 }
+                if close.get() {
+                    break;
+                }
             }
+        }
+        if let Some(e) = refused.take() {
+            return refuse(stream, &mut rsp_buf, e);
+        }
+        if close.get() {
+            return close_after(stream, &rsp_buf);
         }
 
         // send the result back to client
         stream.write_all(&rsp_buf)?;
+        rsp_buf.clear();
     }
 }
 
@@ -259,16 +390,21 @@ impl<T: HttpService + Clone + Send + Sync + 'static> HttpServer<T> {
     /// return a coroutine that you can cancel it when need to stop the service
     pub fn start<L: ToSocketAddrs>(self, addr: L) -> io::Result<coroutine::JoinHandle<()>> {
         let listener = TcpListener::bind(addr)?;
+        crate::server_timing::listening(&listener);
         let service = self.0;
         go!(
             coroutine::Builder::new().name("TcpServer".to_owned()),
             move || {
                 for stream in listener.incoming() {
                     let mut stream = t_c!(stream);
-                    // t_c!(stream.set_nodelay(true));
+                    let accepted = std::time::Instant::now();
+                    // Responses are written whole; Nagle would only hold a second write (a streamed
+                    // chunk) for the client's delayed ACK. Not fatal if it cannot be set.
+                    let _ = stream.set_nodelay(true);
                     let service = service.clone();
                     go!(
-                        move || if let Err(e) = each_connection_loop(&mut stream, service) {
+                        move || if let Err(e) = each_connection_loop(&mut stream, service, accepted)
+                        {
                             // Only log actual errors, not normal client disconnects
                             if !is_client_disconnect(&e) {
                                 error!("service err = {e:?}");
@@ -287,16 +423,20 @@ impl<T: HttpService + Clone + Send + Sync + 'static, const N: usize> HttpServerW
     /// return a coroutine that you can cancel it when need to stop the service
     pub fn start<L: ToSocketAddrs>(self, addr: L) -> io::Result<coroutine::JoinHandle<()>> {
         let listener = TcpListener::bind(addr)?;
+        crate::server_timing::listening(&listener);
         let service = self.0;
         go!(
             coroutine::Builder::new().name("TcpServer".to_owned()),
             move || {
                 for stream in listener.incoming() {
                     let mut stream = t_c!(stream);
-                    // t_c!(stream.set_nodelay(true));
+                    let accepted = std::time::Instant::now();
+                    // Responses are written whole; Nagle would only hold a second write (a streamed
+                    // chunk) for the client's delayed ACK. Not fatal if it cannot be set.
+                    let _ = stream.set_nodelay(true);
                     let service = service.clone();
                     go!(move || if let Err(e) =
-                        each_connection_loop_with_headers::<T, N>(&mut stream, service)
+                        each_connection_loop_with_headers::<T, N>(&mut stream, service, accepted)
                     {
                         // Only log actual errors, not normal client disconnects
                         if !is_client_disconnect(&e) {

@@ -1,0 +1,5080 @@
+//! Replay-aware requests, secure redirects, and bounded connection pooling.
+
+use std::borrow::Cow;
+use std::collections::{HashMap, HashSet};
+use std::fmt;
+use std::io::{self, Read};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+
+use http::header::{
+    AUTHORIZATION, CONNECTION, CONTENT_LENGTH, CONTENT_TYPE, COOKIE, HOST, LOCATION,
+    PROXY_AUTHORIZATION, TRANSFER_ENCODING,
+};
+use http::{HeaderMap, HeaderName, HeaderValue, Method, StatusCode, Version};
+use may::sync::{Condvar, Mutex};
+use rustls::ClientConfig;
+use url::Url;
+
+use super::cancellation::{cancelled_error, is_cancelled_error, run_cancellable};
+use super::interceptor::{Interceptor, NoInterceptor, OutgoingRequest, ResponseHead, Timing};
+use super::trace::{self, client_event, client_span, phase_span, span_record};
+use super::{
+    CancellationToken, ClientEvent, ClientObserver, ObservedOrigin, RequestMetadata,
+    RequestMetadataContext, RequestMetadataProvider, Resolver, SystemResolver,
+    TlsConfigFailurePolicy, TlsConfigProvider, TlsConfigSnapshot,
+};
+use super::{HttpClient, MultipartForm};
+
+const DEFAULT_MAX_RESPONSE_BODY: usize = 8 * 1024 * 1024;
+const DEFAULT_MAX_REQUEST_HEADERS: usize = 64;
+const DEFAULT_MAX_REQUEST_HEADER_BYTES: usize = 16 * 1024;
+
+#[cfg(test)]
+type TestConnector = dyn Fn(&str, Arc<ClientConfig>, Duration, &[std::net::SocketAddr]) -> io::Result<HttpClient>
+    + Send
+    + Sync;
+
+/// Policy governing whether HTTP redirects are followed.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum RedirectPolicy {
+    /// Return 3xx responses to the caller. This is the default.
+    #[default]
+    None,
+    /// Follow at most `max_hops` GET/HEAD redirects within the original origin.
+    SameOrigin { max_hops: usize },
+    /// Follow cross-origin GET/HEAD redirects, stripping credentials first.
+    CrossOrigin {
+        max_hops: usize,
+        /// HTTPS-to-HTTP transitions remain forbidden unless this is explicitly true.
+        allow_https_downgrade: bool,
+    },
+}
+
+impl RedirectPolicy {
+    fn max_hops(self) -> Option<usize> {
+        match self {
+            Self::None => None,
+            Self::SameOrigin { max_hops } | Self::CrossOrigin { max_hops, .. } => Some(max_hops),
+        }
+    }
+}
+
+/// Builder for a cloneable, coroutine-safe HTTP client.
+pub struct ClientBuilder {
+    max_connections: usize,
+    max_connections_per_origin: usize,
+    idle_timeout: Duration,
+    max_connection_lifetime: Duration,
+    connect_timeout: Duration,
+    io_timeout: Duration,
+    request_timeout: Duration,
+    max_request_headers: usize,
+    max_request_header_bytes: usize,
+    max_response_header_bytes: usize,
+    max_response_body: usize,
+    redirect_policy: RedirectPolicy,
+    tls_config: Option<Arc<ClientConfig>>,
+    tls_config_provider: Option<Arc<dyn TlsConfigProvider>>,
+    tls_config_failure_policy: TlsConfigFailurePolicy,
+    resolver: Arc<dyn Resolver>,
+    observer: Option<Arc<dyn ClientObserver>>,
+    metadata_provider: Option<Arc<dyn RequestMetadataProvider>>,
+    #[cfg(test)]
+    connector: Option<Arc<TestConnector>>,
+    sensitive_headers: HashSet<HeaderName>,
+    default_headers: HeaderMap,
+}
+
+impl Default for ClientBuilder {
+    fn default() -> Self {
+        let sensitive_headers = [AUTHORIZATION, COOKIE, PROXY_AUTHORIZATION]
+            .into_iter()
+            .collect();
+        Self {
+            max_connections: 64,
+            max_connections_per_origin: 8,
+            idle_timeout: Duration::from_secs(90),
+            max_connection_lifetime: Duration::from_secs(15 * 60),
+            connect_timeout: Duration::from_secs(10),
+            io_timeout: Duration::from_secs(30),
+            request_timeout: Duration::from_secs(30),
+            max_request_headers: DEFAULT_MAX_REQUEST_HEADERS,
+            max_request_header_bytes: DEFAULT_MAX_REQUEST_HEADER_BYTES,
+            max_response_header_bytes: super::response::DEFAULT_MAX_RESPONSE_HEADER_BYTES,
+            max_response_body: DEFAULT_MAX_RESPONSE_BODY,
+            redirect_policy: RedirectPolicy::None,
+            tls_config: None,
+            tls_config_provider: None,
+            tls_config_failure_policy: TlsConfigFailurePolicy::FailRequest,
+            resolver: Arc::new(SystemResolver),
+            observer: None,
+            metadata_provider: None,
+            #[cfg(test)]
+            connector: None,
+            sensitive_headers,
+            default_headers: HeaderMap::new(),
+        }
+    }
+}
+
+impl ClientBuilder {
+    /// Create a builder with conservative finite limits and redirects disabled.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn max_connections(mut self, value: usize) -> Self {
+        self.max_connections = value;
+        self
+    }
+
+    pub fn max_connections_per_origin(mut self, value: usize) -> Self {
+        self.max_connections_per_origin = value;
+        self
+    }
+
+    pub fn idle_timeout(mut self, value: Duration) -> Self {
+        self.idle_timeout = value;
+        self
+    }
+
+    pub fn max_connection_lifetime(mut self, value: Duration) -> Self {
+        self.max_connection_lifetime = value;
+        self
+    }
+
+    pub fn connect_timeout(mut self, value: Duration) -> Self {
+        self.connect_timeout = value;
+        self
+    }
+
+    pub fn io_timeout(mut self, value: Duration) -> Self {
+        self.io_timeout = value;
+        self
+    }
+
+    pub fn request_timeout(mut self, value: Duration) -> Self {
+        self.request_timeout = value;
+        self
+    }
+
+    /// Limit caller- and provider-supplied request header fields after precedence is applied.
+    pub fn max_request_headers(mut self, value: usize) -> Self {
+        self.max_request_headers = value;
+        self
+    }
+
+    /// Limit the aggregate encoded size of caller- and provider-supplied request headers.
+    pub fn max_request_header_bytes(mut self, value: usize) -> Self {
+        self.max_request_header_bytes = value;
+        self
+    }
+
+    pub fn max_response_body(mut self, value: usize) -> Self {
+        self.max_response_body = value;
+        self
+    }
+
+    pub fn max_response_header_bytes(mut self, value: usize) -> Self {
+        self.max_response_header_bytes = value;
+        self
+    }
+
+    pub fn redirect_policy(mut self, value: RedirectPolicy) -> Self {
+        self.redirect_policy = value;
+        self
+    }
+
+    /// Use a custom rustls configuration for HTTPS (private CAs, mTLS, or tests).
+    pub fn tls_config(mut self, value: Arc<ClientConfig>) -> Self {
+        self.tls_config = Some(value);
+        self
+    }
+
+    /// Resolve rotating rustls identity and trust snapshots for logical HTTPS requests.
+    pub fn tls_config_provider(mut self, value: Arc<dyn TlsConfigProvider>) -> Self {
+        self.tls_config_provider = Some(value);
+        self
+    }
+
+    /// Choose whether a provider load failure may use the last accepted TLS snapshot.
+    pub fn tls_config_failure_policy(mut self, value: TlsConfigFailurePolicy) -> Self {
+        self.tls_config_failure_policy = value;
+        self
+    }
+
+    /// Inject a cached, static, or may-aware resolver.
+    pub fn resolver(mut self, value: Arc<dyn Resolver>) -> Self {
+        self.resolver = value;
+        self
+    }
+
+    /// Observe sanitized request lifecycle events.
+    pub fn observer(mut self, value: Arc<dyn ClientObserver>) -> Self {
+        self.observer = Some(value);
+        self
+    }
+
+    /// Supply rotating credentials or trace context immediately before each network attempt.
+    pub fn request_metadata_provider(mut self, value: Arc<dyn RequestMetadataProvider>) -> Self {
+        self.metadata_provider = Some(value);
+        self
+    }
+
+    #[cfg(test)]
+    fn test_connector(mut self, value: Arc<TestConnector>) -> Self {
+        self.connector = Some(value);
+        self
+    }
+
+    /// Mark an additional header for removal before a cross-origin redirect.
+    pub fn sensitive_header(mut self, value: HeaderName) -> Self {
+        self.sensitive_headers.insert(value);
+        self
+    }
+
+    /// Set a low-precedence header applied to every request attempt.
+    pub fn default_header(mut self, name: HeaderName, value: HeaderValue) -> Self {
+        self.default_headers.insert(name, value);
+        self
+    }
+
+    /// Replace the complete low-precedence default header set.
+    pub fn default_headers(mut self, value: HeaderMap) -> Self {
+        self.default_headers = value;
+        self
+    }
+
+    pub fn build(self) -> io::Result<Client> {
+        self.build_with_interceptor(NoInterceptor)
+    }
+
+    /// Build a client that calls `interceptor` on every attempt (see [`Interceptor`]).
+    pub fn build_with_interceptor<I: Interceptor>(self, interceptor: I) -> io::Result<Client<I>> {
+        if self.max_connections == 0 || self.max_connections_per_origin == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "connection limits must be greater than zero",
+            ));
+        }
+        if self.max_connections_per_origin > self.max_connections {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "per-origin connection limit cannot exceed the global limit",
+            ));
+        }
+        if self.max_response_body == 0 || self.max_response_header_bytes < 4 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "response body limit must be non-zero and header limit at least four bytes",
+            ));
+        }
+        if self.max_request_headers == 0 || self.max_request_header_bytes == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "request header limits must be greater than zero",
+            ));
+        }
+        validate_request_headers(
+            &self.default_headers,
+            self.max_request_headers,
+            self.max_request_header_bytes,
+            "default",
+        )?;
+
+        if self.tls_config.is_some() && self.tls_config_provider.is_some() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "static TLS configuration and TLS configuration provider are mutually exclusive",
+            ));
+        }
+        let (tls_snapshot, tls_config_provider) = match self.tls_config_provider {
+            Some(provider) => {
+                let snapshot = provider.current().map_err(|error| {
+                    tls_provider_error(&format!(
+                        "failed during client construction ({:?})",
+                        error.kind()
+                    ))
+                })?;
+                validate_tls_snapshot(&snapshot)?;
+                (snapshot, Some(provider))
+            }
+            None => {
+                let config = match self.tls_config {
+                    Some(config) => config,
+                    None => HttpClient::platform_tls_config()?,
+                };
+                (TlsConfigSnapshot::new(1, config), None)
+            }
+        };
+        let tls_generation = tls_snapshot.generation;
+        let base_tls_config = Arc::clone(&tls_snapshot.config);
+        Ok(Client {
+            inner: Arc::new(ClientInner {
+                config: ClientConfigValues {
+                    max_connections: self.max_connections,
+                    max_connections_per_origin: self.max_connections_per_origin,
+                    idle_timeout: self.idle_timeout,
+                    max_connection_lifetime: self.max_connection_lifetime,
+                    connect_timeout: self.connect_timeout,
+                    io_timeout: self.io_timeout,
+                    request_timeout: self.request_timeout,
+                    max_request_headers: self.max_request_headers,
+                    max_request_header_bytes: self.max_request_header_bytes,
+                    max_response_header_bytes: self.max_response_header_bytes,
+                    max_response_body: self.max_response_body,
+                    redirect_policy: self.redirect_policy,
+                    sensitive_headers: self.sensitive_headers,
+                    default_headers: self.default_headers,
+                },
+                base_tls_config,
+                tls_config_provider,
+                tls_config_failure_policy: self.tls_config_failure_policy,
+                tls_state: Mutex::new(TlsState {
+                    active: tls_snapshot,
+                }),
+                active_tls_generation: AtomicU64::new(tls_generation),
+                resolver: self.resolver,
+                observer: self.observer,
+                metadata_provider: self.metadata_provider,
+                #[cfg(test)]
+                connector: self.connector,
+                pool: Mutex::new(PoolState::default()),
+                available: Condvar::new(),
+                stats: ClientStatsInner::default(),
+                next_request_id: AtomicU64::new(1),
+            }),
+            interceptor,
+        })
+    }
+}
+
+/// Pooled HTTP/1.1 client. `I` is the per-attempt [`Interceptor`]; the default does nothing and
+/// compiles away.
+#[derive(Clone)]
+pub struct Client<I = NoInterceptor> {
+    inner: Arc<ClientInner>,
+    interceptor: I,
+}
+
+/// Monotonic operational counters for a [`Client`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ClientStats {
+    pub connections_created: u64,
+    pub connections_reused: u64,
+    /// Closed instead of reused: the response left it unusable, the server closed it while idle
+    /// (found by the reuse check), a TLS rotation retired it, or the request failed on it.
+    pub connections_discarded: u64,
+    /// Closed because they sat idle past `idle_timeout` or outlived `max_connection_lifetime`.
+    pub connections_expired: u64,
+    pub pool_waits: u64,
+    pub stale_retries: u64,
+    pub redirects_followed: u64,
+}
+
+/// Stable high-level classification for client failures.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ClientErrorKind {
+    Cancelled,
+    Metadata,
+    InvalidRequest,
+    Dns,
+    Connection,
+    Tls,
+    Timeout,
+    Protocol,
+    BodyTooLarge,
+    BodyNotReplayable,
+    Redirect,
+    Io,
+}
+
+impl ClientErrorKind {
+    /// A stable snake_case name, suitable as a metric label or an `error.type` attribute.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Cancelled => "cancelled",
+            Self::Metadata => "metadata",
+            Self::InvalidRequest => "invalid_request",
+            Self::Dns => "dns",
+            Self::Connection => "connection",
+            Self::Tls => "tls",
+            Self::Timeout => "timeout",
+            Self::Protocol => "protocol",
+            Self::BodyTooLarge => "body_too_large",
+            Self::BodyNotReplayable => "body_not_replayable",
+            Self::Redirect => "redirect",
+            Self::Io => "io",
+        }
+    }
+
+    fn classify(source: &io::Error) -> Self {
+        let message = source.to_string().to_ascii_lowercase();
+        match source.kind() {
+            _ if is_cancelled_error(source) => Self::Cancelled,
+            _ if message.starts_with("request metadata provider") => Self::Metadata,
+            _ if message.contains("body is not replayable") => Self::BodyNotReplayable,
+            io::ErrorKind::InvalidInput => Self::InvalidRequest,
+            io::ErrorKind::AddrNotAvailable => Self::Dns,
+            io::ErrorKind::TimedOut => Self::Timeout,
+            io::ErrorKind::PermissionDenied => Self::Redirect,
+            io::ErrorKind::InvalidData if message.contains("body exceeds") => Self::BodyTooLarge,
+            io::ErrorKind::InvalidData if message.contains("redirect") => Self::Redirect,
+            io::ErrorKind::InvalidData | io::ErrorKind::UnexpectedEof => Self::Protocol,
+            io::ErrorKind::BrokenPipe
+            | io::ErrorKind::ConnectionAborted
+            | io::ErrorKind::ConnectionRefused
+            | io::ErrorKind::ConnectionReset
+            | io::ErrorKind::NotConnected
+            | io::ErrorKind::WriteZero => Self::Connection,
+            io::ErrorKind::Other if message.contains("tls") || message.contains("certificate") => {
+                Self::Tls
+            }
+            _ => Self::Io,
+        }
+    }
+}
+
+/// Classified error returned by [`RequestBuilder::send_typed`].
+#[derive(Debug)]
+pub struct ClientError {
+    kind: ClientErrorKind,
+    source: io::Error,
+}
+
+impl ClientError {
+    pub fn kind(&self) -> ClientErrorKind {
+        self.kind
+    }
+
+    pub fn into_io_error(self) -> io::Error {
+        self.source
+    }
+}
+
+impl fmt::Display for ClientError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "{}", self.source)
+    }
+}
+
+impl std::error::Error for ClientError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.source)
+    }
+}
+
+impl From<io::Error> for ClientError {
+    fn from(source: io::Error) -> Self {
+        let kind = ClientErrorKind::classify(&source);
+        Self { kind, source }
+    }
+}
+
+#[derive(Default)]
+struct ClientStatsInner {
+    connections_created: AtomicU64,
+    connections_reused: AtomicU64,
+    connections_discarded: AtomicU64,
+    connections_expired: AtomicU64,
+    pool_waits: AtomicU64,
+    stale_retries: AtomicU64,
+    redirects_followed: AtomicU64,
+}
+
+impl ClientStatsInner {
+    fn snapshot(&self) -> ClientStats {
+        ClientStats {
+            connections_created: self.connections_created.load(Ordering::Relaxed),
+            connections_reused: self.connections_reused.load(Ordering::Relaxed),
+            connections_discarded: self.connections_discarded.load(Ordering::Relaxed),
+            connections_expired: self.connections_expired.load(Ordering::Relaxed),
+            pool_waits: self.pool_waits.load(Ordering::Relaxed),
+            stale_retries: self.stale_retries.load(Ordering::Relaxed),
+            redirects_followed: self.redirects_followed.load(Ordering::Relaxed),
+        }
+    }
+}
+
+impl<I> fmt::Debug for Client<I> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("Client")
+            .field("max_connections", &self.inner.config.max_connections)
+            .field(
+                "max_connections_per_origin",
+                &self.inner.config.max_connections_per_origin,
+            )
+            .field("redirect_policy", &self.inner.config.redirect_policy)
+            .finish_non_exhaustive()
+    }
+}
+
+#[derive(Debug, Clone)]
+struct RequestTrace {
+    request_id: u64,
+    started: Instant,
+    /// The request's span (feature `tracing`; zero-sized otherwise).
+    span: trace::Span,
+}
+
+struct StreamingExecution<'a> {
+    deadline: Instant,
+    trace: &'a RequestTrace,
+    cancellation: Option<CancellationToken>,
+    attempt: &'a mut u32,
+    sensitive_headers: &'a mut HashSet<HeaderName>,
+    tls_snapshot: &'a mut Option<TlsConfigSnapshot>,
+}
+
+/// What `RequestBuilder::parent_span` / `request_span` chose (feature `tracing`).
+#[cfg_attr(not(feature = "tracing"), allow(dead_code))]
+enum SpanChoice {
+    Parent(trace::Span),
+    Own(trace::Span),
+}
+
+struct AttemptInfo<'a> {
+    method: &'a Method,
+    url: &'a Url,
+    trace: &'a RequestTrace,
+    attempt: u32,
+    redirect_hop: usize,
+    stale_retry: bool,
+    reused_connection: bool,
+}
+
+struct AttemptExecution<'a> {
+    deadline: Instant,
+    trace: &'a RequestTrace,
+    attempt: &'a mut u32,
+    redirect_hop: usize,
+    credentials_stripped: bool,
+    sensitive_headers: &'a mut HashSet<HeaderName>,
+    tls_snapshot: &'a mut Option<TlsConfigSnapshot>,
+}
+
+impl Client {
+    pub fn builder() -> ClientBuilder {
+        ClientBuilder::new()
+    }
+
+    pub fn new() -> io::Result<Self> {
+        Self::builder().build()
+    }
+}
+
+impl<I: Interceptor> Client<I> {
+    /// The same client (same connection pool, configuration and counters) with another
+    /// interceptor.
+    pub fn with_interceptor<J: Interceptor>(&self, interceptor: J) -> Client<J> {
+        Client {
+            inner: Arc::clone(&self.inner),
+            interceptor,
+        }
+    }
+
+    pub fn interceptor(&self) -> &I {
+        &self.interceptor
+    }
+
+    pub fn request(&self, method: Method, url: &str) -> io::Result<RequestBuilder<I>> {
+        let url = parse_url(url)?;
+        Ok(RequestBuilder {
+            client: self.clone(),
+            span: None,
+            method,
+            url,
+            headers: HeaderMap::new(),
+            body: RequestBody::Empty,
+            timeout: None,
+            cancellation: None,
+        })
+    }
+
+    pub fn get(&self, url: &str) -> io::Result<RequestBuilder<I>> {
+        self.request(Method::GET, url)
+    }
+
+    pub fn post(&self, url: &str) -> io::Result<RequestBuilder<I>> {
+        self.request(Method::POST, url)
+    }
+
+    /// Snapshot connection-pool and redirect counters.
+    pub fn stats(&self) -> ClientStats {
+        self.inner.stats.snapshot()
+    }
+
+    fn execute(&self, mut request: RequestBuilder<I>) -> io::Result<BufferedResponse> {
+        let trace = self.begin_request(&request.method, &request.url, request.span.take());
+        let cancellation = request.cancellation.clone();
+        let result = match cancellation {
+            Some(token) => run_cancellable(&token, || self.execute_buffered(request, &trace)),
+            None => self.execute_buffered(request, &trace),
+        };
+        match &result {
+            Ok(response) => {
+                span_record!(
+                    trace.span,
+                    "http.response.status_code",
+                    response.status.as_u16()
+                );
+                self.inner.observe(ClientEvent::RequestCompleted {
+                    request_id: trace.request_id,
+                    status: response.status,
+                    total_duration: trace.started.elapsed(),
+                })
+            }
+            Err(error) => self.observe_failure(&trace, error),
+        }
+        result
+    }
+
+    fn execute_buffered(
+        &self,
+        request: RequestBuilder<I>,
+        trace: &RequestTrace,
+    ) -> io::Result<BufferedResponse> {
+        let deadline = Instant::now()
+            .checked_add(request.timeout.unwrap_or(self.inner.config.request_timeout))
+            .ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidInput, "request timeout overflow")
+            })?;
+        let mut method = request.method;
+        let mut url = request.url;
+        let mut headers = request.headers;
+        let mut body = request.body;
+        let policy = self.inner.config.redirect_policy;
+        let mut visited = HashSet::new();
+        // Only a policy that follows redirects needs loop detection; skip the URL copy otherwise.
+        if policy.max_hops().is_some() {
+            visited.insert(normalized_url(&url));
+        }
+        let mut hops = 0_usize;
+        let mut attempt = 0_u32;
+        let mut credentials_stripped = false;
+        // Only the sensitive headers a metadata provider adds for this request; the configured set
+        // is read in place (cloning it cost an allocation per request).
+        let mut sensitive_headers = HashSet::new();
+        let mut tls_snapshot = None;
+
+        loop {
+            let response = self.execute_once(
+                &method,
+                &url,
+                &headers,
+                &mut body,
+                AttemptExecution {
+                    deadline,
+                    trace,
+                    attempt: &mut attempt,
+                    redirect_hop: hops,
+                    credentials_stripped,
+                    sensitive_headers: &mut sensitive_headers,
+                    tls_snapshot: &mut tls_snapshot,
+                },
+            )?;
+            let Some(max_hops) = policy.max_hops() else {
+                return Ok(response);
+            };
+            if !is_redirect(response.status) {
+                return Ok(response);
+            }
+            let Some(location) = response.headers.get(LOCATION) else {
+                return Ok(response);
+            };
+            if matches!(
+                response.status,
+                StatusCode::MOVED_PERMANENTLY | StatusCode::FOUND
+            ) && !matches!(method, Method::GET | Method::HEAD)
+            {
+                return Ok(response);
+            }
+            if matches!(
+                response.status,
+                StatusCode::TEMPORARY_REDIRECT | StatusCode::PERMANENT_REDIRECT
+            ) && !body.is_replayable()
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "request body is not replayable across this redirect",
+                ));
+            }
+            if hops >= max_hops {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "HTTP redirect hop limit exceeded",
+                ));
+            }
+            let location = location.to_str().map_err(|error| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("invalid redirect Location header: {error}"),
+                )
+            })?;
+            let target = url.join(location).map_err(|error| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("invalid redirect target: {error}"),
+                )
+            })?;
+            validate_redirect(policy, &url, &target)?;
+            if !visited.insert(normalized_url(&target)) {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "HTTP redirect loop detected",
+                ));
+            }
+
+            if !same_origin(&url, &target) {
+                credentials_stripped = true;
+                for header in self
+                    .inner
+                    .config
+                    .sensitive_headers
+                    .iter()
+                    .chain(&sensitive_headers)
+                {
+                    headers.remove(header);
+                }
+            }
+            self.inner.observe(ClientEvent::RedirectFollowed {
+                request_id: trace.request_id,
+                status: response.status,
+                from: observed_url(&url),
+                to: observed_url(&target),
+            });
+            if response.status == StatusCode::SEE_OTHER && method != Method::HEAD {
+                method = Method::GET;
+                body = RequestBody::Empty;
+                headers.remove(CONTENT_TYPE);
+                headers.remove(CONTENT_LENGTH);
+                headers.remove(TRANSFER_ENCODING);
+            }
+            url = target;
+            hops += 1;
+            self.inner
+                .stats
+                .redirects_followed
+                .fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    fn execute_streaming(&self, mut request: RequestBuilder<I>) -> io::Result<StreamingResponse> {
+        let trace = self.begin_request(&request.method, &request.url, request.span.take());
+        let cancellation = request.cancellation.clone();
+        let result = match cancellation {
+            Some(token) => {
+                run_cancellable(&token, || self.execute_streaming_inner(request, &trace))
+            }
+            None => self.execute_streaming_inner(request, &trace),
+        };
+        if let Err(error) = &result {
+            self.observe_failure(&trace, error);
+        }
+        result
+    }
+
+    fn execute_streaming_inner(
+        &self,
+        request: RequestBuilder<I>,
+        trace: &RequestTrace,
+    ) -> io::Result<StreamingResponse> {
+        if self.inner.config.redirect_policy != RedirectPolicy::None {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "streaming responses require redirects to be disabled",
+            ));
+        }
+        let deadline = Instant::now()
+            .checked_add(request.timeout.unwrap_or(self.inner.config.request_timeout))
+            .ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidInput, "request timeout overflow")
+            })?;
+        let cancellation = request.cancellation.clone();
+        let mut body = request.body;
+        let mut attempt = 0_u32;
+        // Only the sensitive headers a metadata provider adds for this request; the configured set
+        // is read in place (cloning it cost an allocation per request).
+        let mut sensitive_headers = HashSet::new();
+        let mut tls_snapshot = None;
+        self.execute_streaming_once(
+            &request.method,
+            &request.url,
+            &request.headers,
+            &mut body,
+            StreamingExecution {
+                deadline,
+                trace,
+                cancellation,
+                attempt: &mut attempt,
+                sensitive_headers: &mut sensitive_headers,
+                tls_snapshot: &mut tls_snapshot,
+            },
+        )
+    }
+
+    fn execute_once(
+        &self,
+        method: &Method,
+        url: &Url,
+        headers: &HeaderMap,
+        body: &mut RequestBody,
+        execution: AttemptExecution<'_>,
+    ) -> io::Result<BufferedResponse> {
+        let AttemptExecution {
+            deadline,
+            trace,
+            attempt,
+            redirect_hop,
+            credentials_stripped,
+            sensitive_headers,
+            tls_snapshot,
+        } = execution;
+        validate_body_method(method, body)?;
+        let (tls_generation, tls_config) = self.tls_for_url(url, trace, tls_snapshot)?;
+        let key = OriginKey::from_url(url, tls_generation)?;
+        let mut stale_retry_available = method_is_idempotent(method) && body.is_replayable();
+        let mut stale_retry = false;
+        loop {
+            *attempt = attempt.checked_add(1).ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "request attempt counter overflow",
+                )
+            })?;
+            let mut attempt_headers = self.prepare_attempt_headers(
+                headers,
+                RequestMetadataContext {
+                    request_id: trace.request_id,
+                    method,
+                    origin: observed_url(url),
+                    attempt: *attempt,
+                    redirect_hop,
+                    stale_retry,
+                },
+                credentials_stripped,
+                sensitive_headers,
+            )?;
+            let mut lease = self.checkout(&key, Arc::clone(&tls_config), deadline, trace)?;
+            let reused_idle_connection = lease.reused_idle_connection;
+            span_record!(
+                trace.span,
+                "may_minihttp.connection_reused",
+                reused_idle_connection
+            );
+            if *attempt > 1 {
+                span_record!(trace.span, "http.request.resend_count", *attempt - 1);
+            }
+            let timing = self.before_send(
+                &mut attempt_headers,
+                AttemptInfo {
+                    method,
+                    url,
+                    trace,
+                    attempt: *attempt,
+                    redirect_hop,
+                    stale_retry,
+                    reused_connection: reused_idle_connection,
+                },
+            );
+            let result = (|| {
+                let mut response = self.send_on_lease(
+                    &mut lease,
+                    method,
+                    url,
+                    &attempt_headers,
+                    body,
+                    deadline,
+                    &trace.span,
+                    trace.request_id,
+                )?;
+
+                let status = response.status();
+                if I::ENABLED {
+                    if let Some(timing) = &timing {
+                        self.interceptor.after_response(
+                            &ResponseHead {
+                                status,
+                                version: response.version(),
+                                headers: response.headers(),
+                                url,
+                            },
+                            timing,
+                        );
+                    }
+                }
+                self.inner.observe(ClientEvent::ResponseHeaders {
+                    request_id: trace.request_id,
+                    origin: observed_url(url),
+                    status,
+                    elapsed: trace.started.elapsed(),
+                });
+                let version = response.version();
+                // The body reader does not need the headers: move them out instead of cloning
+                // the map (an allocation per header, per request).
+                let response_headers = std::mem::take(response.headers_mut());
+                let reusable = response_is_reusable(
+                    method,
+                    status,
+                    version,
+                    &attempt_headers,
+                    &response_headers,
+                );
+                let limit = self.inner.config.max_response_body;
+                // Read straight into the result, sized from Content-Length when there is one
+                // (bounded by the limit), instead of through an 8 KiB scratch buffer allocated and
+                // zeroed per request and copied out of.
+                let expected = response_headers
+                    .get(CONTENT_LENGTH)
+                    .and_then(|value| value.to_str().ok())
+                    .and_then(|value| value.trim().parse::<usize>().ok())
+                    .map_or(0, |length| length.min(limit));
+                let mut bytes = Vec::with_capacity(expected);
+                let body_span = phase_span!(
+                    DEBUG,
+                    parent: &trace.span,
+                    "http_client_body",
+                    "http.response.body.size" = tracing::field::Empty
+                );
+                let body_started = Instant::now();
+                let body_read = (|| -> io::Result<()> {
+                    loop {
+                        if response.body_complete() {
+                            break;
+                        }
+                        let remaining = remaining(deadline)?;
+                        response.set_timeout(Some(self.inner.config.io_timeout.min(remaining)))?;
+                        if bytes.len() == bytes.capacity() {
+                            bytes.reserve(8 * 1024);
+                        }
+                        let filled = bytes.len();
+                        let allowed =
+                            (bytes.capacity() - filled).min(limit - filled.min(limit) + 1);
+                        bytes.resize(filled + allowed, 0);
+                        let read = response.read(&mut bytes[filled..])?;
+                        bytes.truncate(filled + read);
+                        if read == 0 {
+                            break;
+                        }
+                        if bytes.len() > limit {
+                            response.abandon_body();
+                            return Err(io::Error::new(
+                                io::ErrorKind::InvalidData,
+                                format!("HTTP response body exceeds configured {limit}-byte limit"),
+                            ));
+                        }
+                    }
+                    Ok(())
+                })();
+                self.inner.observe(ClientEvent::ResponseBodyRead {
+                    request_id: trace.request_id,
+                    origin: observed_url(url),
+                    duration: body_started.elapsed(),
+                    bytes: bytes.len(),
+                    error: body_read.as_ref().err().map(ClientErrorKind::classify),
+                });
+                body_read?;
+                span_record!(body_span, "http.response.body.size", bytes.len() as u64);
+                drop(body_span);
+                drop(response);
+                Ok((
+                    BufferedResponse {
+                        status,
+                        version,
+                        headers: response_headers,
+                        body: bytes,
+                        final_url: url.clone(),
+                        reused_connection: reused_idle_connection,
+                    },
+                    reusable,
+                ))
+            })();
+            if I::ENABLED {
+                if let (Err(error), Some(timing)) = (&result, &timing) {
+                    self.interceptor.on_error(error, timing);
+                }
+            }
+
+            match result {
+                Ok((response, true)) => {
+                    lease.checkin();
+                    return Ok(response);
+                }
+                Ok((response, false)) => {
+                    drop(lease);
+                    return Ok(response);
+                }
+                Err(error)
+                    if reused_idle_connection
+                        && stale_retry_available
+                        && stale_connection_error(&error) =>
+                {
+                    stale_retry_available = false;
+                    stale_retry = true;
+                    self.inner
+                        .stats
+                        .stale_retries
+                        .fetch_add(1, Ordering::Relaxed);
+                    self.inner.observe(ClientEvent::StaleConnectionRetried {
+                        request_id: trace.request_id,
+                        origin: observed_url(url),
+                    });
+                    drop(lease);
+                    let _ = remaining(deadline)?;
+                }
+                Err(error) => {
+                    drop(lease);
+                    return Err(error);
+                }
+            }
+        }
+    }
+
+    fn execute_streaming_once(
+        &self,
+        method: &Method,
+        url: &Url,
+        headers: &HeaderMap,
+        body: &mut RequestBody,
+        execution: StreamingExecution<'_>,
+    ) -> io::Result<StreamingResponse> {
+        let StreamingExecution {
+            deadline,
+            trace,
+            cancellation,
+            attempt,
+            sensitive_headers,
+            tls_snapshot,
+        } = execution;
+        validate_body_method(method, body)?;
+        let (tls_generation, tls_config) = self.tls_for_url(url, trace, tls_snapshot)?;
+        let key = OriginKey::from_url(url, tls_generation)?;
+        let mut stale_retry_available = method_is_idempotent(method) && body.is_replayable();
+        let mut stale_retry = false;
+        loop {
+            *attempt = attempt.checked_add(1).ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "request attempt counter overflow",
+                )
+            })?;
+            let mut attempt_headers = self.prepare_attempt_headers(
+                headers,
+                RequestMetadataContext {
+                    request_id: trace.request_id,
+                    method,
+                    origin: observed_url(url),
+                    attempt: *attempt,
+                    redirect_hop: 0,
+                    stale_retry,
+                },
+                false,
+                sensitive_headers,
+            )?;
+            let mut lease = self.checkout(&key, Arc::clone(&tls_config), deadline, trace)?;
+            let reused_idle_connection = lease.reused_idle_connection;
+            span_record!(
+                trace.span,
+                "may_minihttp.connection_reused",
+                reused_idle_connection
+            );
+            if *attempt > 1 {
+                span_record!(trace.span, "http.request.resend_count", *attempt - 1);
+            }
+            let timing = self.before_send(
+                &mut attempt_headers,
+                AttemptInfo {
+                    method,
+                    url,
+                    trace,
+                    attempt: *attempt,
+                    redirect_hop: 0,
+                    stale_retry,
+                    reused_connection: reused_idle_connection,
+                },
+            );
+            let sent = self.send_on_lease(
+                &mut lease,
+                method,
+                url,
+                &attempt_headers,
+                body,
+                deadline,
+                &trace.span,
+                trace.request_id,
+            );
+            if I::ENABLED {
+                if let Some(timing) = &timing {
+                    match &sent {
+                        Ok(response) => self.interceptor.after_response(
+                            &ResponseHead {
+                                status: response.status(),
+                                version: response.version(),
+                                headers: response.headers(),
+                                url,
+                            },
+                            timing,
+                        ),
+                        Err(error) => self.interceptor.on_error(error, timing),
+                    }
+                }
+            }
+            match sent {
+                Ok(response) => {
+                    let status = response.status();
+                    span_record!(trace.span, "http.response.status_code", status.as_u16());
+                    self.inner.observe(ClientEvent::ResponseHeaders {
+                        request_id: trace.request_id,
+                        origin: observed_url(url),
+                        status,
+                        elapsed: trace.started.elapsed(),
+                    });
+                    let version = response.version();
+                    let mut response = response;
+                    let response_headers = std::mem::take(response.headers_mut());
+                    let reusable = response_is_reusable(
+                        method,
+                        status,
+                        version,
+                        &attempt_headers,
+                        &response_headers,
+                    );
+                    let mut streaming = StreamingResponse {
+                        response: Some(response),
+                        lease: Some(lease),
+                        reusable,
+                        deadline,
+                        io_timeout: self.inner.config.io_timeout,
+                        status,
+                        version,
+                        headers: response_headers,
+                        final_url: url.clone(),
+                        inner: Arc::clone(&self.inner),
+                        trace: trace.clone(),
+                        body_span: phase_span!(DEBUG, parent: &trace.span, "http_client_body"),
+                        cancellation,
+                        terminal_observed: false,
+                        reused_connection: reused_idle_connection,
+                    };
+                    if streaming
+                        .response
+                        .as_ref()
+                        .is_some_and(super::Response::body_complete)
+                    {
+                        streaming.complete();
+                    }
+                    return Ok(streaming);
+                }
+                Err(error)
+                    if reused_idle_connection
+                        && stale_retry_available
+                        && stale_connection_error(&error) =>
+                {
+                    stale_retry_available = false;
+                    stale_retry = true;
+                    self.inner
+                        .stats
+                        .stale_retries
+                        .fetch_add(1, Ordering::Relaxed);
+                    self.inner.observe(ClientEvent::StaleConnectionRetried {
+                        request_id: trace.request_id,
+                        origin: observed_url(url),
+                    });
+                    drop(lease);
+                    let _ = remaining(deadline)?;
+                }
+                Err(error) => {
+                    drop(lease);
+                    return Err(error);
+                }
+            }
+        }
+    }
+
+    /// Run the interceptor's `before_send` for one attempt; `None` (and no clock read) when the
+    /// interceptor is [`NoInterceptor`].
+    #[inline(always)]
+    fn before_send<'h>(
+        &self,
+        headers: &mut Cow<'h, HeaderMap>,
+        info: AttemptInfo<'_>,
+    ) -> Option<Timing> {
+        if !I::ENABLED {
+            return None;
+        }
+        let timing = Timing {
+            request_started: info.trace.started,
+            attempt_started: Instant::now(),
+            attempt: info.attempt,
+            reused_connection: info.reused_connection,
+        };
+        self.interceptor.before_send(&mut OutgoingRequest {
+            method: info.method,
+            url: info.url,
+            headers,
+            attempt: info.attempt,
+            redirect_hop: info.redirect_hop,
+            stale_retry: info.stale_retry,
+            reused_connection: info.reused_connection,
+        });
+        Some(timing)
+    }
+
+    fn tls_for_url(
+        &self,
+        url: &Url,
+        trace: &RequestTrace,
+        captured: &mut Option<TlsConfigSnapshot>,
+    ) -> io::Result<(u64, Arc<ClientConfig>)> {
+        if url.scheme() != "https" {
+            return Ok((0, Arc::clone(&self.inner.base_tls_config)));
+        }
+        if captured.is_none() {
+            *captured = Some(self.resolve_tls_snapshot(trace)?);
+        }
+        let snapshot = captured
+            .as_ref()
+            .expect("HTTPS request must retain its TLS snapshot");
+        Ok((snapshot.generation, Arc::clone(&snapshot.config)))
+    }
+
+    fn resolve_tls_snapshot(&self, trace: &RequestTrace) -> io::Result<TlsConfigSnapshot> {
+        let Some(provider) = &self.inner.tls_config_provider else {
+            let state = self
+                .inner
+                .tls_state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            return Ok(state.active.clone());
+        };
+
+        let started = Instant::now();
+        let loaded = provider
+            .current()
+            .map_err(|error| tls_provider_error(&format!("failed ({:?})", error.kind())))
+            .and_then(|snapshot| {
+                validate_tls_snapshot(&snapshot)
+                    .map_err(|error| tls_provider_error(&error.to_string()))?;
+                Ok(snapshot)
+            });
+        match loaded {
+            Ok(snapshot) => {
+                let accepted = self.accept_tls_snapshot(trace.request_id, snapshot);
+                self.inner.observe(ClientEvent::TlsConfigCompleted {
+                    request_id: trace.request_id,
+                    duration: started.elapsed(),
+                    generation: Some(accepted.generation),
+                    fallback_used: false,
+                    error: None,
+                });
+                Ok(accepted)
+            }
+            Err(error) => {
+                let fallback = if self.inner.tls_config_failure_policy
+                    == TlsConfigFailurePolicy::UseLastKnownGood
+                {
+                    let state = self
+                        .inner
+                        .tls_state
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    Some(state.active.clone())
+                } else {
+                    None
+                };
+                self.inner.observe(ClientEvent::TlsConfigCompleted {
+                    request_id: trace.request_id,
+                    duration: started.elapsed(),
+                    generation: fallback.as_ref().map(|snapshot| snapshot.generation),
+                    fallback_used: fallback.is_some(),
+                    error: Some(ClientErrorKind::Tls),
+                });
+                fallback.ok_or(error)
+            }
+        }
+    }
+
+    fn accept_tls_snapshot(
+        &self,
+        request_id: u64,
+        snapshot: TlsConfigSnapshot,
+    ) -> TlsConfigSnapshot {
+        let mut state = self
+            .inner
+            .tls_state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let previous = state.active.generation;
+        if snapshot.generation <= previous {
+            return state.active.clone();
+        }
+        state.active = snapshot.clone();
+        self.inner
+            .active_tls_generation
+            .store(snapshot.generation, Ordering::Release);
+        drop(state);
+
+        let retired = self.inner.retire_idle_tls(snapshot.generation);
+        self.inner.observe(ClientEvent::TlsGenerationChanged {
+            request_id,
+            previous_generation: previous,
+            generation: snapshot.generation,
+            retired_idle_connections: retired,
+        });
+        snapshot
+    }
+
+    fn prepare_attempt_headers<'h>(
+        &self,
+        request_headers: &'h HeaderMap,
+        context: RequestMetadataContext<'_>,
+        credentials_stripped: bool,
+        sensitive_headers: &mut HashSet<HeaderName>,
+    ) -> io::Result<Cow<'h, HeaderMap>> {
+        validate_request_headers(
+            request_headers,
+            self.inner.config.max_request_headers,
+            self.inner.config.max_request_header_bytes,
+            "request",
+        )?;
+        // Nothing to merge in (no default headers, no metadata provider, nothing stripped): the
+        // request's own headers are the attempt's, borrowed rather than rebuilt per attempt.
+        if self.inner.config.default_headers.is_empty()
+            && self.inner.metadata_provider.is_none()
+            && !credentials_stripped
+        {
+            return Ok(Cow::Borrowed(request_headers));
+        }
+
+        let mut headers = self.inner.config.default_headers.clone();
+        if let Some(provider) = &self.inner.metadata_provider {
+            let started = Instant::now();
+            let metadata = provider
+                .provide(context)
+                .map_err(|error| metadata_provider_error(&format!("failed ({:?})", error.kind())))
+                .and_then(|metadata| {
+                    validate_request_headers(
+                        &metadata.headers,
+                        self.inner.config.max_request_headers,
+                        self.inner.config.max_request_header_bytes,
+                        "provider",
+                    )
+                    .map_err(|error| metadata_provider_error(&error.to_string()))?;
+                    Ok(metadata)
+                });
+            self.inner.observe(ClientEvent::RequestMetadataCompleted {
+                request_id: context.request_id,
+                origin: context.origin,
+                attempt: context.attempt,
+                redirect_hop: context.redirect_hop,
+                stale_retry: context.stale_retry,
+                duration: started.elapsed(),
+                error: metadata.as_ref().err().map(ClientErrorKind::classify),
+            });
+            let RequestMetadata {
+                headers: provided,
+                sensitive_headers: provided_sensitive,
+            } = metadata?;
+            sensitive_headers.extend(provided_sensitive);
+            overlay_headers(&mut headers, &provided);
+        }
+        overlay_headers(&mut headers, request_headers);
+
+        if credentials_stripped {
+            for name in self
+                .inner
+                .config
+                .sensitive_headers
+                .iter()
+                .chain(sensitive_headers.iter())
+            {
+                headers.remove(name);
+            }
+        }
+        validate_request_headers(
+            &headers,
+            self.inner.config.max_request_headers,
+            self.inner.config.max_request_header_bytes,
+            "merged",
+        )?;
+        Ok(Cow::Owned(headers))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn send_on_lease(
+        &self,
+        lease: &mut PoolLease,
+        method: &Method,
+        url: &Url,
+        headers: &HeaderMap,
+        body: &mut RequestBody,
+        deadline: Instant,
+        span: &trace::Span,
+        request_id: u64,
+    ) -> io::Result<super::Response> {
+        let _ = span;
+        let write_started = Instant::now();
+        if headers.contains_key(HOST) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "Host is derived from the request URL and cannot be overridden",
+            ));
+        }
+        if matches!(*method, Method::GET | Method::HEAD) && !matches!(body, RequestBody::Empty) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "request bodies are not supported for GET or HEAD",
+            ));
+        }
+        let initial_remaining = remaining(deadline)?;
+        lease
+            .connection_mut()
+            .client
+            .set_timeout(Some(self.inner.config.io_timeout.min(initial_remaining)));
+        lease
+            .connection_mut()
+            .client
+            .set_max_response_header_bytes(self.inner.config.max_response_header_bytes)?;
+        let target = origin_form(url)?;
+        let write_span = phase_span!(DEBUG, parent: span, "http_client_write");
+        let mut request = lease
+            .connection_mut()
+            .client
+            .new_request(method.clone(), target);
+        for (name, value) in headers {
+            request.headers_mut().append(name, value.clone());
+        }
+        match body {
+            RequestBody::Empty => {}
+            RequestBody::Bytes(bytes) => request.send(bytes)?,
+            RequestBody::Multipart(form) => request.send_multipart(form)?,
+            RequestBody::Reader {
+                reader,
+                content_length,
+            } => {
+                if matches!(*method, Method::GET | Method::HEAD) {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "streaming request bodies are not supported for GET or HEAD",
+                    ));
+                }
+                let mut reader = reader.take().ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "request body is not replayable and was already consumed",
+                    )
+                })?;
+                request.send_reader(&mut *reader, *content_length)?;
+            }
+        }
+        let client = &mut lease.connection_mut().client;
+        let written = client.write_request(request);
+        drop(write_span);
+        self.inner.observe(ClientEvent::RequestWritten {
+            request_id,
+            origin: observed_url(url),
+            duration: write_started.elapsed(),
+            error: written.as_ref().err().map(ClientErrorKind::classify),
+        });
+        written?;
+        let wait_started = Instant::now();
+        let wait_span = phase_span!(
+            DEBUG,
+            parent: span,
+            "http_client_wait",
+            "http.response.status_code" = tracing::field::Empty
+        );
+        let response = client.read_response();
+        self.inner.observe(ClientEvent::ResponseHeadersReceived {
+            request_id,
+            origin: observed_url(url),
+            duration: wait_started.elapsed(),
+            error: response.as_ref().err().map(ClientErrorKind::classify),
+        });
+        let response = response?;
+        span_record!(
+            wait_span,
+            "http.response.status_code",
+            response.status().as_u16()
+        );
+        drop(wait_span);
+        Ok(response)
+    }
+
+    fn begin_request(
+        &self,
+        method: &Method,
+        url: &Url,
+        choice: Option<SpanChoice>,
+    ) -> RequestTrace {
+        let span = match choice {
+            Some(SpanChoice::Own(span)) => span,
+            choice => {
+                let _parent = match choice {
+                    Some(SpanChoice::Parent(parent)) => parent,
+                    _ => trace::current_parent(),
+                };
+                client_span!(
+                    INFO,
+                    parent: &_parent,
+                    "http_client_request",
+                    "http.request.method" = method.as_str(),
+                    "server.address" = url.host_str().unwrap_or_default(),
+                    "server.port" = url.port_or_known_default().unwrap_or_default(),
+                    "url.scheme" = url.scheme(),
+                    "http.response.status_code" = tracing::field::Empty,
+                    "error.type" = tracing::field::Empty,
+                    "http.request.resend_count" = tracing::field::Empty,
+                    "may_minihttp.connection_reused" = tracing::field::Empty,
+                )
+            }
+        };
+        let trace = RequestTrace {
+            request_id: self.inner.next_request_id.fetch_add(1, Ordering::Relaxed),
+            started: Instant::now(),
+            span,
+        };
+        self.inner.observe(ClientEvent::RequestStarted {
+            request_id: trace.request_id,
+            method,
+            origin: observed_url(url),
+        });
+        trace
+    }
+
+    fn observe_failure(&self, trace: &RequestTrace, error: &io::Error) {
+        let error = ClientErrorKind::classify(error);
+        span_record!(trace.span, "error.type", error.as_str());
+        if error == ClientErrorKind::Cancelled {
+            self.inner.observe(ClientEvent::RequestCancelled {
+                request_id: trace.request_id,
+                total_duration: trace.started.elapsed(),
+            });
+        } else {
+            self.inner.observe(ClientEvent::RequestFailed {
+                request_id: trace.request_id,
+                error,
+                total_duration: trace.started.elapsed(),
+            });
+        }
+    }
+
+    /// Take a connection for `key` (reused, new, or after waiting), reporting how long that took.
+    fn checkout(
+        &self,
+        key: &OriginKey,
+        tls_config: Arc<ClientConfig>,
+        deadline: Instant,
+        trace: &RequestTrace,
+    ) -> io::Result<PoolLease> {
+        let started = Instant::now();
+        let lease = self.checkout_connection(key, tls_config, deadline, trace);
+        self.inner.observe(ClientEvent::CheckoutCompleted {
+            request_id: trace.request_id,
+            origin: observed_key(key),
+            duration: started.elapsed(),
+            reused: lease
+                .as_ref()
+                .is_ok_and(|lease| lease.reused_idle_connection),
+            error: lease.as_ref().err().map(ClientErrorKind::classify),
+        });
+        lease
+    }
+
+    fn checkout_connection(
+        &self,
+        key: &OriginKey,
+        tls_config: Arc<ClientConfig>,
+        deadline: Instant,
+        trace: &RequestTrace,
+    ) -> io::Result<PoolLease> {
+        loop {
+            let now = Instant::now();
+            let mut state = self
+                .inner
+                .pool
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let expired = state.purge_expired(
+                now,
+                self.inner.config.idle_timeout,
+                self.inner.config.max_connection_lifetime,
+            );
+            if expired > 0 {
+                self.inner
+                    .stats
+                    .connections_expired
+                    .fetch_add(expired as u64, Ordering::Relaxed);
+                client_event!(
+                    parent: &trace.span,
+                    reason = "expired",
+                    count = expired as u64,
+                    "pool_evict"
+                );
+            }
+            let idle = state.idle.get_mut(key).and_then(Vec::pop);
+            if let Some(connection) = idle {
+                drop(state);
+                let lease = PoolLease::with_connection(
+                    Arc::clone(&self.inner),
+                    key.clone(),
+                    connection,
+                    trace.request_id,
+                );
+                // Health on reuse: a connection the server closed while it sat idle (its keep-alive
+                // timeout is often shorter than ours) is dropped here, before a request is written
+                // to it. The stale-retry path only covers idempotent, replayable requests; a POST
+                // on such a connection used to fail outright.
+                if !lease
+                    .connection
+                    .as_ref()
+                    .is_some_and(|connection| connection.client.idle_usable())
+                {
+                    // dropping the lease releases its slot and counts it discarded
+                    drop(lease);
+                    client_event!(
+                        parent: &trace.span,
+                        reason = "closed",
+                        count = 1_u64,
+                        "pool_evict"
+                    );
+                    continue;
+                }
+                self.inner
+                    .stats
+                    .connections_reused
+                    .fetch_add(1, Ordering::Relaxed);
+                self.inner.observe(ClientEvent::ConnectionReused {
+                    request_id: trace.request_id,
+                    origin: observed_key(key),
+                });
+                client_event!(parent: &trace.span, result = "hit", "pool_checkout");
+                return Ok(lease);
+            }
+            let per_origin = state.per_origin.get(key).copied().unwrap_or(0);
+            if state.total < self.inner.config.max_connections
+                && per_origin < self.inner.config.max_connections_per_origin
+            {
+                state.total += 1;
+                *state.per_origin.entry(key.clone()).or_default() += 1;
+                drop(state);
+
+                let mut lease =
+                    PoolLease::reserved(Arc::clone(&self.inner), key.clone(), trace.request_id);
+                client_event!(parent: &trace.span, result = "miss", "pool_checkout");
+                let connect_span = phase_span!(
+                    INFO,
+                    parent: &trace.span,
+                    "http_client_connect",
+                    "server.address" = &*key.host,
+                    "server.port" = key.port,
+                    "error.type" = tracing::field::Empty
+                );
+
+                let connect_budget = self.inner.config.connect_timeout.min(remaining(deadline)?);
+                let connect_deadline =
+                    Instant::now().checked_add(connect_budget).ok_or_else(|| {
+                        io::Error::new(io::ErrorKind::InvalidInput, "connect timeout overflow")
+                    })?;
+                let dns_started = Instant::now();
+                let resolution = self.inner.resolver.resolve_with_deadline(
+                    &key.host,
+                    key.port,
+                    connect_deadline,
+                );
+                self.inner.observe(ClientEvent::DnsCompleted {
+                    request_id: trace.request_id,
+                    origin: observed_key(key),
+                    duration: dns_started.elapsed(),
+                    address_count: resolution.as_ref().map_or(0, |value| value.addresses.len()),
+                    source: resolution.as_ref().ok().map(|value| value.source),
+                    error: resolution.as_ref().err().map(ClientErrorKind::classify),
+                });
+                if let Err(_error) = &resolution {
+                    span_record!(
+                        connect_span,
+                        "error.type",
+                        ClientErrorKind::classify(_error).as_str()
+                    );
+                }
+                let addresses = resolution?.addresses;
+                let timeout = connect_deadline
+                    .checked_duration_since(Instant::now())
+                    .ok_or_else(|| {
+                        io::Error::new(
+                            io::ErrorKind::TimedOut,
+                            "DNS resolution exhausted the connect deadline",
+                        )
+                    })?;
+                let origin = key.connect_url();
+                let connect_started = Instant::now();
+                let client =
+                    self.inner
+                        .connect(&origin, Arc::clone(&tls_config), timeout, &addresses);
+                self.inner.observe(ClientEvent::ConnectionCompleted {
+                    request_id: trace.request_id,
+                    origin: observed_key(key),
+                    duration: connect_started.elapsed(),
+                    tls: key.scheme == "https",
+                    error: client.as_ref().err().map(ClientErrorKind::classify),
+                });
+                if let Err(_error) = &client {
+                    span_record!(
+                        connect_span,
+                        "error.type",
+                        ClientErrorKind::classify(_error).as_str()
+                    );
+                }
+                drop(connect_span);
+                let client = client?;
+                lease.connection = Some(PooledConnection {
+                    client,
+                    created: Instant::now(),
+                    idle_since: Instant::now(),
+                });
+                self.inner
+                    .stats
+                    .connections_created
+                    .fetch_add(1, Ordering::Relaxed);
+                return Ok(lease);
+            }
+
+            let wait = remaining(deadline)?;
+            self.inner.stats.pool_waits.fetch_add(1, Ordering::Relaxed);
+            client_event!(parent: &trace.span, result = "wait", "pool_checkout");
+            let wait_started = Instant::now();
+            let (state_after_wait, timeout) = self
+                .inner
+                .available
+                .wait_timeout(state, wait)
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            drop(state_after_wait);
+            self.inner.observe(ClientEvent::PoolWaited {
+                request_id: trace.request_id,
+                origin: observed_key(key),
+                duration: wait_started.elapsed(),
+                timed_out: timeout.timed_out(),
+            });
+            if timeout.timed_out() {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "timed out waiting for an HTTP connection",
+                ));
+            }
+        }
+    }
+}
+
+/// Request builder whose body explicitly records whether it can be replayed.
+pub struct RequestBuilder<I = NoInterceptor> {
+    client: Client<I>,
+    /// Parent of the request's span, or the request's span itself (feature `tracing`).
+    span: Option<SpanChoice>,
+    method: Method,
+    url: Url,
+    headers: HeaderMap,
+    body: RequestBody,
+    timeout: Option<Duration>,
+    cancellation: Option<CancellationToken>,
+}
+
+impl<I: Interceptor> RequestBuilder<I> {
+    pub fn header(mut self, name: HeaderName, value: HeaderValue) -> Self {
+        self.headers.append(name, value);
+        self
+    }
+
+    pub fn header_str(mut self, name: &str, value: &str) -> io::Result<Self> {
+        let name = HeaderName::from_bytes(name.as_bytes()).map_err(|error| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("invalid request header name: {error}"),
+            )
+        })?;
+        let value = HeaderValue::from_str(value).map_err(|error| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("invalid request header value: {error}"),
+            )
+        })?;
+        self.headers.append(name, value);
+        Ok(self)
+    }
+
+    pub fn body(mut self, value: impl Into<Vec<u8>>) -> Self {
+        self.body = RequestBody::Bytes(Arc::from(value.into()));
+        self
+    }
+
+    pub fn multipart(mut self, value: MultipartForm) -> Self {
+        self.body = RequestBody::Multipart(value);
+        self
+    }
+
+    /// Attach a single-use streaming request body.
+    ///
+    /// The reader must itself be coroutine-safe. This body is never retried and cannot be replayed
+    /// across a 307/308 redirect.
+    pub fn reader(mut self, value: impl Read + Send + 'static, content_length: usize) -> Self {
+        self.body = RequestBody::Reader {
+            reader: Some(Box::new(value)),
+            content_length,
+        };
+        self
+    }
+
+    #[cfg(feature = "json")]
+    pub fn json<T: serde::Serialize + ?Sized>(mut self, value: &T) -> io::Result<Self> {
+        let body = serde_json::to_vec(value).map_err(|error| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("JSON serialization failed: {error}"),
+            )
+        })?;
+        self.headers
+            .entry(CONTENT_TYPE)
+            .or_insert(HeaderValue::from_static("application/json"));
+        self.body = RequestBody::Bytes(Arc::from(body));
+        Ok(self)
+    }
+
+    pub fn timeout(mut self, value: Duration) -> Self {
+        self.timeout = Some(value);
+        self
+    }
+
+    /// Cancel this request cooperatively when `token` is cancelled.
+    pub fn cancellation_token(mut self, token: CancellationToken) -> Self {
+        self.cancellation = Some(token);
+        self
+    }
+
+    /// Make `span` the parent of this request's spans (feature `tracing`). Without it the parent
+    /// is [`tracing::Span::current()`] at the time of sending. Coroutine code should pass the
+    /// parent explicitly: a span entered on a thread is not a coroutine's context.
+    #[cfg(feature = "tracing")]
+    pub fn parent_span(mut self, span: &tracing::Span) -> Self {
+        self.span = Some(SpanChoice::Parent(span.clone()));
+        self
+    }
+
+    /// Use `span` as this request's span instead of creating `http_client_request` (feature
+    /// `tracing`): the client records its request fields on it (only those the span declares,
+    /// e.g. as `tracing::field::Empty`) and opens its connect/write/wait/body spans under it.
+    /// For a caller that wants one span per request with its own name and attributes.
+    #[cfg(feature = "tracing")]
+    pub fn request_span(mut self, span: &tracing::Span) -> Self {
+        self.span = Some(SpanChoice::Own(span.clone()));
+        self
+    }
+
+    pub fn send(self) -> io::Result<BufferedResponse> {
+        let client = self.client.clone();
+        client.execute(self)
+    }
+
+    /// Send with a stable high-level error classification while retaining the underlying I/O error.
+    pub fn send_typed(self) -> Result<BufferedResponse, ClientError> {
+        self.send().map_err(ClientError::from)
+    }
+
+    /// Send without buffering the response body.
+    ///
+    /// The connection remains checked out until the body reaches EOF. Dropping the response before
+    /// EOF discards that connection without performing blocking drain I/O. Redirect following must
+    /// be disabled because a streaming body cannot safely hide redirect consumption and replay.
+    pub fn send_streaming(self) -> io::Result<StreamingResponse> {
+        let client = self.client.clone();
+        client.execute_streaming(self)
+    }
+
+    /// Streaming variant with stable high-level error classification.
+    pub fn send_streaming_typed(self) -> Result<StreamingResponse, ClientError> {
+        self.send_streaming().map_err(ClientError::from)
+    }
+}
+
+enum RequestBody {
+    Empty,
+    Bytes(Arc<[u8]>),
+    Multipart(MultipartForm),
+    Reader {
+        reader: Option<Box<dyn Read + Send>>,
+        content_length: usize,
+    },
+}
+
+impl RequestBody {
+    fn is_replayable(&self) -> bool {
+        !matches!(self, Self::Reader { .. })
+    }
+}
+
+/// Fully buffered response. Buffering makes pool check-in unambiguous and redirect replay safe.
+#[derive(Debug)]
+pub struct BufferedResponse {
+    status: StatusCode,
+    version: Version,
+    headers: HeaderMap,
+    body: Vec<u8>,
+    final_url: Url,
+    reused_connection: bool,
+}
+
+impl BufferedResponse {
+    /// True when the response came over a pooled connection that an earlier request had used.
+    pub fn reused_connection(&self) -> bool {
+        self.reused_connection
+    }
+
+    pub fn status(&self) -> StatusCode {
+        self.status
+    }
+
+    pub fn version(&self) -> Version {
+        self.version
+    }
+
+    pub fn headers(&self) -> &HeaderMap {
+        &self.headers
+    }
+
+    pub fn body(&self) -> &[u8] {
+        &self.body
+    }
+
+    pub fn into_body(self) -> Vec<u8> {
+        self.body
+    }
+
+    pub fn final_url(&self) -> &Url {
+        &self.final_url
+    }
+
+    #[cfg(feature = "json")]
+    pub fn json<T: serde::de::DeserializeOwned>(&self) -> io::Result<T> {
+        serde_json::from_slice(&self.body).map_err(|error| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("JSON deserialization failed: {error}"),
+            )
+        })
+    }
+}
+
+/// Streaming response that owns its connection-pool lease.
+///
+/// Reading to EOF returns a reusable HTTP/1.x connection to the pool. Any read error, request
+/// deadline, or early drop discards the connection without trying to drain the body in `Drop`.
+pub struct StreamingResponse {
+    response: Option<super::Response>,
+    lease: Option<PoolLease>,
+    reusable: bool,
+    deadline: Instant,
+    io_timeout: Duration,
+    status: StatusCode,
+    version: Version,
+    headers: HeaderMap,
+    final_url: Url,
+    inner: Arc<ClientInner>,
+    trace: RequestTrace,
+    cancellation: Option<CancellationToken>,
+    terminal_observed: bool,
+    reused_connection: bool,
+    /// Open while the body is read (feature `tracing`).
+    #[cfg_attr(not(feature = "tracing"), allow(dead_code))]
+    body_span: trace::Span,
+}
+
+impl fmt::Debug for StreamingResponse {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("StreamingResponse")
+            .field("status", &self.status)
+            .field("version", &self.version)
+            .field("headers", &self.headers)
+            .field("final_url", &self.final_url)
+            .field("complete", &self.response.is_none())
+            .finish()
+    }
+}
+
+impl StreamingResponse {
+    /// True when the response came over a pooled connection that an earlier request had used.
+    pub fn reused_connection(&self) -> bool {
+        self.reused_connection
+    }
+
+    pub fn status(&self) -> StatusCode {
+        self.status
+    }
+
+    pub fn version(&self) -> Version {
+        self.version
+    }
+
+    pub fn headers(&self) -> &HeaderMap {
+        &self.headers
+    }
+
+    /// The response headers, mutably: a caller that forwards them can `std::mem::take` the map
+    /// instead of cloning it. The body reader does not use them.
+    pub fn headers_mut(&mut self) -> &mut HeaderMap {
+        &mut self.headers
+    }
+
+    pub fn final_url(&self) -> &Url {
+        &self.final_url
+    }
+
+    fn complete(&mut self) {
+        self.close_spans(None);
+        drop(self.response.take());
+        if let Some(lease) = self.lease.take() {
+            if self.reusable {
+                lease.checkin();
+            }
+        }
+        if !self.terminal_observed {
+            self.inner.observe(ClientEvent::RequestCompleted {
+                request_id: self.trace.request_id,
+                status: self.status,
+                total_duration: self.trace.started.elapsed(),
+            });
+            self.terminal_observed = true;
+        }
+    }
+
+    /// End the body and request spans at the end of the body rather than when the response is
+    /// dropped. No-op without the `tracing` feature.
+    fn close_spans(&mut self, error: Option<ClientErrorKind>) {
+        let _ = error;
+        #[cfg(feature = "tracing")]
+        {
+            if let Some(error) = error {
+                self.trace.span.record("error.type", error.as_str());
+            }
+            self.body_span = tracing::Span::none();
+            self.trace.span = tracing::Span::none();
+        }
+    }
+
+    fn discard_connection(&mut self) {
+        if let Some(response) = self.response.as_mut() {
+            response.abandon_body();
+        }
+        drop(self.response.take());
+        drop(self.lease.take());
+    }
+
+    fn fail(&mut self, error: &io::Error) {
+        self.close_spans(Some(ClientErrorKind::classify(error)));
+        self.discard_connection();
+        if !self.terminal_observed {
+            self.inner.observe(ClientEvent::RequestFailed {
+                request_id: self.trace.request_id,
+                error: ClientErrorKind::classify(error),
+                total_duration: self.trace.started.elapsed(),
+            });
+            self.terminal_observed = true;
+        }
+    }
+
+    fn cancel(&mut self) -> io::Error {
+        self.close_spans(Some(ClientErrorKind::Cancelled));
+        self.discard_connection();
+        if !self.terminal_observed {
+            self.inner.observe(ClientEvent::RequestCancelled {
+                request_id: self.trace.request_id,
+                total_duration: self.trace.started.elapsed(),
+            });
+            self.terminal_observed = true;
+        }
+        cancelled_error()
+    }
+
+    fn abandon(&mut self) {
+        let incomplete = self.response.is_some();
+        self.discard_connection();
+        if incomplete && !self.terminal_observed {
+            self.inner.observe(ClientEvent::RequestAbandoned {
+                request_id: self.trace.request_id,
+                status: self.status,
+                total_duration: self.trace.started.elapsed(),
+            });
+            self.terminal_observed = true;
+        }
+    }
+
+    fn read_transport(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+        let timeout = remaining(self.deadline)?.min(self.io_timeout);
+        let Some(response) = self.response.as_mut() else {
+            return Ok(0);
+        };
+        response.set_timeout(Some(timeout))?;
+        response.read(buffer)
+    }
+
+    fn finish_read(&mut self, result: io::Result<usize>) -> io::Result<usize> {
+        match result {
+            Ok(read) => {
+                if self
+                    .response
+                    .as_ref()
+                    .is_some_and(super::Response::body_complete)
+                {
+                    self.complete();
+                }
+                Ok(read)
+            }
+            Err(error) => {
+                self.fail(&error);
+                Err(error)
+            }
+        }
+    }
+}
+
+impl Read for StreamingResponse {
+    fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+        if buffer.is_empty() || self.response.is_none() {
+            return Ok(0);
+        }
+        let cancellation = self.cancellation.clone();
+        let result = match cancellation {
+            Some(token) => run_cancellable(&token, || self.read_transport(buffer)),
+            None => self.read_transport(buffer),
+        };
+        if result.as_ref().err().is_some_and(is_cancelled_error) {
+            return Err(self.cancel());
+        }
+        self.finish_read(result)
+    }
+}
+
+impl Drop for StreamingResponse {
+    fn drop(&mut self) {
+        if std::thread::panicking() {
+            self.discard_connection();
+        } else {
+            self.abandon();
+        }
+    }
+}
+
+struct ClientInner {
+    config: ClientConfigValues,
+    base_tls_config: Arc<ClientConfig>,
+    tls_config_provider: Option<Arc<dyn TlsConfigProvider>>,
+    tls_config_failure_policy: TlsConfigFailurePolicy,
+    tls_state: Mutex<TlsState>,
+    active_tls_generation: AtomicU64,
+    resolver: Arc<dyn Resolver>,
+    observer: Option<Arc<dyn ClientObserver>>,
+    metadata_provider: Option<Arc<dyn RequestMetadataProvider>>,
+    #[cfg(test)]
+    connector: Option<Arc<TestConnector>>,
+    pool: Mutex<PoolState>,
+    available: Condvar,
+    stats: ClientStatsInner,
+    next_request_id: AtomicU64,
+}
+
+impl ClientInner {
+    fn observe(&self, event: ClientEvent<'_>) {
+        if let Some(observer) = &self.observer {
+            observer.observe(event);
+        }
+    }
+
+    fn connect(
+        &self,
+        origin: &str,
+        tls_config: Arc<ClientConfig>,
+        timeout: Duration,
+        addresses: &[std::net::SocketAddr],
+    ) -> io::Result<HttpClient> {
+        #[cfg(test)]
+        if let Some(connector) = &self.connector {
+            return connector(origin, tls_config, timeout, addresses);
+        }
+        HttpClient::from_url_with_resolved_options(origin, tls_config, timeout, addresses)
+    }
+
+    fn retire_idle_tls(&self, active_generation: u64) -> usize {
+        let mut state = self
+            .pool
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let retired = state.retire_tls_generations(active_generation);
+        drop(state);
+        if retired > 0 {
+            self.stats
+                .connections_discarded
+                .fetch_add(retired as u64, Ordering::Relaxed);
+            self.available.notify_all();
+        }
+        retired
+    }
+}
+
+struct TlsState {
+    active: TlsConfigSnapshot,
+}
+
+struct ClientConfigValues {
+    max_connections: usize,
+    max_connections_per_origin: usize,
+    idle_timeout: Duration,
+    max_connection_lifetime: Duration,
+    connect_timeout: Duration,
+    io_timeout: Duration,
+    request_timeout: Duration,
+    max_request_headers: usize,
+    max_request_header_bytes: usize,
+    max_response_header_bytes: usize,
+    max_response_body: usize,
+    redirect_policy: RedirectPolicy,
+    sensitive_headers: HashSet<HeaderName>,
+    default_headers: HeaderMap,
+}
+
+/// Pool key. Cloned on every checkout and checkin, so the host is shared (`Arc<str>`) and the
+/// scheme static: a clone is a reference-count bump, not two string copies.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct OriginKey {
+    scheme: &'static str,
+    host: Arc<str>,
+    port: u16,
+    tls_generation: u64,
+}
+
+impl OriginKey {
+    fn from_url(url: &Url, tls_generation: u64) -> io::Result<Self> {
+        let host = url
+            .host_str()
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "URL has no host"))?;
+        let port = url.port_or_known_default().ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidInput, "URL scheme has no known port")
+        })?;
+        // `parse_url` admits only http and https; the url crate lower-cases both and their hosts.
+        let scheme = if url.scheme() == "https" {
+            "https"
+        } else {
+            "http"
+        };
+        let host: Arc<str> = if host.bytes().any(|b| b.is_ascii_uppercase()) {
+            Arc::from(host.to_ascii_lowercase())
+        } else {
+            Arc::from(host)
+        };
+        Ok(Self {
+            scheme,
+            host,
+            port,
+            tls_generation: if url.scheme() == "https" {
+                tls_generation
+            } else {
+                0
+            },
+        })
+    }
+
+    fn connect_url(&self) -> String {
+        let host = if self.host.contains(':') {
+            format!("[{}]", self.host)
+        } else {
+            self.host.to_string()
+        };
+        format!("{}://{}:{}/", self.scheme, host, self.port)
+    }
+}
+
+#[derive(Default)]
+struct PoolState {
+    idle: HashMap<OriginKey, Vec<PooledConnection>>,
+    per_origin: HashMap<OriginKey, usize>,
+    total: usize,
+}
+
+impl PoolState {
+    /// Drop idle connections past their idle timeout or lifetime; returns how many.
+    fn purge_expired(&mut self, now: Instant, idle_timeout: Duration, lifetime: Duration) -> usize {
+        let mut removed = Vec::new();
+        let mut expired = 0;
+        self.idle.retain(|key, connections| {
+            let before = connections.len();
+            connections.retain(|connection| {
+                now.duration_since(connection.idle_since) < idle_timeout
+                    && now.duration_since(connection.created) < lifetime
+            });
+            let count = before - connections.len();
+            if count > 0 {
+                removed.push((key.clone(), count));
+            }
+            !connections.is_empty()
+        });
+        for (key, count) in removed {
+            expired += count;
+            self.total = self.total.saturating_sub(count);
+            if let Some(origin_count) = self.per_origin.get_mut(&key) {
+                *origin_count = origin_count.saturating_sub(count);
+                if *origin_count == 0 {
+                    self.per_origin.remove(&key);
+                }
+            }
+        }
+        expired
+    }
+
+    fn retire_tls_generations(&mut self, active_generation: u64) -> usize {
+        let keys: Vec<_> = self
+            .idle
+            .keys()
+            .filter(|key| key.scheme == "https" && key.tls_generation != active_generation)
+            .cloned()
+            .collect();
+        let mut retired = 0;
+        for key in keys {
+            let count = self
+                .idle
+                .remove(&key)
+                .map_or(0, |connections| connections.len());
+            retired += count;
+            self.total = self.total.saturating_sub(count);
+            if let Some(origin_count) = self.per_origin.get_mut(&key) {
+                *origin_count = origin_count.saturating_sub(count);
+                if *origin_count == 0 {
+                    self.per_origin.remove(&key);
+                }
+            }
+        }
+        retired
+    }
+}
+
+struct PooledConnection {
+    client: HttpClient,
+    created: Instant,
+    idle_since: Instant,
+}
+
+/// Owns one accounted pool slot. Dropping it from any path, including coroutine cancellation,
+/// releases capacity unless the connection was successfully returned to the idle pool.
+struct PoolLease {
+    inner: Arc<ClientInner>,
+    key: OriginKey,
+    request_id: u64,
+    connection: Option<PooledConnection>,
+    accounted: bool,
+    reused_idle_connection: bool,
+}
+
+impl PoolLease {
+    fn reserved(inner: Arc<ClientInner>, key: OriginKey, request_id: u64) -> Self {
+        Self {
+            inner,
+            key,
+            request_id,
+            connection: None,
+            accounted: true,
+            reused_idle_connection: false,
+        }
+    }
+
+    fn with_connection(
+        inner: Arc<ClientInner>,
+        key: OriginKey,
+        connection: PooledConnection,
+        request_id: u64,
+    ) -> Self {
+        Self {
+            inner,
+            key,
+            request_id,
+            connection: Some(connection),
+            accounted: true,
+            reused_idle_connection: true,
+        }
+    }
+
+    fn connection_mut(&mut self) -> &mut PooledConnection {
+        self.connection
+            .as_mut()
+            .expect("connected pool lease must contain a connection")
+    }
+
+    fn checkin(mut self) {
+        let now = Instant::now();
+        if self.key.scheme == "https"
+            && self.key.tls_generation != self.inner.active_tls_generation.load(Ordering::Acquire)
+        {
+            return;
+        }
+        if now.duration_since(self.connection_mut().created)
+            >= self.inner.config.max_connection_lifetime
+        {
+            return;
+        }
+        self.connection_mut().idle_since = now;
+        let connection = self
+            .connection
+            .take()
+            .expect("connected pool lease must contain a connection");
+        let mut state = self
+            .inner
+            .pool
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        state
+            .idle
+            .entry(self.key.clone())
+            .or_default()
+            .push(connection);
+        self.accounted = false;
+        drop(state);
+        self.inner.available.notify_one();
+    }
+}
+
+impl Drop for PoolLease {
+    fn drop(&mut self) {
+        if !self.accounted {
+            return;
+        }
+        let discarded = self.connection.is_some();
+        if discarded {
+            self.inner
+                .stats
+                .connections_discarded
+                .fetch_add(1, Ordering::Relaxed);
+        }
+        let mut state = self
+            .inner
+            .pool
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        state.total = state.total.saturating_sub(1);
+        if let Some(count) = state.per_origin.get_mut(&self.key) {
+            *count = count.saturating_sub(1);
+            if *count == 0 {
+                state.per_origin.remove(&self.key);
+            }
+        }
+        self.accounted = false;
+        drop(state);
+        self.inner.available.notify_one();
+        if discarded && !std::thread::panicking() {
+            self.inner.observe(ClientEvent::ConnectionDiscarded {
+                request_id: self.request_id,
+                origin: observed_key(&self.key),
+            });
+        }
+    }
+}
+
+fn parse_url(value: &str) -> io::Result<Url> {
+    let mut url = Url::parse(value).map_err(|error| {
+        io::Error::new(io::ErrorKind::InvalidInput, format!("invalid URL: {error}"))
+    })?;
+    if !matches!(url.scheme(), "http" | "https") {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "URL scheme must be http or https",
+        ));
+    }
+    if !url.username().is_empty() || url.password().is_some() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "credentials in request URLs are not supported",
+        ));
+    }
+    url.set_fragment(None);
+    Ok(url)
+}
+
+fn origin_form(url: &Url) -> io::Result<http::Uri> {
+    let mut target = url.path().to_string();
+    if target.is_empty() {
+        target.push('/');
+    }
+    if let Some(query) = url.query() {
+        target.push('?');
+        target.push_str(query);
+    }
+    // `try_from(String)` takes the buffer; `parse()` would copy it.
+    http::Uri::try_from(target).map_err(|error| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("URL cannot be represented as an HTTP request target: {error}"),
+        )
+    })
+}
+
+fn normalized_url(url: &Url) -> String {
+    let mut normalized = url.clone();
+    normalized.set_fragment(None);
+    normalized.to_string()
+}
+
+fn observed_url(url: &Url) -> ObservedOrigin<'_> {
+    ObservedOrigin {
+        scheme: url.scheme(),
+        host: url.host_str().unwrap_or_default(),
+        port: url.port_or_known_default().unwrap_or_default(),
+    }
+}
+
+fn observed_key(key: &OriginKey) -> ObservedOrigin<'_> {
+    ObservedOrigin {
+        scheme: key.scheme,
+        host: &key.host,
+        port: key.port,
+    }
+}
+
+fn same_origin(left: &Url, right: &Url) -> bool {
+    left.scheme().eq_ignore_ascii_case(right.scheme())
+        && left.host_str().map(str::to_ascii_lowercase)
+            == right.host_str().map(str::to_ascii_lowercase)
+        && left.port_or_known_default() == right.port_or_known_default()
+}
+
+fn validate_redirect(policy: RedirectPolicy, source: &Url, target: &Url) -> io::Result<()> {
+    if !matches!(target.scheme(), "http" | "https") {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "redirect target scheme must be http or https",
+        ));
+    }
+    if !target.username().is_empty() || target.password().is_some() {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "redirect target must not contain URL credentials",
+        ));
+    }
+    let same = same_origin(source, target);
+    match policy {
+        RedirectPolicy::None => unreachable!(),
+        RedirectPolicy::SameOrigin { .. } if !same => Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "cross-origin redirect rejected by policy",
+        )),
+        RedirectPolicy::CrossOrigin {
+            allow_https_downgrade: false,
+            ..
+        } if source.scheme() == "https" && target.scheme() == "http" => Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "HTTPS-to-HTTP redirect rejected by policy",
+        )),
+        _ => Ok(()),
+    }
+}
+
+fn is_redirect(status: StatusCode) -> bool {
+    matches!(
+        status,
+        StatusCode::MOVED_PERMANENTLY
+            | StatusCode::FOUND
+            | StatusCode::SEE_OTHER
+            | StatusCode::TEMPORARY_REDIRECT
+            | StatusCode::PERMANENT_REDIRECT
+    )
+}
+
+fn method_is_idempotent(method: &Method) -> bool {
+    matches!(
+        *method,
+        Method::GET | Method::HEAD | Method::PUT | Method::DELETE | Method::OPTIONS | Method::TRACE
+    )
+}
+
+fn validate_body_method(method: &Method, body: &RequestBody) -> io::Result<()> {
+    if matches!(*method, Method::GET | Method::HEAD) && !matches!(body, RequestBody::Empty) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "request bodies are not supported for GET or HEAD",
+        ));
+    }
+    Ok(())
+}
+
+fn overlay_headers(target: &mut HeaderMap, source: &HeaderMap) {
+    for name in source.keys() {
+        target.remove(name);
+        for value in source.get_all(name) {
+            target.append(name.clone(), value.clone());
+        }
+    }
+}
+
+fn validate_request_headers(
+    headers: &HeaderMap,
+    max_count: usize,
+    max_bytes: usize,
+    source: &str,
+) -> io::Result<()> {
+    for name in [HOST, CONTENT_LENGTH, TRANSFER_ENCODING] {
+        if headers.contains_key(&name) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("{source} headers cannot set transport-owned {name}"),
+            ));
+        }
+    }
+    if headers.len() > max_count {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("{source} headers exceed the configured {max_count}-field limit"),
+        ));
+    }
+    let mut encoded_bytes = 0_usize;
+    for (name, value) in headers {
+        encoded_bytes = encoded_bytes
+            .checked_add(name.as_str().len())
+            .and_then(|size| size.checked_add(value.as_bytes().len()))
+            .and_then(|size| size.checked_add(4))
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("{source} header size overflow"),
+                )
+            })?;
+    }
+    if encoded_bytes > max_bytes {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("{source} headers exceed the configured {max_bytes}-byte limit"),
+        ));
+    }
+    Ok(())
+}
+
+fn metadata_provider_error(detail: &str) -> io::Error {
+    io::Error::other(format!("request metadata provider {detail}"))
+}
+
+fn validate_tls_snapshot(snapshot: &TlsConfigSnapshot) -> io::Result<()> {
+    if snapshot.generation == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "TLS configuration generation zero is reserved for non-TLS connections",
+        ));
+    }
+    Ok(())
+}
+
+fn tls_provider_error(detail: &str) -> io::Error {
+    io::Error::other(format!("TLS configuration provider {detail}"))
+}
+
+fn stale_connection_error(error: &io::Error) -> bool {
+    matches!(
+        error.kind(),
+        io::ErrorKind::BrokenPipe
+            | io::ErrorKind::ConnectionAborted
+            | io::ErrorKind::ConnectionReset
+            | io::ErrorKind::NotConnected
+            | io::ErrorKind::UnexpectedEof
+            | io::ErrorKind::WriteZero
+    )
+}
+
+fn response_is_reusable(
+    method: &Method,
+    status: StatusCode,
+    version: Version,
+    request_headers: &HeaderMap,
+    headers: &HeaderMap,
+) -> bool {
+    if method == Method::CONNECT || status == StatusCode::SWITCHING_PROTOCOLS {
+        return false;
+    }
+    let close = header_has_token(request_headers, CONNECTION, "close")
+        || header_has_token(headers, CONNECTION, "close");
+    let persistent = match version {
+        Version::HTTP_11 => !close,
+        Version::HTTP_10 => header_has_token(headers, CONNECTION, "keep-alive"),
+        _ => false,
+    };
+    let no_body = method == Method::HEAD
+        || status.is_informational()
+        || status == StatusCode::NO_CONTENT
+        || status == StatusCode::NOT_MODIFIED;
+    let framed = no_body
+        || headers.contains_key(CONTENT_LENGTH)
+        || header_has_token(headers, TRANSFER_ENCODING, "chunked");
+    persistent && framed
+}
+
+fn header_has_token(headers: &HeaderMap, name: HeaderName, expected: &str) -> bool {
+    headers
+        .get_all(name)
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .flat_map(|value| value.split(','))
+        .any(|value| value.trim().eq_ignore_ascii_case(expected))
+}
+
+fn remaining(deadline: Instant) -> io::Result<Duration> {
+    deadline
+        .checked_duration_since(Instant::now())
+        .ok_or_else(|| io::Error::new(io::ErrorKind::TimedOut, "HTTP request deadline exceeded"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::client::ServiceResolver;
+    use std::io::{Read, Write};
+    use std::net::{SocketAddr, TcpListener};
+    use std::sync::Mutex as StdMutex;
+    use std::thread;
+
+    struct StaticResolver(SocketAddr);
+
+    impl Resolver for StaticResolver {
+        fn resolve(&self, _host: &str, _port: u16) -> io::Result<Vec<SocketAddr>> {
+            Ok(vec![self.0])
+        }
+    }
+
+    #[derive(Default)]
+    struct RecordingObserver(StdMutex<Vec<String>>);
+
+    impl RecordingObserver {
+        fn events(&self) -> Vec<String> {
+            self.0.lock().unwrap().clone()
+        }
+    }
+
+    impl ClientObserver for RecordingObserver {
+        fn observe(&self, event: ClientEvent<'_>) {
+            let value = match event {
+                ClientEvent::RequestStarted {
+                    request_id,
+                    method,
+                    origin,
+                } => format!(
+                    "start:{request_id}:{method}:{}://{}:{}",
+                    origin.scheme, origin.host, origin.port
+                ),
+                ClientEvent::RequestMetadataCompleted {
+                    request_id,
+                    attempt,
+                    redirect_hop,
+                    stale_retry,
+                    error,
+                    ..
+                } => format!(
+                    "metadata:{request_id}:{attempt}:{redirect_hop}:{stale_retry}:{error:?}"
+                ),
+                ClientEvent::TlsConfigCompleted {
+                    request_id,
+                    generation,
+                    fallback_used,
+                    error,
+                    ..
+                } => format!(
+                    "tls-config:{request_id}:{generation:?}:{fallback_used}:{error:?}"
+                ),
+                ClientEvent::TlsGenerationChanged {
+                    request_id,
+                    previous_generation,
+                    generation,
+                    retired_idle_connections,
+                } => format!(
+                    "tls-generation:{request_id}:{previous_generation}:{generation}:{retired_idle_connections}"
+                ),
+                ClientEvent::PoolWaited {
+                    request_id,
+                    timed_out,
+                    ..
+                } => format!("wait:{request_id}:{timed_out}"),
+                ClientEvent::DnsCompleted {
+                    request_id,
+                    address_count,
+                    source,
+                    error,
+                    ..
+                } => format!("dns:{request_id}:{address_count}:{source:?}:{error:?}"),
+                ClientEvent::ConnectionCompleted {
+                    request_id,
+                    tls,
+                    error,
+                    ..
+                } => format!("connect:{request_id}:{tls}:{error:?}"),
+                ClientEvent::ConnectionReused { request_id, .. } => {
+                    format!("reuse:{request_id}")
+                }
+                ClientEvent::ConnectionDiscarded { request_id, .. } => {
+                    format!("discard:{request_id}")
+                }
+                ClientEvent::ResponseHeaders {
+                    request_id, status, ..
+                } => format!("headers:{request_id}:{}", status.as_u16()),
+                ClientEvent::RedirectFollowed {
+                    request_id, status, ..
+                } => format!("redirect:{request_id}:{}", status.as_u16()),
+                ClientEvent::StaleConnectionRetried { request_id, .. } => {
+                    format!("retry:{request_id}")
+                }
+                ClientEvent::RequestCompleted {
+                    request_id, status, ..
+                } => format!("complete:{request_id}:{}", status.as_u16()),
+                ClientEvent::RequestFailed {
+                    request_id, error, ..
+                } => format!("failed:{request_id}:{error:?}"),
+                ClientEvent::RequestCancelled { request_id, .. } => {
+                    format!("cancelled:{request_id}")
+                }
+                ClientEvent::RequestAbandoned {
+                    request_id, status, ..
+                } => format!("abandoned:{request_id}:{}", status.as_u16()),
+                // Phase timings: asserted by `observer_reports_request_phase_timings`.
+                ClientEvent::CheckoutCompleted { .. }
+                | ClientEvent::RequestWritten { .. }
+                | ClientEvent::ResponseHeadersReceived { .. }
+                | ClientEvent::ResponseBodyRead { .. } => return,
+            };
+            self.0.lock().unwrap().push(value);
+        }
+    }
+
+    /// Spawn a test coroutine with a 256 KiB stack. A full client request needs more than may's
+    /// 32 KiB default in Windows debug builds (these tests aborted there with 0xc00000fd); hosts
+    /// configure larger stacks in production (BRRTRouter: 256 KiB). `may::go!` always takes the
+    /// default.
+    fn go<T: Send + 'static>(
+        operation: impl FnOnce() -> T + Send + 'static,
+    ) -> may::coroutine::JoinHandle<T> {
+        // SAFETY: test closures touch no coroutine-unsafe thread-local state.
+        unsafe {
+            may::coroutine::Builder::new()
+                .stack_size(256 * 1024 / std::mem::size_of::<usize>())
+                .spawn(operation)
+        }
+        .expect("spawn test coroutine")
+    }
+
+    fn read_head(stream: &mut impl Read) -> String {
+        let mut request = Vec::new();
+        let mut byte = [0_u8; 1];
+        while !request.ends_with(b"\r\n\r\n") {
+            stream.read_exact(&mut byte).unwrap();
+            request.push(byte[0]);
+        }
+        String::from_utf8(request).unwrap()
+    }
+
+    fn test_client(policy: RedirectPolicy) -> Client {
+        Client::builder()
+            .redirect_policy(policy)
+            .request_timeout(Duration::from_secs(2))
+            .build()
+            .unwrap()
+    }
+
+    // The idle check peeks the socket, which may only allows on unix (where its sockets are
+    // non-blocking); elsewhere the stale-retry path is all there is, and a POST is not retried.
+    #[cfg(unix)]
+    #[test]
+    fn pool_drops_an_idle_connection_the_server_closed_before_reusing_it() {
+        // The server answers one request per connection and closes it, while still saying
+        // keep-alive (as a server whose idle timeout fired would). A POST is not stale-retried,
+        // so before the reuse check the second POST failed on the dead pooled connection.
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = thread::spawn(move || {
+            for _ in 0..2 {
+                let (mut stream, _) = listener.accept().unwrap();
+                let head = read_head(&mut stream);
+                let length: usize = head
+                    .lines()
+                    .find_map(|l| {
+                        l.to_ascii_lowercase()
+                            .strip_prefix("content-length:")
+                            .map(|v| v.trim().parse().unwrap())
+                    })
+                    .unwrap_or(0);
+                let mut body = vec![0_u8; length];
+                stream.read_exact(&mut body).unwrap();
+                stream
+                    .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok")
+                    .unwrap();
+                // drop: the connection closes with no Connection: close
+            }
+        });
+        let client = test_client(RedirectPolicy::None);
+        let url = format!("http://127.0.0.1:{port}/submit");
+        let first = client
+            .post(&url)
+            .unwrap()
+            .body(b"one".to_vec())
+            .send()
+            .unwrap();
+        assert_eq!(first.body(), b"ok");
+        // let the FIN arrive
+        thread::sleep(Duration::from_millis(50));
+        let second = client
+            .post(&url)
+            .unwrap()
+            .body(b"two".to_vec())
+            .send()
+            .unwrap();
+        assert_eq!(second.body(), b"ok");
+        server.join().unwrap();
+        let stats = client.stats();
+        assert_eq!(stats.connections_created, 2);
+        assert_eq!(stats.connections_reused, 0);
+        assert_eq!(stats.connections_discarded, 1);
+        assert_eq!(stats.stale_retries, 0);
+    }
+
+    #[test]
+    fn low_level_client_is_send() {
+        fn assert_send<T: Send>() {}
+        assert_send::<HttpClient>();
+    }
+
+    #[test]
+    fn pool_key_separates_scheme_port_and_tls_generation() {
+        let http = OriginKey::from_url(&Url::parse("http://example.com/").unwrap(), 10).unwrap();
+        let https = OriginKey::from_url(&Url::parse("https://example.com/").unwrap(), 10).unwrap();
+        let other_port =
+            OriginKey::from_url(&Url::parse("https://example.com:444/").unwrap(), 10).unwrap();
+        let other_tls =
+            OriginKey::from_url(&Url::parse("https://example.com/").unwrap(), 11).unwrap();
+        assert_ne!(http, https);
+        assert_ne!(https, other_port);
+        assert_ne!(https, other_tls);
+    }
+
+    #[test]
+    fn pool_expiry_uses_injected_instant_for_idle_and_lifetime_limits() {
+        fn connection(created: Instant, idle_since: Instant) -> PooledConnection {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let address = listener.local_addr().unwrap();
+            let accept = thread::spawn(move || listener.accept().unwrap());
+            let client = HttpClient::connect(address).unwrap();
+            let _ = accept.join().unwrap();
+            PooledConnection {
+                client,
+                created,
+                idle_since,
+            }
+        }
+
+        let now = Instant::now();
+        let key = OriginKey::from_url(&Url::parse("http://example.com/").unwrap(), 0).unwrap();
+        let mut state = PoolState::default();
+        state.total = 2;
+        state.per_origin.insert(key.clone(), 2);
+        state.idle.insert(
+            key.clone(),
+            vec![
+                connection(now - Duration::from_secs(5), now - Duration::from_secs(3)),
+                connection(now - Duration::from_secs(30), now - Duration::from_secs(1)),
+            ],
+        );
+
+        assert_eq!(
+            state.purge_expired(now, Duration::from_secs(2), Duration::from_secs(20)),
+            2
+        );
+        assert_eq!(state.total, 0);
+        assert!(!state.per_origin.contains_key(&key));
+        assert!(!state.idle.contains_key(&key));
+    }
+
+    #[test]
+    fn redirect_policy_rejects_cross_origin_and_downgrade() {
+        let https = Url::parse("https://example.com/a").unwrap();
+        let other = Url::parse("https://other.example/a").unwrap();
+        let http = Url::parse("http://example.com/a").unwrap();
+        assert!(
+            validate_redirect(RedirectPolicy::SameOrigin { max_hops: 2 }, &https, &other).is_err()
+        );
+        assert!(validate_redirect(
+            RedirectPolicy::CrossOrigin {
+                max_hops: 2,
+                allow_https_downgrade: false,
+            },
+            &https,
+            &http
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn default_builder_has_redirects_disabled_and_finite_limits() {
+        let builder = ClientBuilder::new();
+        assert_eq!(builder.redirect_policy, RedirectPolicy::None);
+        assert!(builder.max_connections > 0);
+        assert!(builder.max_response_body > 0);
+        assert!(builder.max_request_headers > 0);
+        assert!(builder.max_request_header_bytes > 0);
+    }
+
+    #[test]
+    fn request_metadata_precedence_and_rotation_are_deterministic() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let first = read_head(&mut stream).to_ascii_lowercase();
+            assert!(first.contains("\r\nx-default: default-only\r\n"));
+            assert!(first.contains("\r\nx-priority: request\r\n"));
+            assert!(first.contains("\r\nx-rotating: token-1\r\n"));
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok")
+                .unwrap();
+            stream.flush().unwrap();
+
+            let second = read_head(&mut stream).to_ascii_lowercase();
+            assert!(second.contains("\r\nx-priority: provider\r\n"));
+            assert!(second.contains("\r\nx-rotating: token-2\r\n"));
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok")
+                .unwrap();
+        });
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let provider_calls = calls.clone();
+        let provider = Arc::new(move |context: RequestMetadataContext<'_>| {
+            let call = provider_calls.fetch_add(1, Ordering::Relaxed) + 1;
+            assert_eq!(context.attempt, 1);
+            assert_eq!(context.redirect_hop, 0);
+            assert!(!context.stale_retry);
+            Ok(RequestMetadata::new()
+                .header(
+                    HeaderName::from_static("x-priority"),
+                    HeaderValue::from_static("provider"),
+                )
+                .header(
+                    HeaderName::from_static("x-rotating"),
+                    HeaderValue::from_str(&format!("token-{call}")).unwrap(),
+                ))
+        });
+        let client = Client::builder()
+            .default_header(
+                HeaderName::from_static("x-default"),
+                HeaderValue::from_static("default-only"),
+            )
+            .default_header(
+                HeaderName::from_static("x-priority"),
+                HeaderValue::from_static("default"),
+            )
+            .request_metadata_provider(provider)
+            .build()
+            .unwrap();
+
+        client
+            .get(&format!("http://127.0.0.1:{port}/one"))
+            .unwrap()
+            .header(
+                HeaderName::from_static("x-priority"),
+                HeaderValue::from_static("request"),
+            )
+            .send()
+            .unwrap();
+        client
+            .get(&format!("http://127.0.0.1:{port}/two"))
+            .unwrap()
+            .send()
+            .unwrap();
+        server.join().unwrap();
+        assert_eq!(calls.load(Ordering::Relaxed), 2);
+    }
+
+    #[test]
+    fn metadata_provider_failure_is_redacted_classified_and_pre_connect() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        listener.set_nonblocking(true).unwrap();
+        let observer = Arc::new(RecordingObserver::default());
+        let provider = Arc::new(|_context: RequestMetadataContext<'_>| {
+            Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "Bearer must-never-escape",
+            ))
+        });
+        let client = Client::builder()
+            .observer(observer.clone())
+            .request_metadata_provider(provider)
+            .build()
+            .unwrap();
+
+        let error = client
+            .get(&format!("http://127.0.0.1:{port}/never-sent"))
+            .unwrap()
+            .send_typed()
+            .unwrap_err();
+        assert_eq!(error.kind(), ClientErrorKind::Metadata);
+        assert!(!error.to_string().contains("must-never-escape"));
+        assert_eq!(
+            listener.accept().unwrap_err().kind(),
+            io::ErrorKind::WouldBlock
+        );
+        let events = observer.events();
+        assert!(events
+            .iter()
+            .any(|event| event == "metadata:1:1:0:false:Some(Metadata)"));
+        assert!(events.iter().any(|event| event == "failed:1:Metadata"));
+    }
+
+    #[test]
+    fn transport_owned_and_bounded_request_headers_are_enforced() {
+        for name in [HOST, CONTENT_LENGTH, TRANSFER_ENCODING] {
+            let error = Client::builder()
+                .default_header(name, HeaderValue::from_static("invalid"))
+                .build()
+                .unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+            assert!(error.to_string().contains("transport-owned"));
+        }
+
+        let provider = Arc::new(|_context: RequestMetadataContext<'_>| {
+            Ok(RequestMetadata::new().header(HOST, HeaderValue::from_static("invalid")))
+        });
+        let error = Client::builder()
+            .request_metadata_provider(provider)
+            .build()
+            .unwrap()
+            .get("http://127.0.0.1:9/")
+            .unwrap()
+            .send_typed()
+            .unwrap_err();
+        assert_eq!(error.kind(), ClientErrorKind::Metadata);
+
+        let client = Client::builder()
+            .max_request_headers(1)
+            .default_header(
+                HeaderName::from_static("x-one"),
+                HeaderValue::from_static("1"),
+            )
+            .build()
+            .unwrap();
+        let error = client
+            .get("http://127.0.0.1:9/")
+            .unwrap()
+            .header(
+                HeaderName::from_static("x-two"),
+                HeaderValue::from_static("2"),
+            )
+            .send_typed()
+            .unwrap_err();
+        assert_eq!(error.kind(), ClientErrorKind::InvalidRequest);
+
+        let debug = format!(
+            "{:?}",
+            RequestMetadata::new().header(
+                AUTHORIZATION,
+                HeaderValue::from_static("Bearer must-never-escape")
+            )
+        );
+        assert!(!debug.contains("must-never-escape"));
+    }
+
+    #[test]
+    fn get_body_is_rejected_before_connection_attempt() {
+        let error = test_client(RedirectPolicy::None)
+            .get("http://127.0.0.1:9/")
+            .unwrap()
+            .body(b"not allowed".to_vec())
+            .send()
+            .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+        assert!(error.to_string().contains("GET or HEAD"));
+    }
+
+    #[test]
+    fn typed_errors_preserve_source_and_classification() {
+        let error = ClientError::from(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "HTTP response body exceeds configured limit",
+        ));
+        assert_eq!(error.kind(), ClientErrorKind::BodyTooLarge);
+        assert!(error.to_string().contains("body exceeds"));
+    }
+
+    #[test]
+    fn injected_resolver_controls_connection_addresses() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let request = read_head(&mut stream).to_ascii_lowercase();
+            assert!(request.contains("\r\nhost: service.invalid:"));
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok")
+                .unwrap();
+        });
+        let client = Client::builder()
+            .resolver(Arc::new(StaticResolver(address)))
+            .build()
+            .unwrap();
+        let response = client
+            .get(&format!("http://service.invalid:{}/", address.port()))
+            .unwrap()
+            .send()
+            .unwrap();
+        assert_eq!(response.body(), b"ok");
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn service_resolver_preserves_logical_host_and_reports_source() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let request = read_head(&mut stream).to_ascii_lowercase();
+            assert!(request.contains("\r\nhost: identity.internal:"));
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok")
+                .unwrap();
+        });
+        let resolver = Arc::new(ServiceResolver::default());
+        let unavailable = SocketAddr::from(([127, 0, 0, 2], address.port()));
+        resolver
+            .update(
+                "identity.internal",
+                address.port(),
+                vec![unavailable, address],
+            )
+            .unwrap();
+        let observer = Arc::new(RecordingObserver::default());
+        let client = Client::builder()
+            .resolver(resolver)
+            .observer(observer.clone())
+            .build()
+            .unwrap();
+
+        assert_eq!(
+            client
+                .get(&format!(
+                    "http://identity.internal:{}/health",
+                    address.port()
+                ))
+                .unwrap()
+                .send()
+                .unwrap()
+                .body(),
+            b"ok"
+        );
+        server.join().unwrap();
+        assert!(observer
+            .events()
+            .iter()
+            .any(|event| event == "dns:1:2:Some(ServiceRegistry):None"));
+    }
+
+    #[test]
+    fn service_resolver_preserves_logical_tls_identity() {
+        use rcgen::{generate_simple_self_signed, CertifiedKey};
+        use rustls::pki_types::PrivatePkcs8KeyDer;
+        use rustls::{ClientConfig, RootCertStore, ServerConfig, ServerConnection, StreamOwned};
+
+        let CertifiedKey { cert, signing_key } =
+            generate_simple_self_signed(vec!["identity.internal".to_owned()]).unwrap();
+        let provider = Arc::new(rustls::crypto::ring::default_provider());
+        let server_config = ServerConfig::builder_with_provider(provider.clone())
+            .with_safe_default_protocol_versions()
+            .unwrap()
+            .with_no_client_auth()
+            .with_single_cert(
+                vec![cert.der().clone()],
+                PrivatePkcs8KeyDer::from(signing_key.serialize_der()).into(),
+            )
+            .unwrap();
+        let mut roots = RootCertStore::empty();
+        roots.add(cert.der().clone()).unwrap();
+        let client_config = ClientConfig::builder_with_provider(provider)
+            .with_safe_default_protocol_versions()
+            .unwrap()
+            .with_root_certificates(roots)
+            .with_no_client_auth();
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let connection = ServerConnection::new(Arc::new(server_config)).unwrap();
+            let mut tls = StreamOwned::new(connection, stream);
+            let request = read_head(&mut tls).to_ascii_lowercase();
+            assert!(request.contains("\r\nhost: identity.internal:"));
+            tls.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok")
+                .unwrap();
+            tls.flush().unwrap();
+        });
+        let resolver = Arc::new(ServiceResolver::default());
+        resolver
+            .update("identity.internal", address.port(), vec![address])
+            .unwrap();
+        let client = Client::builder()
+            .resolver(resolver)
+            .tls_config(Arc::new(client_config))
+            .build()
+            .unwrap();
+
+        let response = client
+            .get(&format!(
+                "https://identity.internal:{}/health",
+                address.port()
+            ))
+            .unwrap()
+            .send()
+            .unwrap();
+        assert_eq!(response.body(), b"ok");
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn tls_generation_rotation_retires_idle_connections() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            for index in 0..2 {
+                let (mut stream, _) = listener.accept().unwrap();
+                let _ = read_head(&mut stream);
+                let response = if index == 0 {
+                    b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok".as_slice()
+                } else {
+                    b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok"
+                        .as_slice()
+                };
+                stream.write_all(response).unwrap();
+            }
+        });
+        let first_config = HttpClient::platform_tls_config().unwrap();
+        let second_config = HttpClient::platform_tls_config().unwrap();
+        let generation = Arc::new(AtomicU64::new(1));
+        let provider_generation = generation.clone();
+        let provider_first = first_config.clone();
+        let provider_second = second_config.clone();
+        let provider = Arc::new(move || match provider_generation.load(Ordering::Acquire) {
+            1 => Ok(TlsConfigSnapshot::new(1, provider_first.clone())),
+            2 => Ok(TlsConfigSnapshot::new(2, provider_second.clone())),
+            _ => unreachable!(),
+        });
+        let observed_configs = Arc::new(StdMutex::new(Vec::new()));
+        let connector_configs = observed_configs.clone();
+        let connector_first = first_config.clone();
+        let connector_second = second_config.clone();
+        let connector = Arc::new(
+            move |_origin: &str,
+                  tls_config: Arc<ClientConfig>,
+                  _timeout: Duration,
+                  addresses: &[SocketAddr]| {
+                let value = if Arc::ptr_eq(&tls_config, &connector_first) {
+                    1
+                } else if Arc::ptr_eq(&tls_config, &connector_second) {
+                    2
+                } else {
+                    0
+                };
+                connector_configs.lock().unwrap().push(value);
+                HttpClient::connect(addresses[0])
+            },
+        );
+        let observer = Arc::new(RecordingObserver::default());
+        let client = Client::builder()
+            .resolver(Arc::new(StaticResolver(address)))
+            .tls_config_provider(provider)
+            .test_connector(connector)
+            .observer(observer.clone())
+            .build()
+            .unwrap();
+
+        client
+            .get(&format!("https://identity.internal:{}/one", address.port()))
+            .unwrap()
+            .send()
+            .unwrap();
+        generation.store(2, Ordering::Release);
+        client
+            .get(&format!("https://identity.internal:{}/two", address.port()))
+            .unwrap()
+            .send()
+            .unwrap();
+        server.join().unwrap();
+
+        assert_eq!(*observed_configs.lock().unwrap(), vec![1, 2]);
+        assert_eq!(client.stats().connections_created, 2);
+        assert_eq!(client.stats().connections_discarded, 2);
+        assert!(observer
+            .events()
+            .iter()
+            .any(|event| event == "tls-generation:2:1:2:1"));
+    }
+
+    #[test]
+    fn tls_rotation_uses_the_new_mtls_client_identity() {
+        use rcgen::{generate_simple_self_signed, CertifiedKey};
+        use rustls::pki_types::PrivatePkcs8KeyDer;
+        use rustls::server::WebPkiClientVerifier;
+        use rustls::{ClientConfig, RootCertStore, ServerConfig, ServerConnection, StreamOwned};
+
+        let CertifiedKey {
+            cert: server_cert,
+            signing_key: server_key,
+        } = generate_simple_self_signed(vec!["identity.internal".to_owned()]).unwrap();
+        let CertifiedKey {
+            cert: client_a_cert,
+            signing_key: client_a_key,
+        } = generate_simple_self_signed(vec!["client-a.internal".to_owned()]).unwrap();
+        let CertifiedKey {
+            cert: client_b_cert,
+            signing_key: client_b_key,
+        } = generate_simple_self_signed(vec!["client-b.internal".to_owned()]).unwrap();
+        let provider = Arc::new(rustls::crypto::ring::default_provider());
+
+        let mut client_roots = RootCertStore::empty();
+        client_roots.add(client_a_cert.der().clone()).unwrap();
+        client_roots.add(client_b_cert.der().clone()).unwrap();
+        let client_verifier =
+            WebPkiClientVerifier::builder_with_provider(Arc::new(client_roots), provider.clone())
+                .build()
+                .unwrap();
+        let server_config = ServerConfig::builder_with_provider(provider.clone())
+            .with_safe_default_protocol_versions()
+            .unwrap()
+            .with_client_cert_verifier(client_verifier)
+            .with_single_cert(
+                vec![server_cert.der().clone()],
+                PrivatePkcs8KeyDer::from(server_key.serialize_der()).into(),
+            )
+            .unwrap();
+
+        fn client_config(
+            provider: Arc<rustls::crypto::CryptoProvider>,
+            server_cert: rustls::pki_types::CertificateDer<'static>,
+            client_cert: rustls::pki_types::CertificateDer<'static>,
+            client_key: Vec<u8>,
+        ) -> Arc<ClientConfig> {
+            let mut roots = RootCertStore::empty();
+            roots.add(server_cert).unwrap();
+            Arc::new(
+                ClientConfig::builder_with_provider(provider)
+                    .with_safe_default_protocol_versions()
+                    .unwrap()
+                    .with_root_certificates(roots)
+                    .with_client_auth_cert(
+                        vec![client_cert],
+                        PrivatePkcs8KeyDer::from(client_key).into(),
+                    )
+                    .unwrap(),
+            )
+        }
+        let config_a = client_config(
+            provider.clone(),
+            server_cert.der().clone(),
+            client_a_cert.der().clone(),
+            client_a_key.serialize_der(),
+        );
+        let config_b = client_config(
+            provider,
+            server_cert.der().clone(),
+            client_b_cert.der().clone(),
+            client_b_key.serialize_der(),
+        );
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server_config = Arc::new(server_config);
+        let expected = [client_a_cert.der().clone(), client_b_cert.der().clone()];
+        let server = thread::spawn(move || {
+            for expected_cert in expected {
+                let (stream, _) = listener.accept().unwrap();
+                let connection = ServerConnection::new(server_config.clone()).unwrap();
+                let mut tls = StreamOwned::new(connection, stream);
+                let _ = read_head(&mut tls);
+                let peer = tls
+                    .conn
+                    .peer_certificates()
+                    .and_then(|certificates| certificates.first())
+                    .expect("mTLS peer certificate must be available");
+                assert_eq!(peer.as_ref(), expected_cert.as_ref());
+                tls.write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok",
+                )
+                .unwrap();
+                tls.flush().unwrap();
+            }
+        });
+
+        let generation = Arc::new(AtomicU64::new(1));
+        let provider_generation = generation.clone();
+        let provider_config_a = config_a.clone();
+        let provider_config_b = config_b.clone();
+        let tls_provider = Arc::new(move || {
+            Ok(match provider_generation.load(Ordering::Acquire) {
+                1 => TlsConfigSnapshot::new(1, provider_config_a.clone()),
+                2 => TlsConfigSnapshot::new(2, provider_config_b.clone()),
+                _ => unreachable!(),
+            })
+        });
+        let client = Client::builder()
+            .resolver(Arc::new(StaticResolver(address)))
+            .tls_config_provider(tls_provider)
+            .build()
+            .unwrap();
+        client
+            .get(&format!("https://identity.internal:{}/a", address.port()))
+            .unwrap()
+            .send()
+            .unwrap();
+        generation.store(2, Ordering::Release);
+        client
+            .get(&format!("https://identity.internal:{}/b", address.port()))
+            .unwrap()
+            .send()
+            .unwrap();
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn tls_provider_failure_can_use_last_known_good_snapshot() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            for _ in 0..2 {
+                let _ = read_head(&mut stream);
+                stream
+                    .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok")
+                    .unwrap();
+                stream.flush().unwrap();
+            }
+        });
+        let config = HttpClient::platform_tls_config().unwrap();
+        let provider_config = config.clone();
+        let available = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let provider_available = available.clone();
+        let provider = Arc::new(move || {
+            if provider_available.load(Ordering::Acquire) {
+                Ok(TlsConfigSnapshot::new(1, provider_config.clone()))
+            } else {
+                Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "private key must-never-escape",
+                ))
+            }
+        });
+        let connector = Arc::new(
+            move |_origin: &str,
+                  _tls_config: Arc<ClientConfig>,
+                  _timeout: Duration,
+                  addresses: &[SocketAddr]| { HttpClient::connect(addresses[0]) },
+        );
+        let observer = Arc::new(RecordingObserver::default());
+        let client = Client::builder()
+            .resolver(Arc::new(StaticResolver(address)))
+            .tls_config_provider(provider)
+            .tls_config_failure_policy(TlsConfigFailurePolicy::UseLastKnownGood)
+            .test_connector(connector)
+            .observer(observer.clone())
+            .build()
+            .unwrap();
+        client
+            .get(&format!("https://identity.internal:{}/one", address.port()))
+            .unwrap()
+            .send()
+            .unwrap();
+        available.store(false, Ordering::Release);
+        client
+            .get(&format!("https://identity.internal:{}/two", address.port()))
+            .unwrap()
+            .send()
+            .unwrap();
+        server.join().unwrap();
+
+        assert_eq!(client.stats().connections_created, 1);
+        assert_eq!(client.stats().connections_reused, 1);
+        let events = observer.events();
+        assert!(events
+            .iter()
+            .any(|event| event == "tls-config:2:Some(1):true:Some(Tls)"));
+        assert!(!events.join("|").contains("must-never-escape"));
+    }
+
+    #[test]
+    fn tls_provider_failure_fails_closed_before_connect_by_default() {
+        let config = HttpClient::platform_tls_config().unwrap();
+        let provider_config = config.clone();
+        let available = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let provider_available = available.clone();
+        let provider = Arc::new(move || {
+            if provider_available.load(Ordering::Acquire) {
+                Ok(TlsConfigSnapshot::new(1, provider_config.clone()))
+            } else {
+                Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "private key must-never-escape",
+                ))
+            }
+        });
+        let connector_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let calls = connector_calls.clone();
+        let connector = Arc::new(
+            move |_origin: &str,
+                  _tls_config: Arc<ClientConfig>,
+                  _timeout: Duration,
+                  _addresses: &[SocketAddr]| {
+                calls.fetch_add(1, Ordering::Relaxed);
+                Err(io::Error::other("connector must not run"))
+            },
+        );
+        let client = Client::builder()
+            .tls_config_provider(provider)
+            .test_connector(connector)
+            .build()
+            .unwrap();
+        available.store(false, Ordering::Release);
+
+        let error = client
+            .get("https://identity.internal/fail-closed")
+            .unwrap()
+            .send_typed()
+            .unwrap_err();
+        assert_eq!(error.kind(), ClientErrorKind::Tls);
+        assert!(!error.to_string().contains("must-never-escape"));
+        assert_eq!(connector_calls.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn resolver_time_counts_against_connect_deadline() {
+        struct SlowResolver;
+        impl Resolver for SlowResolver {
+            fn resolve(&self, _host: &str, _port: u16) -> io::Result<Vec<SocketAddr>> {
+                thread::sleep(Duration::from_millis(30));
+                Ok(vec!["127.0.0.1:9".parse().unwrap()])
+            }
+        }
+
+        let client = Client::builder()
+            .resolver(Arc::new(SlowResolver))
+            .connect_timeout(Duration::from_millis(5))
+            .build()
+            .unwrap();
+        let error = client
+            .get("http://slow.invalid/")
+            .unwrap()
+            .send()
+            .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+    }
+
+    #[test]
+    fn fully_consumed_responses_reuse_the_connection() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            for expected in ["/one", "/two"] {
+                let request = read_head(&mut stream);
+                assert!(request.starts_with(&format!("GET {expected} HTTP/1.1\r\n")));
+                stream
+                    .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok")
+                    .unwrap();
+                stream.flush().unwrap();
+            }
+        });
+
+        let client = test_client(RedirectPolicy::None);
+        for path in ["one", "two"] {
+            let response = client
+                .get(&format!("http://127.0.0.1:{port}/{path}"))
+                .unwrap()
+                .send()
+                .unwrap();
+            assert_eq!(response.body(), b"ok");
+        }
+        let stats = client.stats();
+        assert_eq!(stats.connections_created, 1);
+        assert_eq!(stats.connections_reused, 1);
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn observer_records_sanitized_new_and_reused_request_lifecycles() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            for _ in 0..2 {
+                let _ = read_head(&mut stream);
+                stream
+                    .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok")
+                    .unwrap();
+                stream.flush().unwrap();
+            }
+        });
+        let observer = Arc::new(RecordingObserver::default());
+        let client = Client::builder()
+            .observer(observer.clone())
+            .build()
+            .unwrap();
+
+        for path in ["one?token=do-not-observe", "two"] {
+            assert_eq!(
+                client
+                    .get(&format!("http://127.0.0.1:{port}/{path}"))
+                    .unwrap()
+                    .header(AUTHORIZATION, HeaderValue::from_static("Bearer secret"))
+                    .send()
+                    .unwrap()
+                    .body(),
+                b"ok"
+            );
+        }
+        server.join().unwrap();
+
+        let events = observer.events();
+        assert_eq!(events[0], format!("start:1:GET:http://127.0.0.1:{port}"));
+        assert!(events
+            .iter()
+            .any(|event| event == "dns:1:1:Some(Resolver):None"));
+        assert!(events.iter().any(|event| event == "connect:1:false:None"));
+        assert!(events.iter().any(|event| event == "complete:1:200"));
+        assert!(events.iter().any(|event| event == "reuse:2"));
+        assert!(events.iter().any(|event| event == "complete:2:200"));
+        let joined = events.join("|");
+        assert!(!joined.contains("do-not-observe"));
+        assert!(!joined.contains("Bearer"));
+        assert!(!joined.contains("secret"));
+    }
+
+    #[derive(Default)]
+    struct PhaseObserver(StdMutex<Vec<(String, Duration)>>);
+
+    impl ClientObserver for PhaseObserver {
+        fn observe(&self, event: ClientEvent<'_>) {
+            let entry = match event {
+                ClientEvent::CheckoutCompleted {
+                    request_id,
+                    duration,
+                    reused,
+                    error,
+                    ..
+                } => (
+                    format!("checkout:{request_id}:{reused}:{error:?}"),
+                    duration,
+                ),
+                ClientEvent::RequestWritten {
+                    request_id,
+                    duration,
+                    error,
+                    ..
+                } => (format!("written:{request_id}:{error:?}"), duration),
+                ClientEvent::ResponseHeadersReceived {
+                    request_id,
+                    duration,
+                    error,
+                    ..
+                } => (format!("headers:{request_id}:{error:?}"), duration),
+                ClientEvent::ResponseBodyRead {
+                    request_id,
+                    duration,
+                    bytes,
+                    error,
+                    ..
+                } => (format!("body:{request_id}:{bytes}:{error:?}"), duration),
+                _ => return,
+            };
+            self.0.lock().unwrap().push(entry);
+        }
+    }
+
+    #[test]
+    fn observer_reports_request_phase_timings() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            for _ in 0..2 {
+                let _ = read_head(&mut stream);
+                // the server "thinks" before answering: that is header wait, not write or body
+                thread::sleep(Duration::from_millis(60));
+                stream
+                    .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok")
+                    .unwrap();
+                stream.flush().unwrap();
+            }
+        });
+        let observer = Arc::new(PhaseObserver::default());
+        let client = Client::builder()
+            .observer(observer.clone())
+            .build()
+            .unwrap();
+        for _ in 0..2 {
+            let response = client
+                .get(&format!("http://127.0.0.1:{port}/phases"))
+                .unwrap()
+                .send()
+                .unwrap();
+            assert_eq!(response.body(), b"ok");
+        }
+        server.join().unwrap();
+
+        let events = observer.0.lock().unwrap().clone();
+        let names: Vec<&str> = events.iter().map(|(name, _)| name.as_str()).collect();
+        assert_eq!(
+            names,
+            [
+                "checkout:1:false:None",
+                "written:1:None",
+                "headers:1:None",
+                "body:1:2:None",
+                "checkout:2:true:None",
+                "written:2:None",
+                "headers:2:None",
+                "body:2:2:None",
+            ]
+        );
+        let duration = |name: &str| events.iter().find(|(n, _)| n == name).unwrap().1;
+        assert!(duration("headers:1:None") >= Duration::from_millis(60));
+        assert!(duration("headers:2:None") >= Duration::from_millis(60));
+        assert!(duration("written:2:None") < Duration::from_millis(60));
+        assert!(duration("body:2:2:None") < Duration::from_millis(60));
+    }
+
+    #[test]
+    fn fully_consumed_streaming_response_reuses_the_connection() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            for expected in ["/stream", "/after-stream"] {
+                let request = read_head(&mut stream);
+                assert!(request.starts_with(&format!("GET {expected} HTTP/1.1\r\n")));
+                stream
+                    .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 4\r\n\r\ndata")
+                    .unwrap();
+                stream.flush().unwrap();
+            }
+        });
+
+        let client = test_client(RedirectPolicy::None);
+        let mut response = client
+            .get(&format!("http://127.0.0.1:{port}/stream"))
+            .unwrap()
+            .send_streaming()
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let mut body = [0_u8; 4];
+        response.read_exact(&mut body).unwrap();
+        assert_eq!(&body, b"data");
+        drop(response);
+
+        assert_eq!(
+            client
+                .get(&format!("http://127.0.0.1:{port}/after-stream"))
+                .unwrap()
+                .send()
+                .unwrap()
+                .body(),
+            b"data"
+        );
+        let stats = client.stats();
+        assert_eq!(stats.connections_created, 1);
+        assert_eq!(stats.connections_reused, 1);
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn partial_streaming_response_drop_discards_connection_without_drain() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = thread::spawn(move || {
+            let (mut partial, _) = listener.accept().unwrap();
+            assert!(read_head(&mut partial).starts_with("GET /partial HTTP/1.1\r\n"));
+            partial
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 10\r\n\r\nabcdefghij")
+                .unwrap();
+            partial.flush().unwrap();
+
+            let (mut replacement, _) = listener.accept().unwrap();
+            assert!(read_head(&mut replacement).starts_with("GET /replacement HTTP/1.1\r\n"));
+            replacement
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok")
+                .unwrap();
+        });
+
+        let client = test_client(RedirectPolicy::None);
+        let mut response = client
+            .get(&format!("http://127.0.0.1:{port}/partial"))
+            .unwrap()
+            .send_streaming()
+            .unwrap();
+        let mut prefix = [0_u8; 2];
+        response.read_exact(&mut prefix).unwrap();
+        assert_eq!(&prefix, b"ab");
+        drop(response);
+
+        assert_eq!(
+            client
+                .get(&format!("http://127.0.0.1:{port}/replacement"))
+                .unwrap()
+                .send()
+                .unwrap()
+                .body(),
+            b"ok"
+        );
+        let stats = client.stats();
+        assert_eq!(stats.connections_created, 2);
+        // One discard is the partial response; the other is the replacement's explicit close.
+        assert_eq!(stats.connections_discarded, 2);
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn observer_marks_partial_streaming_response_abandoned() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let _ = read_head(&mut stream);
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 4\r\n\r\ndata")
+                .unwrap();
+        });
+        let observer = Arc::new(RecordingObserver::default());
+        let client = Client::builder()
+            .observer(observer.clone())
+            .build()
+            .unwrap();
+        let mut response = client
+            .get(&format!("http://127.0.0.1:{port}/stream"))
+            .unwrap()
+            .send_streaming()
+            .unwrap();
+        let mut byte = [0_u8; 1];
+        response.read_exact(&mut byte).unwrap();
+        drop(response);
+        server.join().unwrap();
+
+        let events = observer.events();
+        assert!(events.iter().any(|event| event == "discard:1"));
+        assert!(events.iter().any(|event| event == "abandoned:1:200"));
+    }
+
+    #[test]
+    fn cancellation_interrupts_streaming_read_without_abandonment_event() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let (partial_tx, partial_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let server = thread::spawn(move || {
+            let (mut cancelled, _) = listener.accept().unwrap();
+            assert!(read_head(&mut cancelled).starts_with("GET /stream HTTP/1.1\r\n"));
+            cancelled
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 4\r\n\r\na")
+                .unwrap();
+            cancelled.flush().unwrap();
+            partial_tx.send(()).unwrap();
+            release_rx.recv().unwrap();
+            let _ = cancelled.write_all(b"bcd");
+            drop(cancelled);
+
+            let (mut replacement, _) = listener.accept().unwrap();
+            assert!(read_head(&mut replacement).starts_with("GET /fresh HTTP/1.1\r\n"));
+            replacement
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\nConnection: close\r\n\r\nfresh",
+                )
+                .unwrap();
+        });
+        let observer = Arc::new(RecordingObserver::default());
+        let client = Client::builder()
+            .max_connections(1)
+            .max_connections_per_origin(1)
+            .request_timeout(Duration::from_secs(2))
+            .observer(observer.clone())
+            .build()
+            .unwrap();
+        let token = CancellationToken::new();
+        let mut response = client
+            .get(&format!("http://127.0.0.1:{port}/stream"))
+            .unwrap()
+            .cancellation_token(token.clone())
+            .send_streaming()
+            .unwrap();
+        partial_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        let mut first = [0_u8; 1];
+        response.read_exact(&mut first).unwrap();
+        assert_eq!(&first, b"a");
+
+        let blocked_read = go(move || {
+            let mut next = [0_u8; 1];
+            let result = response.read(&mut next);
+            (response, result)
+        });
+        thread::sleep(Duration::from_millis(20));
+        assert!(token.cancel());
+        let (response, error) = blocked_read.join().unwrap();
+        let error = error.unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::Interrupted);
+        drop(response);
+        assert_eq!(client.stats().connections_discarded, 1);
+
+        release_tx.send(()).unwrap();
+        assert_eq!(
+            client
+                .get(&format!("http://127.0.0.1:{port}/fresh"))
+                .unwrap()
+                .send()
+                .unwrap()
+                .body(),
+            b"fresh"
+        );
+        server.join().unwrap();
+        let events = observer.events();
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| *event == "cancelled:1")
+                .count(),
+            1
+        );
+        assert!(events.iter().any(|event| event == "discard:1"));
+        assert!(!events.iter().any(|event| event == "abandoned:1:200"));
+    }
+
+    #[test]
+    fn cancellation_after_stream_completion_preserves_eof_outcome() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let _ = read_head(&mut stream);
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok")
+                .unwrap();
+        });
+        let observer = Arc::new(RecordingObserver::default());
+        let client = Client::builder()
+            .observer(observer.clone())
+            .build()
+            .unwrap();
+        let token = CancellationToken::new();
+        let mut response = client
+            .get(&format!("http://127.0.0.1:{port}/"))
+            .unwrap()
+            .cancellation_token(token.clone())
+            .send_streaming()
+            .unwrap();
+        let mut body = Vec::new();
+        response.read_to_end(&mut body).unwrap();
+        assert_eq!(body, b"ok");
+        assert!(token.cancel());
+        let mut byte = [0_u8; 1];
+        assert_eq!(response.read(&mut byte).unwrap(), 0);
+        drop(response);
+        server.join().unwrap();
+        let events = observer.events();
+        assert!(events.iter().any(|event| event == "complete:1:200"));
+        assert!(!events.iter().any(|event| event == "cancelled:1"));
+    }
+
+    #[test]
+    fn observer_records_connection_failure_once() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        drop(listener);
+        let observer = Arc::new(RecordingObserver::default());
+        let client = Client::builder()
+            .resolver(Arc::new(StaticResolver(address)))
+            .observer(observer.clone())
+            .build()
+            .unwrap();
+
+        let error = client
+            .get(&format!("http://service.invalid:{}/", address.port()))
+            .unwrap()
+            .send()
+            .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::ConnectionRefused);
+        let events = observer.events();
+        assert!(events
+            .iter()
+            .any(|event| event == "connect:1:false:Some(Connection)"));
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| *event == "failed:1:Connection")
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn pre_cancelled_request_has_typed_error_and_one_terminal_event() {
+        let token = CancellationToken::new();
+        assert!(token.cancel());
+        let observer = Arc::new(RecordingObserver::default());
+        let client = Client::builder()
+            .observer(observer.clone())
+            .build()
+            .unwrap();
+
+        let error = client
+            .get("http://127.0.0.1:9/never-connect")
+            .unwrap()
+            .cancellation_token(token)
+            .send_typed()
+            .unwrap_err();
+        assert_eq!(error.kind(), ClientErrorKind::Cancelled);
+        assert_eq!(error.into_io_error().kind(), io::ErrorKind::Interrupted);
+        let events = observer.events();
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event.starts_with("cancelled:"))
+                .count(),
+            1
+        );
+        assert!(!events.iter().any(|event| event.starts_with("failed:")));
+        assert!(!events.iter().any(|event| event.starts_with("connect:")));
+    }
+
+    #[test]
+    fn cancellation_interrupts_may_aware_resolution() {
+        struct SleepingResolver(std::sync::mpsc::Sender<()>);
+
+        impl Resolver for SleepingResolver {
+            fn resolve(&self, _host: &str, port: u16) -> io::Result<Vec<SocketAddr>> {
+                self.0.send(()).unwrap();
+                may::coroutine::sleep(Duration::from_secs(5));
+                Ok(vec![SocketAddr::from(([127, 0, 0, 1], port))])
+            }
+        }
+
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let token = CancellationToken::new();
+        let request_token = token.clone();
+        let client = Client::builder()
+            .resolver(Arc::new(SleepingResolver(started_tx)))
+            .connect_timeout(Duration::from_secs(10))
+            .build()
+            .unwrap();
+        let request = go(move || {
+            client
+                .get("http://resolution.internal:8080/")
+                .unwrap()
+                .cancellation_token(request_token)
+                .send_typed()
+        });
+        started_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+
+        let cancelled_at = Instant::now();
+        assert!(token.cancel());
+        let error = request.join().unwrap().unwrap_err();
+        assert_eq!(error.kind(), ClientErrorKind::Cancelled);
+        assert!(cancelled_at.elapsed() < Duration::from_millis(500));
+    }
+
+    #[test]
+    fn cancellation_interrupts_connect_and_releases_reservation() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            assert!(read_head(&mut stream).starts_with("GET /after HTTP/1.1\r\n"));
+            stream
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\nConnection: close\r\n\r\nafter",
+                )
+                .unwrap();
+        });
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let connector_calls = calls.clone();
+        let connector = Arc::new(
+            move |origin: &str,
+                  tls_config: Arc<ClientConfig>,
+                  timeout: Duration,
+                  addresses: &[SocketAddr]| {
+                if connector_calls.fetch_add(1, Ordering::Relaxed) == 0 {
+                    started_tx.send(()).unwrap();
+                    may::coroutine::sleep(Duration::from_secs(5));
+                    return Err(io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        "injected connect did not complete",
+                    ));
+                }
+                HttpClient::from_url_with_resolved_options(origin, tls_config, timeout, addresses)
+            },
+        );
+        let client = Client::builder()
+            .max_connections(1)
+            .max_connections_per_origin(1)
+            .resolver(Arc::new(StaticResolver(address)))
+            .test_connector(connector)
+            .build()
+            .unwrap();
+        let token = CancellationToken::new();
+        let request_token = token.clone();
+        let cancelled_client = client.clone();
+        let request = go(move || {
+            cancelled_client
+                .get(&format!(
+                    "http://connect.internal:{}/cancel",
+                    address.port()
+                ))
+                .unwrap()
+                .cancellation_token(request_token)
+                .send_typed()
+        });
+        started_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        assert!(token.cancel());
+        assert_eq!(
+            request.join().unwrap().unwrap_err().kind(),
+            ClientErrorKind::Cancelled
+        );
+
+        assert_eq!(
+            client
+                .get(&format!("http://connect.internal:{}/after", address.port()))
+                .unwrap()
+                .send()
+                .unwrap()
+                .body(),
+            b"after"
+        );
+        assert_eq!(calls.load(Ordering::Relaxed), 2);
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn cancellation_interrupts_buffered_response_and_releases_capacity() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let (blocked_tx, blocked_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let server = thread::spawn(move || {
+            let (mut cancelled, _) = listener.accept().unwrap();
+            assert!(read_head(&mut cancelled).starts_with("GET /cancel HTTP/1.1\r\n"));
+            blocked_tx.send(()).unwrap();
+            release_rx.recv().unwrap();
+            let _ = cancelled.write_all(
+                b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\nConnection: close\r\n\r\nstale",
+            );
+            drop(cancelled);
+
+            let (mut replacement, _) = listener.accept().unwrap();
+            assert!(read_head(&mut replacement).starts_with("GET /fresh HTTP/1.1\r\n"));
+            replacement
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\nConnection: close\r\n\r\nfresh",
+                )
+                .unwrap();
+        });
+        let observer = Arc::new(RecordingObserver::default());
+        let client = Client::builder()
+            .max_connections(1)
+            .max_connections_per_origin(1)
+            .request_timeout(Duration::from_secs(2))
+            .observer(observer.clone())
+            .build()
+            .unwrap();
+        let token = CancellationToken::new();
+        let request_token = token.clone();
+        let cancelled_client = client.clone();
+        let request = go(move || {
+            cancelled_client
+                .get(&format!("http://127.0.0.1:{port}/cancel"))
+                .unwrap()
+                .cancellation_token(request_token)
+                .send_typed()
+        });
+        blocked_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+
+        let cancelled_at = Instant::now();
+        assert!(token.cancel());
+        let error = request.join().unwrap().unwrap_err();
+        assert_eq!(error.kind(), ClientErrorKind::Cancelled);
+        assert!(cancelled_at.elapsed() < Duration::from_millis(500));
+        assert_eq!(client.stats().connections_discarded, 1);
+
+        release_tx.send(()).unwrap();
+        let response = client
+            .get(&format!("http://127.0.0.1:{port}/fresh"))
+            .unwrap()
+            .send()
+            .unwrap();
+        assert_eq!(response.body(), b"fresh");
+        server.join().unwrap();
+
+        let events = observer.events();
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| *event == "cancelled:1")
+                .count(),
+            1
+        );
+        assert!(!events.iter().any(|event| event == "discard:1"));
+        assert!(events.iter().any(|event| event == "complete:2:200"));
+    }
+
+    #[test]
+    fn cancellation_completion_race_emits_one_terminal_outcome() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let barrier = Arc::new(std::sync::Barrier::new(3));
+        let server_barrier = barrier.clone();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let _ = read_head(&mut stream);
+            server_barrier.wait();
+            let _ = stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok");
+        });
+        let observer = Arc::new(RecordingObserver::default());
+        let client = Client::builder()
+            .observer(observer.clone())
+            .build()
+            .unwrap();
+        let token = CancellationToken::new();
+        let request_token = token.clone();
+        let request = go(move || {
+            client
+                .get(&format!("http://127.0.0.1:{port}/race"))
+                .unwrap()
+                .cancellation_token(request_token)
+                .send_typed()
+        });
+        let cancel_barrier = barrier.clone();
+        let canceller = thread::spawn(move || {
+            cancel_barrier.wait();
+            token.cancel();
+        });
+        barrier.wait();
+
+        let result = request.join().unwrap();
+        if let Err(error) = result {
+            assert_eq!(error.kind(), ClientErrorKind::Cancelled);
+        }
+        canceller.join().unwrap();
+        server.join().unwrap();
+        let events = observer.events();
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| {
+                    event.starts_with("complete:")
+                        || event.starts_with("cancelled:")
+                        || event.starts_with("failed:")
+                        || event.starts_with("abandoned:")
+                })
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn streaming_response_rejects_implicit_redirect_following() {
+        let client = test_client(RedirectPolicy::SameOrigin { max_hops: 1 });
+        let error = client
+            .get("http://127.0.0.1:9/")
+            .unwrap()
+            .send_streaming()
+            .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+        assert!(error.to_string().contains("redirects"));
+    }
+
+    #[test]
+    fn stale_idle_connection_is_replaced_once_for_get() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = thread::spawn(move || {
+            let (mut stale, _) = listener.accept().unwrap();
+            assert!(read_head(&mut stale).starts_with("GET /first HTTP/1.1\r\n"));
+            stale
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok")
+                .unwrap();
+            stale.flush().unwrap();
+            // The connection dies after the client wrote its next request on it (the pool's
+            // idle check passed): the server reads that request and closes without answering.
+            let _ = read_head(&mut stale);
+            drop(stale);
+
+            let (mut replacement, _) = listener.accept().unwrap();
+            assert!(read_head(&mut replacement).starts_with("GET /second HTTP/1.1\r\n"));
+            replacement
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\nConnection: close\r\n\r\nfresh",
+                )
+                .unwrap();
+        });
+
+        let observer = Arc::new(RecordingObserver::default());
+        let client = Client::builder()
+            .redirect_policy(RedirectPolicy::None)
+            .request_timeout(Duration::from_secs(2))
+            .observer(observer.clone())
+            .build()
+            .unwrap();
+        assert_eq!(
+            client
+                .get(&format!("http://127.0.0.1:{port}/first"))
+                .unwrap()
+                .send()
+                .unwrap()
+                .body(),
+            b"ok"
+        );
+        assert_eq!(
+            client
+                .get(&format!("http://127.0.0.1:{port}/second"))
+                .unwrap()
+                .send()
+                .unwrap()
+                .body(),
+            b"fresh"
+        );
+        assert_eq!(client.stats().stale_retries, 1);
+        assert!(observer.events().iter().any(|event| event == "retry:2"));
+        server.join().unwrap();
+    }
+
+    #[derive(Clone, Default)]
+    struct AttemptHeader {
+        events: Arc<std::sync::Mutex<Vec<String>>>,
+    }
+
+    impl Interceptor for AttemptHeader {
+        fn before_send(&self, request: &mut OutgoingRequest<'_, '_>) {
+            let attempt = request.attempt();
+            self.events.lock().unwrap().push(format!(
+                "before:{}:{}:{}",
+                request.url().path(),
+                attempt,
+                request.reused_connection()
+            ));
+            request.headers_mut().insert(
+                HeaderName::from_static("x-attempt"),
+                HeaderValue::from(attempt),
+            );
+        }
+
+        fn after_response(&self, response: &ResponseHead<'_>, timing: &Timing) {
+            self.events.lock().unwrap().push(format!(
+                "after:{}:{}:{}",
+                response.status().as_u16(),
+                timing.attempt(),
+                timing.reused_connection()
+            ));
+        }
+
+        fn on_error(&self, _error: &io::Error, timing: &Timing) {
+            self.events
+                .lock()
+                .unwrap()
+                .push(format!("error:{}", timing.attempt()));
+        }
+    }
+
+    #[test]
+    fn interceptor_runs_on_every_attempt_including_the_stale_retry() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = thread::spawn(move || {
+            let (mut stale, _) = listener.accept().unwrap();
+            let first = read_head(&mut stale).to_ascii_lowercase();
+            assert!(first.contains("x-attempt: 1\r\n"), "{first}");
+            stale
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok")
+                .unwrap();
+            stale.flush().unwrap();
+            let _ = read_head(&mut stale);
+            drop(stale);
+
+            let (mut replacement, _) = listener.accept().unwrap();
+            let retried = read_head(&mut replacement).to_ascii_lowercase();
+            // The header set in before_send is per attempt: the retry carries its own value.
+            assert!(retried.contains("x-attempt: 2\r\n"), "{retried}");
+            assert_eq!(retried.matches("x-attempt").count(), 1, "{retried}");
+            replacement
+                .write_all(
+                    b"HTTP/1.1 201 Created\r\nContent-Length: 5\r\nConnection: close\r\n\r\nfresh",
+                )
+                .unwrap();
+        });
+
+        let interceptor = AttemptHeader::default();
+        let client = Client::builder()
+            .redirect_policy(RedirectPolicy::None)
+            .request_timeout(Duration::from_secs(2))
+            .build_with_interceptor(interceptor.clone())
+            .unwrap();
+        let first = client
+            .get(&format!("http://127.0.0.1:{port}/first"))
+            .unwrap()
+            .send()
+            .unwrap();
+        assert!(!first.reused_connection());
+        let second = client
+            .get(&format!("http://127.0.0.1:{port}/second"))
+            .unwrap()
+            .send()
+            .unwrap();
+        assert_eq!(second.body(), b"fresh");
+        assert!(!second.reused_connection());
+        server.join().unwrap();
+
+        let events = interceptor.events.lock().unwrap().clone();
+        assert_eq!(
+            events,
+            [
+                "before:/first:1:false",
+                "after:200:1:false",
+                "before:/second:1:true",
+                "error:1",
+                "before:/second:2:false",
+                "after:201:2:false",
+            ]
+        );
+    }
+
+    #[test]
+    fn with_interceptor_shares_the_pool_and_reports_reuse() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            for _ in 0..2 {
+                let _ = read_head(&mut stream);
+                stream
+                    .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok")
+                    .unwrap();
+                stream.flush().unwrap();
+            }
+        });
+
+        let plain = test_client(RedirectPolicy::None);
+        let interceptor = AttemptHeader::default();
+        let intercepted = plain.with_interceptor(interceptor.clone());
+        let url = format!("http://127.0.0.1:{port}/");
+        assert!(!plain.get(&url).unwrap().send().unwrap().reused_connection());
+        let streamed = intercepted.get(&url).unwrap().send_streaming().unwrap();
+        assert!(streamed.reused_connection());
+        drop(streamed);
+        assert_eq!(plain.stats().connections_created, 1);
+        assert_eq!(plain.stats().connections_reused, 1);
+        assert_eq!(
+            interceptor.events.lock().unwrap().clone(),
+            ["before:/:1:true", "after:200:1:true"]
+        );
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn stale_connection_retry_refreshes_attempt_metadata() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = thread::spawn(move || {
+            let (mut stale, _) = listener.accept().unwrap();
+            let prime = read_head(&mut stale).to_ascii_lowercase();
+            assert!(prime.contains("\r\nx-attempt: value-1\r\n"));
+            stale
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok")
+                .unwrap();
+            stale.flush().unwrap();
+            // The connection dies after the client wrote its next request on it (the pool's
+            // idle check passed): the server reads that request and closes without answering.
+            let _ = read_head(&mut stale);
+            drop(stale);
+
+            let (mut replacement, _) = listener.accept().unwrap();
+            let retried = read_head(&mut replacement).to_ascii_lowercase();
+            assert!(retried.starts_with("get /retry http/1.1\r\n"));
+            assert!(retried.contains("\r\nx-attempt: value-3\r\n"));
+            replacement
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\nConnection: close\r\n\r\nfresh",
+                )
+                .unwrap();
+        });
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let provider_calls = calls.clone();
+        let provider = Arc::new(move |_context: RequestMetadataContext<'_>| {
+            let call = provider_calls.fetch_add(1, Ordering::Relaxed) + 1;
+            Ok(RequestMetadata::new().header(
+                HeaderName::from_static("x-attempt"),
+                HeaderValue::from_str(&format!("value-{call}")).unwrap(),
+            ))
+        });
+        let observer = Arc::new(RecordingObserver::default());
+        let client = Client::builder()
+            .observer(observer.clone())
+            .request_metadata_provider(provider)
+            .build()
+            .unwrap();
+        client
+            .get(&format!("http://127.0.0.1:{port}/prime"))
+            .unwrap()
+            .send()
+            .unwrap();
+        assert_eq!(
+            client
+                .get(&format!("http://127.0.0.1:{port}/retry"))
+                .unwrap()
+                .send()
+                .unwrap()
+                .body(),
+            b"fresh"
+        );
+        server.join().unwrap();
+        assert_eq!(calls.load(Ordering::Relaxed), 3);
+        let events = observer.events();
+        assert!(events
+            .iter()
+            .any(|event| event == "metadata:2:1:0:false:None"));
+        assert!(events
+            .iter()
+            .any(|event| event == "metadata:2:2:0:true:None"));
+    }
+
+    #[test]
+    fn stale_idle_connection_does_not_retry_post() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = thread::spawn(move || {
+            let (mut stale, _) = listener.accept().unwrap();
+            let _ = read_head(&mut stale);
+            stale
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok")
+                .unwrap();
+            stale.flush().unwrap();
+            // The connection dies after the client wrote its next request on it (the pool's
+            // idle check passed): the server reads that request and closes without answering.
+            // The body is read too, so the close is a FIN: closing over unread bytes sends a
+            // reset, which Windows reports as an uncategorised error.
+            let _ = read_head(&mut stale);
+            let mut body = [0_u8; 11];
+            stale.read_exact(&mut body).unwrap();
+            drop(stale);
+
+            thread::sleep(Duration::from_millis(150));
+            listener.set_nonblocking(true).unwrap();
+            assert_eq!(
+                listener.accept().unwrap_err().kind(),
+                io::ErrorKind::WouldBlock,
+                "POST unexpectedly opened a retry connection"
+            );
+        });
+
+        let client = test_client(RedirectPolicy::None);
+        client
+            .get(&format!("http://127.0.0.1:{port}/prime"))
+            .unwrap()
+            .send()
+            .unwrap();
+        let error = client
+            .post(&format!("http://127.0.0.1:{port}/must-not-retry"))
+            .unwrap()
+            .body(b"side effect".to_vec())
+            .send()
+            .unwrap_err();
+        assert!(stale_connection_error(&error));
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn pool_capacity_waits_without_opening_a_second_connection() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let observer = Arc::new(RecordingObserver::default());
+        let client = Client::builder()
+            .max_connections(1)
+            .max_connections_per_origin(1)
+            .request_timeout(Duration::from_secs(2))
+            .observer(observer.clone())
+            .build()
+            .unwrap();
+        let watched = client.clone();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            for request in 0..2 {
+                let _ = read_head(&mut stream);
+                // Hold the first response until the second request is queued behind it. (A fixed
+                // 25 ms sleep raced the scheduler on a loaded host: the second request could start
+                // after the first had finished, and never wait.)
+                let deadline = Instant::now() + Duration::from_secs(1);
+                while request == 0 && watched.stats().pool_waits == 0 && Instant::now() < deadline {
+                    thread::sleep(Duration::from_millis(1));
+                }
+                stream
+                    .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok")
+                    .unwrap();
+                stream.flush().unwrap();
+            }
+        });
+        let first = client.clone();
+        let second = client.clone();
+        let one = go(move || {
+            first
+                .get(&format!("http://127.0.0.1:{port}/one"))
+                .unwrap()
+                .send()
+        });
+        let two = go(move || {
+            second
+                .get(&format!("http://127.0.0.1:{port}/two"))
+                .unwrap()
+                .send()
+        });
+        assert_eq!(one.join().unwrap().unwrap().body(), b"ok");
+        assert_eq!(two.join().unwrap().unwrap().body(), b"ok");
+        assert!(observer
+            .events()
+            .iter()
+            .any(|event| event.starts_with("wait:")));
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn cancellation_wakes_pool_wait_without_consuming_the_connection() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let (holding_tx, holding_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            assert!(read_head(&mut stream).starts_with("GET /hold HTTP/1.1\r\n"));
+            holding_tx.send(()).unwrap();
+            release_rx.recv().unwrap();
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok")
+                .unwrap();
+            stream.flush().unwrap();
+            assert!(read_head(&mut stream).starts_with("GET /after HTTP/1.1\r\n"));
+            stream
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\nConnection: close\r\n\r\nafter",
+                )
+                .unwrap();
+        });
+        let observer = Arc::new(RecordingObserver::default());
+        let client = Client::builder()
+            .max_connections(1)
+            .max_connections_per_origin(1)
+            .request_timeout(Duration::from_secs(2))
+            .observer(observer.clone())
+            .build()
+            .unwrap();
+        let holding_client = client.clone();
+        let holding = go(move || {
+            holding_client
+                .get(&format!("http://127.0.0.1:{port}/hold"))
+                .unwrap()
+                .send()
+        });
+        holding_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+
+        let token = CancellationToken::new();
+        let wait_token = token.clone();
+        let waiting_client = client.clone();
+        let waiting = go(move || {
+            waiting_client
+                .get(&format!("http://127.0.0.1:{port}/must-not-send"))
+                .unwrap()
+                .cancellation_token(wait_token)
+                .send_typed()
+        });
+        let wait_deadline = Instant::now() + Duration::from_secs(1);
+        while client.stats().pool_waits == 0 && Instant::now() < wait_deadline {
+            thread::sleep(Duration::from_millis(1));
+        }
+        assert_eq!(client.stats().pool_waits, 1);
+        assert!(token.cancel());
+        assert_eq!(
+            waiting.join().unwrap().unwrap_err().kind(),
+            ClientErrorKind::Cancelled
+        );
+
+        release_tx.send(()).unwrap();
+        assert_eq!(holding.join().unwrap().unwrap().body(), b"ok");
+        assert_eq!(
+            client
+                .get(&format!("http://127.0.0.1:{port}/after"))
+                .unwrap()
+                .send()
+                .unwrap()
+                .body(),
+            b"after"
+        );
+        server.join().unwrap();
+        assert!(observer.events().iter().any(|event| event == "cancelled:2"));
+    }
+
+    #[test]
+    fn cancelled_request_releases_pool_capacity() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let (blocked_tx, blocked_rx) = std::sync::mpsc::channel();
+        let server = thread::spawn(move || {
+            let (mut blocked, _) = listener.accept().unwrap();
+            let _ = read_head(&mut blocked);
+            blocked_tx.send(()).unwrap();
+            thread::sleep(Duration::from_millis(100));
+            drop(blocked);
+
+            let (mut replacement, _) = listener.accept().unwrap();
+            let request = read_head(&mut replacement);
+            assert!(request.starts_with("GET /after-cancel HTTP/1.1\r\n"));
+            replacement
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok")
+                .unwrap();
+        });
+
+        let client = Client::builder()
+            .max_connections(1)
+            .max_connections_per_origin(1)
+            .request_timeout(Duration::from_secs(2))
+            .build()
+            .unwrap();
+        let blocked_client = client.clone();
+        let blocked = go(move || {
+            blocked_client
+                .get(&format!("http://127.0.0.1:{port}/blocked"))
+                .unwrap()
+                .send()
+        });
+        blocked_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        unsafe { blocked.coroutine().cancel() };
+        assert!(blocked.join().is_err());
+
+        let response = client
+            .get(&format!("http://127.0.0.1:{port}/after-cancel"))
+            .unwrap()
+            .send()
+            .unwrap();
+        assert_eq!(response.body(), b"ok");
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn redirects_are_disabled_by_default() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let request = read_head(&mut stream);
+            assert!(request.starts_with("GET /start HTTP/1.1\r\n"));
+            stream
+                .write_all(
+                    b"HTTP/1.1 302 Found\r\nLocation: /final\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                )
+                .unwrap();
+        });
+
+        let response = test_client(RedirectPolicy::None)
+            .get(&format!("http://127.0.0.1:{port}/start"))
+            .unwrap()
+            .send()
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::FOUND);
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn same_origin_redirect_resolves_relative_location() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            assert!(read_head(&mut stream).starts_with("GET /start HTTP/1.1\r\n"));
+            stream
+                .write_all(b"HTTP/1.1 302 Found\r\nLocation: /final\r\nContent-Length: 0\r\n\r\n")
+                .unwrap();
+            stream.flush().unwrap();
+            assert!(read_head(&mut stream).starts_with("GET /final HTTP/1.1\r\n"));
+            stream
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\nConnection: close\r\n\r\ndone!",
+                )
+                .unwrap();
+        });
+
+        let observer = Arc::new(RecordingObserver::default());
+        let client = Client::builder()
+            .redirect_policy(RedirectPolicy::SameOrigin { max_hops: 3 })
+            .request_timeout(Duration::from_secs(2))
+            .observer(observer.clone())
+            .build()
+            .unwrap();
+        let response = client
+            .get(&format!("http://127.0.0.1:{port}/start"))
+            .unwrap()
+            .send()
+            .unwrap();
+        assert_eq!(response.body(), b"done!");
+        assert_eq!(response.final_url().path(), "/final");
+        let events = observer.events();
+        let redirect = events
+            .iter()
+            .position(|event| event == "redirect:1:302")
+            .unwrap();
+        let completed = events
+            .iter()
+            .position(|event| event == "complete:1:200")
+            .unwrap();
+        assert!(redirect < completed);
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn temporary_redirect_replays_buffered_post_body() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            for (path, redirect) in [("/start", true), ("/final", false)] {
+                let head = read_head(&mut stream);
+                assert!(head.starts_with(&format!("POST {path} HTTP/1.1\r\n")));
+                assert!(head.to_ascii_lowercase().contains("content-length: 4\r\n"));
+                let mut body = [0_u8; 4];
+                stream.read_exact(&mut body).unwrap();
+                assert_eq!(&body, b"data");
+                if redirect {
+                    stream
+                        .write_all(
+                            b"HTTP/1.1 307 Temporary Redirect\r\nLocation: /final\r\nContent-Length: 0\r\n\r\n",
+                        )
+                        .unwrap();
+                    stream.flush().unwrap();
+                } else {
+                    stream
+                        .write_all(
+                            b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok",
+                        )
+                        .unwrap();
+                }
+            }
+        });
+
+        let response = test_client(RedirectPolicy::SameOrigin { max_hops: 2 })
+            .post(&format!("http://127.0.0.1:{port}/start"))
+            .unwrap()
+            .body(b"data".to_vec())
+            .send()
+            .unwrap();
+        assert_eq!(response.body(), b"ok");
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn streaming_reader_is_sent_once_and_rejected_for_replay_redirect() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let head = read_head(&mut stream);
+            assert!(head.starts_with("POST /start HTTP/1.1\r\n"));
+            assert!(head.to_ascii_lowercase().contains("content-length: 4\r\n"));
+            let mut body = [0_u8; 4];
+            stream.read_exact(&mut body).unwrap();
+            assert_eq!(&body, b"data");
+            stream
+                .write_all(
+                    b"HTTP/1.1 307 Temporary Redirect\r\nLocation: /again\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                )
+                .unwrap();
+        });
+
+        let error = test_client(RedirectPolicy::SameOrigin { max_hops: 2 })
+            .post(&format!("http://127.0.0.1:{port}/start"))
+            .unwrap()
+            .reader(std::io::Cursor::new(b"data".to_vec()), 4)
+            .send_typed()
+            .unwrap_err();
+        assert_eq!(error.kind(), ClientErrorKind::BodyNotReplayable);
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn cross_origin_redirect_strips_credentials() {
+        let target = TcpListener::bind("127.0.0.1:0").unwrap();
+        let target_port = target.local_addr().unwrap().port();
+        let source = TcpListener::bind("127.0.0.1:0").unwrap();
+        let source_port = source.local_addr().unwrap().port();
+        let source_server = thread::spawn(move || {
+            let (mut stream, _) = source.accept().unwrap();
+            let request = read_head(&mut stream).to_ascii_lowercase();
+            assert!(request.contains("\r\nx-service-token: token-1\r\n"));
+            assert!(request.contains("\r\nx-trace: trace-1\r\n"));
+            write!(
+                stream,
+                "HTTP/1.1 302 Found\r\nLocation: http://127.0.0.1:{target_port}/final\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+            )
+            .unwrap();
+        });
+        let target_server = thread::spawn(move || {
+            let (mut stream, _) = target.accept().unwrap();
+            let request = read_head(&mut stream).to_ascii_lowercase();
+            assert!(!request.contains("\r\nauthorization:"));
+            assert!(!request.contains("\r\ncookie:"));
+            assert!(!request.contains("\r\nx-secret:"));
+            assert!(!request.contains("\r\nx-service-token:"));
+            assert!(request.contains("\r\nx-trace: trace-2\r\n"));
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok")
+                .unwrap();
+        });
+
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let provider_calls = calls.clone();
+        let provider = Arc::new(move |context: RequestMetadataContext<'_>| {
+            let call = provider_calls.fetch_add(1, Ordering::Relaxed) + 1;
+            assert_eq!(context.attempt as usize, call);
+            assert_eq!(context.redirect_hop + 1, call);
+            Ok(RequestMetadata::new()
+                .header(
+                    HeaderName::from_static("x-service-token"),
+                    HeaderValue::from_str(&format!("token-{call}")).unwrap(),
+                )
+                .sensitive_header(HeaderName::from_static("x-service-token"))
+                .header(
+                    HeaderName::from_static("x-trace"),
+                    HeaderValue::from_str(&format!("trace-{call}")).unwrap(),
+                ))
+        });
+        let observer = Arc::new(RecordingObserver::default());
+        let response = Client::builder()
+            .redirect_policy(RedirectPolicy::CrossOrigin {
+                max_hops: 3,
+                allow_https_downgrade: false,
+            })
+            .sensitive_header(HeaderName::from_static("x-secret"))
+            .request_metadata_provider(provider)
+            .observer(observer.clone())
+            .request_timeout(Duration::from_secs(2))
+            .build()
+            .unwrap()
+            .get(&format!("http://127.0.0.1:{source_port}/start"))
+            .unwrap()
+            .header(AUTHORIZATION, HeaderValue::from_static("Bearer secret"))
+            .header(COOKIE, HeaderValue::from_static("session=secret"))
+            .header(
+                HeaderName::from_static("x-secret"),
+                HeaderValue::from_static("hidden"),
+            )
+            .send()
+            .unwrap();
+        assert_eq!(response.body(), b"ok");
+        source_server.join().unwrap();
+        target_server.join().unwrap();
+        assert_eq!(calls.load(Ordering::Relaxed), 2);
+        assert!(observer
+            .events()
+            .iter()
+            .any(|event| event == "metadata:1:2:1:false:None"));
+    }
+}

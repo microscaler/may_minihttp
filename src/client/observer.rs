@@ -1,0 +1,160 @@
+//! Request lifecycle observations for service-client integrations.
+
+use std::time::Duration;
+
+use http::{Method, StatusCode};
+
+use super::resolver::ResolutionSource;
+use super::rich::ClientErrorKind;
+
+/// Sanitized network origin exposed to client observers.
+///
+/// Paths, query strings, user information, and headers are deliberately absent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ObservedOrigin<'a> {
+    pub scheme: &'a str,
+    pub host: &'a str,
+    pub port: u16,
+}
+
+/// One synchronous observation from an HTTP request lifecycle.
+///
+/// Event values borrow request state only for the duration of [`ClientObserver::observe`].
+/// Implementations that retain data must copy only the fields they actually need.
+#[derive(Debug, Clone, Copy)]
+#[non_exhaustive]
+pub enum ClientEvent<'a> {
+    RequestStarted {
+        request_id: u64,
+        method: &'a Method,
+        origin: ObservedOrigin<'a>,
+    },
+    RequestMetadataCompleted {
+        request_id: u64,
+        origin: ObservedOrigin<'a>,
+        attempt: u32,
+        redirect_hop: usize,
+        stale_retry: bool,
+        duration: Duration,
+        error: Option<ClientErrorKind>,
+    },
+    TlsConfigCompleted {
+        request_id: u64,
+        duration: Duration,
+        generation: Option<u64>,
+        fallback_used: bool,
+        error: Option<ClientErrorKind>,
+    },
+    TlsGenerationChanged {
+        request_id: u64,
+        previous_generation: u64,
+        generation: u64,
+        retired_idle_connections: usize,
+    },
+    PoolWaited {
+        request_id: u64,
+        origin: ObservedOrigin<'a>,
+        duration: Duration,
+        timed_out: bool,
+    },
+    DnsCompleted {
+        request_id: u64,
+        origin: ObservedOrigin<'a>,
+        duration: Duration,
+        address_count: usize,
+        source: Option<ResolutionSource>,
+        error: Option<ClientErrorKind>,
+    },
+    ConnectionCompleted {
+        request_id: u64,
+        origin: ObservedOrigin<'a>,
+        duration: Duration,
+        tls: bool,
+        error: Option<ClientErrorKind>,
+    },
+    ConnectionReused {
+        request_id: u64,
+        origin: ObservedOrigin<'a>,
+    },
+    ConnectionDiscarded {
+        request_id: u64,
+        origin: ObservedOrigin<'a>,
+    },
+    /// The pool handed out a connection: reused, newly connected (DNS and connect included), or
+    /// after waiting for one. One per attempt.
+    CheckoutCompleted {
+        request_id: u64,
+        origin: ObservedOrigin<'a>,
+        duration: Duration,
+        reused: bool,
+        error: Option<ClientErrorKind>,
+    },
+    /// The request head and body were written to the connection.
+    RequestWritten {
+        request_id: u64,
+        origin: ObservedOrigin<'a>,
+        duration: Duration,
+        error: Option<ClientErrorKind>,
+    },
+    /// From the request being written to the response head being read: the server's time plus
+    /// the network, as the client sees it.
+    ResponseHeadersReceived {
+        request_id: u64,
+        origin: ObservedOrigin<'a>,
+        duration: Duration,
+        error: Option<ClientErrorKind>,
+    },
+    /// The response body was read in full by the buffered client (`send`). Streaming responses
+    /// are read by the caller, which times them itself.
+    ResponseBodyRead {
+        request_id: u64,
+        origin: ObservedOrigin<'a>,
+        duration: Duration,
+        bytes: usize,
+        error: Option<ClientErrorKind>,
+    },
+    ResponseHeaders {
+        request_id: u64,
+        origin: ObservedOrigin<'a>,
+        status: StatusCode,
+        elapsed: Duration,
+    },
+    RedirectFollowed {
+        request_id: u64,
+        status: StatusCode,
+        from: ObservedOrigin<'a>,
+        to: ObservedOrigin<'a>,
+    },
+    StaleConnectionRetried {
+        request_id: u64,
+        origin: ObservedOrigin<'a>,
+    },
+    RequestCompleted {
+        request_id: u64,
+        status: StatusCode,
+        total_duration: Duration,
+    },
+    RequestFailed {
+        request_id: u64,
+        error: ClientErrorKind,
+        total_duration: Duration,
+    },
+    RequestCancelled {
+        request_id: u64,
+        total_duration: Duration,
+    },
+    RequestAbandoned {
+        request_id: u64,
+        status: StatusCode,
+        total_duration: Duration,
+    },
+}
+
+/// Receives request lifecycle observations.
+///
+/// Callbacks run synchronously and never while the client holds its pool or transport lock. They
+/// cannot alter request control flow. Implementations should return quickly and must apply their
+/// own panic and latency policy.
+pub trait ClientObserver: Send + Sync {
+    fn observe(&self, event: ClientEvent<'_>);
+}
