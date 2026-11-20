@@ -7,6 +7,7 @@ use std::net::ToSocketAddrs;
 
 use crate::request::{self, Request};
 use crate::response::{self, Response};
+use crate::upgrade::{OnUpgrade, Upgraded};
 
 #[cfg(unix)]
 use bytes::Buf;
@@ -208,6 +209,7 @@ fn each_connection_loop_with_headers<T: HttpService, const N: usize>(
         let mut streamed = false;
         timing.read(buffered, req_buf.len());
         let mut refused = None;
+        let mut upgrade = None;
 
         // prepare the requests, we should make sure the request is fully read
         loop {
@@ -231,6 +233,10 @@ fn each_connection_loop_with_headers<T: HttpService, const N: usize>(
             let called = service.call(req, &mut rsp);
             streamed |= rsp.is_streamed();
             timing.served(called.is_ok());
+            if let Some(on_upgrade) = rsp.take_upgrade() {
+                upgrade = encode_upgrade(rsp, called, on_upgrade, &close, &mut rsp_buf);
+                break;
+            }
             match called {
                 Ok(()) => response::encode(rsp, &mut rsp_buf),
                 Err(e) => {
@@ -243,6 +249,9 @@ fn each_connection_loop_with_headers<T: HttpService, const N: usize>(
             }
         }
 
+        if let Some(on_upgrade) = upgrade {
+            return switch_protocols(stream, &mut rsp_buf, &mut req_buf, on_upgrade);
+        }
         timing.incomplete(req_buf.len());
         if let Some(e) = refused {
             return refuse(stream, &mut rsp_buf, e);
@@ -283,6 +292,54 @@ fn refuse(stream: &mut TcpStream, rsp_buf: &mut BytesMut, error: io::Error) -> i
         }
         None => Err(error),
     }
+}
+
+/// Encode the response to a request whose service called [`Response::upgrade`]. Returns the
+/// upgrade closure when the connection switches; otherwise queues the response the request gets
+/// instead and marks the connection to close.
+fn encode_upgrade(
+    rsp: Response,
+    called: io::Result<()>,
+    on_upgrade: OnUpgrade,
+    close: &Cell<bool>,
+    rsp_buf: &mut BytesMut,
+) -> Option<OnUpgrade> {
+    match called {
+        // The request body was read to its end: the bytes after it belong to the new protocol.
+        Ok(()) if !close.get() => {
+            response::encode(rsp, rsp_buf);
+            Some(on_upgrade)
+        }
+        // The body could not be delimited, so where the new protocol starts is unknown.
+        Ok(()) => {
+            drop(rsp);
+            debug!("upgrade refused: the request body was not read to its end");
+            response::encode_rejection(400, rsp_buf);
+            None
+        }
+        Err(e) => {
+            drop(rsp);
+            eprintln!("service err = {e:?}");
+            response::encode_error(e, rsp_buf);
+            close.set(true);
+            None
+        }
+    }
+}
+
+/// Write the queued responses (the 101 last), then run the upgrade on the connection. HTTP is not
+/// read on it again; the caller closes it when this returns.
+fn switch_protocols(
+    stream: &mut TcpStream,
+    rsp_buf: &mut BytesMut,
+    req_buf: &mut BytesMut,
+    on_upgrade: OnUpgrade,
+) -> io::Result<()> {
+    stream.write_all(rsp_buf)?;
+    stream.flush()?;
+    rsp_buf.clear();
+    let buffered = req_buf.split();
+    on_upgrade(Upgraded::new(stream, buffered))
 }
 
 /// Write everything queued, then end the connection: no further request on it is read.
@@ -331,6 +388,7 @@ fn each_connection_loop_with_headers<T: HttpService, const N: usize>(
     let mut kv_buf = BytesMut::with_capacity(512);
     let close = Cell::new(false);
     let mut refused = None;
+    let mut upgrade = None;
     loop {
         // read the socket for requests
         reserve_buf(&mut req_buf);
@@ -360,7 +418,12 @@ fn each_connection_loop_with_headers<T: HttpService, const N: usize>(
                     }
                 };
                 let mut rsp = Response::new(&mut body_buf, &mut kv_buf);
-                match service.call(req, &mut rsp) {
+                let called = service.call(req, &mut rsp);
+                if let Some(on_upgrade) = rsp.take_upgrade() {
+                    upgrade = encode_upgrade(rsp, called, on_upgrade, &close, &mut rsp_buf);
+                    break;
+                }
+                match called {
                     Ok(()) => response::encode(rsp, &mut rsp_buf),
                     Err(e) => {
                         eprintln!("service err = {:?}", e);
@@ -371,6 +434,9 @@ fn each_connection_loop_with_headers<T: HttpService, const N: usize>(
                     break;
                 }
             }
+        }
+        if let Some(on_upgrade) = upgrade.take() {
+            return switch_protocols(stream, &mut rsp_buf, &mut req_buf, on_upgrade);
         }
         if let Some(e) = refused.take() {
             return refuse(stream, &mut rsp_buf, e);

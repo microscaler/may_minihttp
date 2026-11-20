@@ -74,6 +74,8 @@ jobs:
               --test request_parsing \
               --test simple_header_test \
               --test http_hardening \
+              --test server_upgrade \
+              --test websocket_upgrade \
               --message-format libtest-json \
               2>&1 \
             > target/nextest/unit-${{ matrix.name }}-${{ matrix.os }}.json

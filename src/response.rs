@@ -2,6 +2,7 @@ use std::borrow::Cow;
 use std::io::{self, Write};
 
 use crate::request::MAX_HEADERS;
+use crate::upgrade::{OnUpgrade, Upgraded};
 
 use bytes::BytesMut;
 use may::net::TcpStream;
@@ -118,6 +119,8 @@ pub struct Response<'a> {
     /// When true, headers/body were already written to the socket (chunked/SSE).
     /// [`encode`] becomes a no-op so the connection loop does not double-write.
     streamed: bool,
+    /// Set by [`Response::upgrade`]: once this 101 is written the connection runs it.
+    on_upgrade: Option<OnUpgrade>,
 }
 
 enum Body {
@@ -145,6 +148,7 @@ impl<'a> Response<'a> {
             rsp_buf,
             kv_head,
             streamed: false,
+            on_upgrade: None,
         }
     }
 
@@ -152,6 +156,63 @@ impl<'a> Response<'a> {
     #[inline]
     pub fn is_streamed(&self) -> bool {
         self.streamed
+    }
+
+    /// `true` when [`Self::upgrade`] was called: the connection switches protocols after this response.
+    #[inline]
+    pub fn is_upgrade(&self) -> bool {
+        self.on_upgrade.is_some()
+    }
+
+    /// Answer with `101 Switching Protocols` to `protocol`, and run `on_upgrade` on the connection
+    /// once the 101 is written.
+    ///
+    /// Sets the status, `Upgrade: <protocol>` and `Connection: Upgrade`; add any headers the
+    /// protocol needs (a WebSocket `Sec-WebSocket-Accept`) with [`Self::header`] or
+    /// [`Self::header_kv`]. A body set on this response is not sent: a 101 has none.
+    ///
+    /// The server loop writes the responses still queued for earlier pipelined requests, then this
+    /// 101, then calls `on_upgrade` with the [`Upgraded`] connection on the connection's own
+    /// coroutine. HTTP is not parsed on the connection again; it closes when `on_upgrade`
+    /// returns. Checking that the request asked for this protocol (`Upgrade`,
+    /// `Connection: upgrade`, `Sec-WebSocket-Key`...) is the caller's, before calling this.
+    ///
+    /// The upgrade does not happen, and the connection closes after this response, when the
+    /// request's body could not be read to its end (the connection's position in the byte stream
+    /// is unknown) or when `call` returns an error (that error's 500 is sent instead).
+    ///
+    /// ```ignore
+    /// fn call(&mut self, req: Request, rsp: &mut Response) -> io::Result<()> {
+    ///     let accept = websocket_accept(&req)?; // the caller's protocol check
+    ///     rsp.header_kv("Sec-WebSocket-Accept", &accept);
+    ///     rsp.upgrade("websocket", |conn| {
+    ///         let mut ws = tungstenite::WebSocket::from_raw_socket(conn, Role::Server, None);
+    ///         // ... frame messages on `ws` until the session ends
+    ///         Ok(())
+    ///     });
+    ///     Ok(())
+    /// }
+    /// ```
+    pub fn upgrade<F>(&mut self, protocol: &str, on_upgrade: F) -> &mut Self
+    where
+        F: FnOnce(Upgraded<'_>) -> io::Result<()> + 'static,
+    {
+        self.status_message = StatusMessage {
+            code: 101,
+            msg: "Switching Protocols",
+        };
+        self.header_kv("Upgrade", protocol);
+        self.header_kv("Connection", "Upgrade");
+        self.body = Body::Dummy;
+        self.rsp_buf.clear();
+        self.on_upgrade = Some(Box::new(on_upgrade));
+        self
+    }
+
+    /// The upgrade closure, taken by the server loop before the response is encoded.
+    #[inline]
+    pub(crate) fn take_upgrade(&mut self) -> Option<OnUpgrade> {
+        self.on_upgrade.take()
     }
 
     #[inline]
@@ -400,7 +461,9 @@ fn write_status_and_headers(rsp: &Response<'_>, buf: &mut BytesMut, chunked: boo
         buf.extend_from_slice(b"\r\nServer: M\r\nDate: ");
     }
     crate::date::append_date(buf);
-    if chunked {
+    if rsp.status_message.code == 101 {
+        // RFC 9110 §8.6: no Content-Length in a 1xx response; it has no body.
+    } else if chunked {
         buf.extend_from_slice(b"\r\nTransfer-Encoding: chunked");
     } else {
         buf.extend_from_slice(b"\r\nContent-Length: ");
@@ -424,7 +487,9 @@ pub(crate) fn encode(mut rsp: Response, buf: &mut BytesMut) {
         return;
     }
     write_status_and_headers(&rsp, buf, /*chunked=*/ false);
-    buf.extend_from_slice(rsp.get_body());
+    if rsp.status_message.code != 101 {
+        buf.extend_from_slice(rsp.get_body());
+    }
 }
 
 /// The response to a request refused before the service saw it; the connection closes after it.

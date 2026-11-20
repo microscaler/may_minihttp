@@ -6,6 +6,7 @@ mod http_server;
 mod request;
 mod response;
 mod server_timing;
+mod upgrade;
 
 #[cfg(feature = "client")]
 pub mod client;
@@ -16,3 +17,4 @@ pub use request::{
     MaxHeaders, RejectedRequest, Request, MAX_REQUEST_HEAD_BYTES,
 };
 pub use response::{ChunkedBodyWriter, IntoResponseHeader, Response, ResponseHeader};
+pub use upgrade::Upgraded;
