@@ -18,6 +18,7 @@ mod rich;
 mod shared;
 mod tls;
 mod trace;
+mod upgrade;
 
 pub use cancellation::CancellationToken;
 pub use client_impl::HttpClient;
@@ -36,3 +37,4 @@ pub use rich::{
     RedirectPolicy, RequestBuilder, StreamingResponse,
 };
 pub use tls::{TlsConfigFailurePolicy, TlsConfigProvider, TlsConfigSnapshot};
+pub use upgrade::{Upgrade, Upgraded};
