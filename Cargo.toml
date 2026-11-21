@@ -33,6 +33,8 @@ serde_json = { version = "1", optional = true }
 tracing = { version = "0.1", default-features = false, features = ["std"], optional = true }
 
 [dev-dependencies]
+# tests/websocket_upgrade.rs: a real WebSocket on Response::upgrade (server framing; the test's client handshake).
+tungstenite = { version = "0.29", default-features = false, features = ["handshake"] }
 atoi = "3"
 num_cpus = "1.0"
 smallvec = "1.1"
