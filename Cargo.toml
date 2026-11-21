@@ -61,7 +61,10 @@ tracing-subscriber = { version = "0.3", default-features = false, features = ["r
 libc = { version = "0.2", optional = true }
 
 [target.'cfg(unix)'.dev-dependencies]
-may_postgres = { git = "https://github.com/Xudong-Huang/may_postgres.git", default-features = false }
+# The microscaler fork from its mpsc response-channel fix on (v0.1.2, microscaler/may_postgres#9): may 0.3.52 made
+# spsc::Sender !Sync and every may_postgres before that fix stops compiling (upstream master included), and an
+# unpinned git dev-dependency breaks this repository's CI whenever it moves.
+may_postgres = { git = "https://github.com/microscaler/may_postgres.git", tag = "v0.1.2", default-features = false }
 
 [features]
 default = ["may/default"]
