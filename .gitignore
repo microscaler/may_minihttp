@@ -1,4 +1,6 @@
 
 /target/
 **/*.rs.bk
+._*
+**/._*
 Cargo.lock
