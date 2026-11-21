@@ -12,6 +12,7 @@ use rustls::{ClientConfig, ClientConnection, StreamOwned};
 use rustls_platform_verifier::BuilderVerifierExt;
 
 use super::shared::{SharedStream, Transport};
+use super::upgrade::{check_switched_response, check_upgrade_request, Upgrade, Upgraded};
 use crate::client::{MultipartForm, Request, Response};
 
 /// Coroutine HTTP/1.1 client with native HTTP and rustls-backed HTTPS transports.
@@ -394,6 +395,32 @@ impl HttpClient {
     pub fn send_request(&mut self, req: Request) -> io::Result<Response> {
         self.write_request(req)?;
         self.get_rsp()
+    }
+
+    /// Send a request that asks to switch protocols, and on `101 Switching Protocols` return the
+    /// connection itself (a WebSocket opening handshake, say).
+    ///
+    /// The request must carry an `Upgrade` header and `Connection: upgrade`; without them nothing
+    /// is sent and the error is `InvalidInput`. A 101 must name its protocol in `Upgrade`
+    /// (`InvalidData` otherwise). Any final response is returned as [`Upgrade::Refused`], body
+    /// unread. The client is consumed either way: after an upgrade the connection no longer
+    /// speaks HTTP, and after a refusal it is the response's to finish.
+    pub fn upgrade(mut self, mut req: Request) -> io::Result<Upgrade> {
+        if let Err(error) = check_upgrade_request(req.headers()) {
+            // A dropped, unfinished request writes its head (compatibility); this one must not go out.
+            req.abort();
+            return Err(error);
+        }
+        self.write_request(req)?;
+        let response = self.get_rsp()?;
+        if response.status() != http::StatusCode::SWITCHING_PROTOCOLS {
+            return Ok(Upgrade::Refused(response));
+        }
+        check_switched_response(&response)?;
+        Ok(Upgrade::Switched {
+            response,
+            stream: Upgraded::new(self.conn.clone()),
+        })
     }
 
     /// The first half of [`send_request`](Self::send_request): finish writing the request.
