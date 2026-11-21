@@ -3238,7 +3238,11 @@ mod tests {
                 .unwrap();
         });
         let resolver = Arc::new(ServiceResolver::default());
-        let unavailable = SocketAddr::from(([127, 0, 0, 2], address.port()));
+        // IPv6 loopback on the same port (the listener is IPv4 only): nothing listens there, so the
+        // connect fails at once on every platform (refused, or unreachable where IPv6 is off).
+        // 127.0.0.2 is only routed to loopback on Linux; on macOS (lo0 carries 127.0.0.1 alone) a
+        // connect to it waits out the whole connect deadline, so the second address was never tried.
+        let unavailable = SocketAddr::from((std::net::Ipv6Addr::LOCALHOST, address.port()));
         resolver
             .update(
                 "identity.internal",
