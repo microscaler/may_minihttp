@@ -521,6 +521,7 @@ struct RequestTrace {
 }
 
 struct StreamingExecution<'a> {
+    allow_stale_retry: bool,
     deadline: Instant,
     trace: &'a RequestTrace,
     cancellation: Option<CancellationToken>,
@@ -547,6 +548,7 @@ struct AttemptInfo<'a> {
 }
 
 struct AttemptExecution<'a> {
+    allow_stale_retry: bool,
     deadline: Instant,
     trace: &'a RequestTrace,
     attempt: &'a mut u32,
@@ -591,6 +593,7 @@ impl<I: Interceptor> Client<I> {
             body: RequestBody::Empty,
             timeout: None,
             cancellation: None,
+            stale_retry: true,
         })
     }
 
@@ -642,6 +645,7 @@ impl<I: Interceptor> Client<I> {
             .ok_or_else(|| {
                 io::Error::new(io::ErrorKind::InvalidInput, "request timeout overflow")
             })?;
+        let allow_stale_retry = request.stale_retry;
         let mut method = request.method;
         let mut url = request.url;
         let mut headers = request.headers;
@@ -667,6 +671,7 @@ impl<I: Interceptor> Client<I> {
                 &headers,
                 &mut body,
                 AttemptExecution {
+                    allow_stale_retry,
                     deadline,
                     trace,
                     attempt: &mut attempt,
@@ -806,6 +811,7 @@ impl<I: Interceptor> Client<I> {
             &request.headers,
             &mut body,
             StreamingExecution {
+                allow_stale_retry: request.stale_retry,
                 deadline,
                 trace,
                 cancellation,
@@ -825,6 +831,7 @@ impl<I: Interceptor> Client<I> {
         execution: AttemptExecution<'_>,
     ) -> io::Result<BufferedResponse> {
         let AttemptExecution {
+            allow_stale_retry,
             deadline,
             trace,
             attempt,
@@ -836,7 +843,8 @@ impl<I: Interceptor> Client<I> {
         validate_body_method(method, body)?;
         let (tls_generation, tls_config) = self.tls_for_url(url, trace, tls_snapshot)?;
         let key = OriginKey::from_url(url, tls_generation)?;
-        let mut stale_retry_available = method_is_idempotent(method) && body.is_replayable();
+        let mut stale_retry_available =
+            allow_stale_retry && method_is_idempotent(method) && body.is_replayable();
         let mut stale_retry = false;
         loop {
             *attempt = attempt.checked_add(1).ok_or_else(|| {
@@ -1042,6 +1050,7 @@ impl<I: Interceptor> Client<I> {
         execution: StreamingExecution<'_>,
     ) -> io::Result<StreamingResponse> {
         let StreamingExecution {
+            allow_stale_retry,
             deadline,
             trace,
             cancellation,
@@ -1052,7 +1061,8 @@ impl<I: Interceptor> Client<I> {
         validate_body_method(method, body)?;
         let (tls_generation, tls_config) = self.tls_for_url(url, trace, tls_snapshot)?;
         let key = OriginKey::from_url(url, tls_generation)?;
-        let mut stale_retry_available = method_is_idempotent(method) && body.is_replayable();
+        let mut stale_retry_available =
+            allow_stale_retry && method_is_idempotent(method) && body.is_replayable();
         let mut stale_retry = false;
         loop {
             *attempt = attempt.checked_add(1).ok_or_else(|| {
@@ -1779,9 +1789,24 @@ pub struct RequestBuilder<I = NoInterceptor> {
     body: RequestBody,
     timeout: Option<Duration>,
     cancellation: Option<CancellationToken>,
+    /// Whether the pool may resend this request on a fresh connection when a reused one turns out
+    /// dead ([`RequestBuilder::stale_retry`]).
+    stale_retry: bool,
 }
 
 impl<I: Interceptor> RequestBuilder<I> {
+    /// Whether the pool may resend this request on a fresh connection when the reused connection
+    /// it was written to turns out dead. On by default for idempotent methods with a replayable
+    /// body (GET, HEAD, PUT, DELETE, OPTIONS, TRACE). Turn it off for a request whose effect must
+    /// happen at most once even though its method is idempotent - a DELETE that cancels an order,
+    /// where a second send that finds the order already cancelling answers with an error and hides
+    /// the first send's success. With it off, such a failure is returned to the caller, who knows
+    /// the request may have been received.
+    pub fn stale_retry(mut self, allow: bool) -> Self {
+        self.stale_retry = allow;
+        self
+    }
+
     pub fn header(mut self, name: HeaderName, value: HeaderValue) -> Self {
         self.headers.append(name, value);
         self
@@ -4684,6 +4709,46 @@ mod tests {
             .post(&format!("http://127.0.0.1:{port}/must-not-retry"))
             .unwrap()
             .body(b"side effect".to_vec())
+            .send()
+            .unwrap_err();
+        assert!(stale_connection_error(&error));
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn stale_retry_off_does_not_resend_a_delete() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = thread::spawn(move || {
+            let (mut stale, _) = listener.accept().unwrap();
+            let _ = read_head(&mut stale);
+            stale
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok")
+                .unwrap();
+            stale.flush().unwrap();
+            // the DELETE arrives on the reused connection, which dies before the answer
+            let _ = read_head(&mut stale);
+            drop(stale);
+
+            thread::sleep(Duration::from_millis(150));
+            listener.set_nonblocking(true).unwrap();
+            assert_eq!(
+                listener.accept().unwrap_err().kind(),
+                io::ErrorKind::WouldBlock,
+                "the DELETE was resent on a retry connection"
+            );
+        });
+
+        let client = test_client(RedirectPolicy::None);
+        client
+            .get(&format!("http://127.0.0.1:{port}/prime"))
+            .unwrap()
+            .send()
+            .unwrap();
+        let error = client
+            .request(Method::DELETE, &format!("http://127.0.0.1:{port}/orders/1"))
+            .unwrap()
+            .stale_retry(false)
             .send()
             .unwrap_err();
         assert!(stale_connection_error(&error));
