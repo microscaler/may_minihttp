@@ -42,6 +42,118 @@ fn main() {
 }
 ```
 
+### Native HTTP/HTTPS client
+
+Enable the `client` feature to use the coroutine-native HTTP/1.1 client. Absolute `http://` URLs
+use a plain `may::net::TcpStream`; absolute `https://` URLs use rustls with the platform certificate
+verifier and the ring crypto provider.
+
+```toml
+[dependencies]
+may_minihttp = { version = "0.1", features = ["client"] }
+```
+
+```rust,no_run
+use may_minihttp::client::HttpClient;
+
+let mut client = HttpClient::from_url("https://identity.example.com")?;
+let response = client.get("/health".parse()?)?;
+# Ok::<(), Box<dyn std::error::Error>>(())
+```
+
+Use `HttpClient::from_url_with_tls_config` when a private CA or mTLS client configuration is
+required. `HttpClient` is the low-level, single-connection streaming API.
+
+For requests across multiple origins, use the cloneable pooled `Client`. Its default `send` API
+buffers responses up to a configured limit; `send_streaming` holds the exclusive pool lease until
+EOF and discards the connection on an early drop. Pool limits, header/body limits, and deadlines are
+finite; redirects are disabled unless explicitly enabled.
+
+```rust,no_run
+use may_minihttp::client::{CancellationToken, Client, RedirectPolicy};
+
+let client = Client::builder()
+    .redirect_policy(RedirectPolicy::SameOrigin { max_hops: 5 })
+    .build()?;
+let cancellation = CancellationToken::new();
+let response = client
+    .get("https://identity.example.com/health")?
+    .cancellation_token(cancellation.clone())
+    .send()?;
+assert!(response.status().is_success());
+# Ok::<(), Box<dyn std::error::Error>>(())
+```
+
+The rich client also provides optional JSON helpers, bounded multipart preloading, single-use
+request readers, typed error classification, operational pool counters, sanitized lifecycle
+observation, and injectable resolution. `ServiceResolver` is a bounded push-updated registry with
+no request-path DNS I/O. `CachingResolver` adds positive/negative TTLs, address rotation, and
+single-flight refresh to an application-owned resolver; wrapping the default `SystemResolver`
+reduces but does not eliminate its possible blocking DNS boundary. Observer events intentionally
+omit paths, query strings, headers, and bodies, and callbacks run outside pool and transport locks.
+An optional `CancellationToken` can be cancelled safely from another coroutine or thread. Token
+cancellation interrupts may-aware waits and I/O, discards incomplete connections, produces
+`ClientErrorKind::Cancelled`, and emits one terminal observer event after unwind cleanup. Direct
+unsafe coroutine cancellation still performs pool cleanup but deliberately invokes no callbacks
+from `Drop`.
+
+#### Per-attempt hooks
+
+`Client<I>` is generic over an `Interceptor`, which defaults to `NoInterceptor` and then compiles
+away. An interceptor's `before_send` runs on every attempt the client makes: the first try, the
+pool's own retry on a fresh connection, and each redirect hop. It can add or change headers for
+that attempt. `after_response` sees the response head with the attempt's timing (time to first
+byte, whether the connection was reused), and `on_error` sees a failed attempt, including one a
+retry then hid from the caller. Headers that are the same for every attempt are simpler to set on
+the request builder.
+
+```rust,no_run
+use may_minihttp::client::{Client, Interceptor, OutgoingRequest};
+use http::{HeaderName, HeaderValue};
+
+#[derive(Clone)]
+struct AttemptId;
+
+impl Interceptor for AttemptId {
+    fn before_send(&self, request: &mut OutgoingRequest<'_, '_>) {
+        let attempt = HeaderValue::from(request.attempt());
+        request
+            .headers_mut()
+            .insert(HeaderName::from_static("x-attempt"), attempt);
+    }
+}
+
+let client = Client::builder().build_with_interceptor(AttemptId)?;
+// or, sharing an existing client's pool: existing.with_interceptor(AttemptId)
+# Ok::<(), Box<dyn std::error::Error>>(())
+```
+
+#### Tracing (feature `tracing`)
+
+With the `tracing` feature, each request through `Client` is a span tree under target
+`may_minihttp::client`:
+
+- `http_client_request` (INFO) has method, server address and port, status, `error.type`, resend
+  count and connection reuse.
+- `http_client_connect` (INFO) covers a new connection.
+- `http_client_write`, `http_client_wait` (time to first byte) and `http_client_body` are at
+  DEBUG level.
+- `pool_checkout` and `pool_evict` are DEBUG events.
+
+Paths, query strings and headers are not recorded.
+
+Spans are never entered, because a coroutine can resume on another thread. Give the parent
+explicitly with `RequestBuilder::parent_span`, or hand the client your own per-request span with
+`RequestBuilder::request_span`. Without the feature, nothing is compiled in, and `tracing` is not a
+dependency.
+
+Multipart filesystem helpers are deliberately named `blocking_*` and must be called outside
+latency-sensitive may coroutines. Automatic stale-socket retry is limited to one attempt for
+idempotent requests with replayable bodies.
+
+The normal client graph uses `may`, rustls, and the ring provider selected through rustls. It does
+not include reqwest, Tokio, Hyper, or AWS-LC. Proxy discovery and HTTP/2 are not implicit.
+
 ## Performance
 Tested with only one working thread on my laptop
 
@@ -90,4 +202,3 @@ This project is licensed under either of
    http://opensource.org/licenses/MIT)
 
 at your option.
-
